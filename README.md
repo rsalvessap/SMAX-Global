@@ -26,6 +26,16 @@ Em vez de adivinhar quais são, o script **aprende observando**:
 Durante o aprendizado nada é enviado: o script apenas observa o tráfego que a tela do SMAX
 já faria de qualquer jeito.
 
+O modo aprender e as capturas ficam em `GM_setValue`, não em memória: o SMAX recarrega a página
+ao navegar até a tela de abertura, e um estado só em memória se perderia no meio do fluxo.
+
+### Quando não captura nada
+
+O painel tem um bloco **Diagnóstico** listando toda requisição que passou pelo interceptador e
+**não** virou candidato, com o motivo (`URL fora de /rest/{tenant}/`, `corpo não é JSON`,
+`JSON sem CREATE de Request`) e um trecho do corpo. Se o chamado foi aberto e nenhuma captura
+apareceu, é ali que se vê o formato real do payload — sem precisar adivinhar a heurística.
+
 ### O que o molde carrega
 
 | Campo | Origem |

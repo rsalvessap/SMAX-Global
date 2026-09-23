@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SMAX Global - TJSP
 // @namespace    https://github.com/rsalvessap/SMAX-Global
-// @version      1.0
+// @version      1.1
 // @description  Abertura automatizada de chamado global no SMAX TJSP — aprende o molde a partir de uma abertura manual e replica trocando titulo, descricao e urgencia
 // @author       rsalvessap
 // @match        https://suporte.tjsp.jus.br/saw/*
@@ -23,7 +23,10 @@
   if (window.top && window.top !== window.self) return;
   if (window.location.hostname !== 'suporte.tjsp.jus.br') return;
 
-  const SMAX_GLOBAL_VERSION = '1.0';
+  const SMAX_GLOBAL_VERSION = '1.1';
+
+  // O userscript roda em sandbox; quem dispara as requisicoes e a pagina.
+  const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
 
   /* =========================================================
    * Store
@@ -37,6 +40,11 @@
       molde: null,          // { capturedAt, url, method, properties, sampleResponse }
       lastTitle: '',
       lastUrgency: 'med',
+      // O SMAX recarrega a pagina ao navegar ate a tela de abertura, entao o
+      // modo aprender e as capturas precisam sobreviver a um reload.
+      learning: false,
+      candidates: [],
+      sniffer: [],          // tudo que passou pelo interceptador e NAO virou candidato
     };
 
     const state = JSON.parse(JSON.stringify(defaults));
@@ -295,16 +303,70 @@
     const RE_REST = /\/rest\/\d+\//i;
     const MAX_CANDIDATES = 40;
 
-    let armed = false;
+    const MAX_SNIFFER = 25;
+    const MAX_PERSISTED = 8;
+
     let patched = false;
-    const candidates = [];
     const listeners = new Set();
 
+    // Estado vem do storage: arming e capturas precisam sobreviver ao reload
+    // que o SMAX faz ao navegar ate a tela de abertura de chamado.
+    let armed = !!prefs.learning;
+    const candidates = Array.isArray(prefs.candidates) ? prefs.candidates.slice() : [];
+    const sniffer = Array.isArray(prefs.sniffer) ? prefs.sniffer.slice() : [];
+
     const notify = () => listeners.forEach(fn => { try { fn(); } catch { } });
+
+    const persist = () => {
+      prefs.learning = armed;
+      prefs.candidates = candidates.slice(0, MAX_PERSISTED);
+      prefs.sniffer = sniffer.slice(0, MAX_SNIFFER);
+      Store.save();
+    };
 
     const parseBody = (body) => {
       if (!body || typeof body !== 'string') return null;
       try { return JSON.parse(body); } catch { return null; }
+    };
+
+    // O corpo nem sempre chega como string: pode ser URLSearchParams, Blob,
+    // ArrayBuffer ou um Request. Sem isso a captura falha em silencio.
+    const bodyToString = (body) => {
+      if (body == null) return null;
+      if (typeof body === 'string') return body;
+      try {
+        if (body instanceof URLSearchParams) return body.toString();
+        if (typeof ArrayBuffer !== 'undefined' && (body instanceof ArrayBuffer || ArrayBuffer.isView(body))) {
+          return new TextDecoder('utf-8').decode(body instanceof ArrayBuffer ? new Uint8Array(body) : body);
+        }
+        if (typeof FormData !== 'undefined' && body instanceof FormData) {
+          return JSON.stringify(Object.fromEntries([...body.entries()].map(([k, v]) => [k, String(v)])));
+        }
+      } catch { }
+      return null;
+    };
+
+    const describeBody = (body, raw) => {
+      if (raw) return raw.length > 600 ? raw.slice(0, 600) + '…' : raw;
+      if (body == null) return '(sem corpo)';
+      const t = Object.prototype.toString.call(body);
+      return `(corpo nao textual: ${t})`;
+    };
+
+    // Registra TUDO que passou pelo interceptador mas nao virou candidato.
+    // Sem isso, quando o payload do SMAX nao bate com a heuristica, o usuario
+    // ve o painel vazio e nao tem como saber o porque.
+    const sniff = ({ method, url, body, raw, reason }) => {
+      sniffer.unshift({
+        t: Date.now(),
+        method: String(method || '').toUpperCase(),
+        url: String(url || ''),
+        reason,
+        preview: describeBody(body, raw)
+      });
+      if (sniffer.length > MAX_SNIFFER) sniffer.length = MAX_SNIFFER;
+      persist();
+      notify();
     };
 
     // Um payload serve como molde se cria uma entidade Request.
@@ -321,12 +383,17 @@
 
     const record = ({ method, url, body, responseText }) => {
       if (!armed) return;
-      if (!RE_REST.test(url)) return;
       if (String(method || '').toUpperCase() === 'GET') return;
 
-      const json = parseBody(body);
+      const raw = bodyToString(body);
+
+      if (!RE_REST.test(url)) { sniff({ method, url, body, raw, reason: 'URL fora de /rest/{tenant}/' }); return; }
+
+      const json = parseBody(raw);
+      if (!json) { sniff({ method, url, body, raw, reason: 'corpo nao e JSON' }); return; }
+
       const score = scoreCandidate(json);
-      if (!score) return;
+      if (!score) { sniff({ method, url, body, raw, reason: 'JSON sem CREATE de Request' }); return; }
 
       candidates.unshift({
         capturedAt: Date.now(),
@@ -338,6 +405,7 @@
       });
       if (candidates.length > MAX_CANDIDATES) candidates.length = MAX_CANDIDATES;
       console.info('[SMAX Global] Candidato capturado (score %d): %s', score, url);
+      persist();
       notify();
     };
 
@@ -345,16 +413,17 @@
       if (patched) return;
       patched = true;
       try {
-        const origOpen = XMLHttpRequest.prototype.open;
-        const origSend = XMLHttpRequest.prototype.send;
+        const XHR = (pageWindow && pageWindow.XMLHttpRequest) || XMLHttpRequest;
+        const origOpen = XHR.prototype.open;
+        const origSend = XHR.prototype.send;
 
-        XMLHttpRequest.prototype.open = function patchedOpen(method, url, ...rest) {
+        XHR.prototype.open = function patchedOpen(method, url, ...rest) {
           try { this.__smaxGlobalUrl = url; this.__smaxGlobalMethod = method; } catch { }
           return origOpen.call(this, method, url, ...rest);
         };
 
-        XMLHttpRequest.prototype.send = function patchedSend(body) {
-          const reqBody = typeof body === 'string' ? body : null;
+        XHR.prototype.send = function patchedSend(body) {
+          const reqBody = body;
           this.addEventListener('load', function onLoad() {
             try {
               record({
@@ -368,18 +437,26 @@
           return origSend.call(this, body);
         };
 
-        if (window.fetch) {
-          const origFetch = window.fetch;
-          window.fetch = function patchedFetch(input, init) {
+        const fetchHost = pageWindow && pageWindow.fetch ? pageWindow : window;
+        if (fetchHost.fetch) {
+          const origFetch = fetchHost.fetch;
+          fetchHost.fetch = function patchedFetch(input, init) {
             const url = typeof input === 'string' ? input : (input && input.url) || '';
             const method = (init && init.method) || (input && input.method) || 'GET';
-            const reqBody = init && typeof init.body === 'string' ? init.body : null;
-            return origFetch(input, init).then((resp) => {
+            // Quando o corpo vem dentro de um Request, so da para ler clonando.
+            let bodyPromise;
+            if (init && init.body != null) bodyPromise = Promise.resolve(init.body);
+            else if (input && typeof input === 'object' && typeof input.clone === 'function') {
+              bodyPromise = input.clone().text().catch(() => null);
+            } else bodyPromise = Promise.resolve(null);
+
+            return origFetch.call(this, input, init).then((resp) => {
               try {
-                if (armed && reqBody && RE_REST.test(url)) {
-                  resp.clone().text().then((txt) => {
-                    record({ method, url: url || resp.url, body: reqBody, responseText: txt });
-                  }).catch(() => { });
+                if (armed && String(method).toUpperCase() !== 'GET') {
+                  Promise.all([bodyPromise, resp.clone().text().catch(() => '')])
+                    .then(([reqBody, txt]) => {
+                      record({ method, url: url || resp.url, body: reqBody, responseText: txt });
+                    }).catch(() => { });
                 }
               } catch { }
               return resp;
@@ -393,11 +470,12 @@
 
     return {
       patch,
-      arm: () => { armed = true; notify(); },
-      disarm: () => { armed = false; notify(); },
+      arm: () => { armed = true; persist(); notify(); },
+      disarm: () => { armed = false; persist(); notify(); },
       isArmed: () => armed,
       getCandidates: () => candidates.slice(),
-      clear: () => { candidates.length = 0; notify(); },
+      getSniffer: () => sniffer.slice(),
+      clear: () => { candidates.length = 0; sniffer.length = 0; persist(); notify(); },
       onChange: (fn) => { listeners.add(fn); return () => listeners.delete(fn); }
     };
   })();
@@ -675,6 +753,8 @@
 .smax-gl-cand-title { font-size:12.5px; font-weight:600; color:var(--sp-text); }
 .smax-gl-cand-meta { font-size:11px; color:var(--sp-text-dim); font-family:Consolas, monospace; word-break:break-all; }
 .smax-gl-badge { font-size:10px; padding:2px 7px; border-radius:10px; border:1px solid currentColor; white-space:nowrap; }
+.smax-gl-details { border:1px solid var(--sp-border); border-radius:var(--sp-r-md); padding:10px 12px; background:var(--sp-card-bg); }
+.smax-gl-details > summary { cursor:pointer; font-size:12.5px; font-weight:600; color:var(--sp-text); }
 .smax-gl-badge-best { color:var(--sp-success); }
 `);
 
@@ -816,6 +896,29 @@
           Assim que você salvar, a captura aparece aqui.
         </div>` : '');
 
+      // Diagnostico: se nada virou candidato, mostra o que passou e por que foi
+      // descartado. E isso que permite corrigir a heuristica sem adivinhar.
+      const sniffed = Capture.getSniffer();
+      const sniffBlock = sniffed.length ? `
+        <details class="smax-gl-details" style="margin-top:18px;">
+          <summary>Diagnóstico — ${sniffed.length} requisição(ões) vista(s) e descartada(s)</summary>
+          <div class="smax-gl-note" style="margin-top:8px;">
+            Se o chamado foi aberto e nada apareceu como captura, o payload do SMAX está aqui.
+            Use <strong>Copiar diagnóstico</strong> e me mande.
+          </div>
+          ${sniffed.map(s => `
+            <div class="smax-gl-cand">
+              <div class="smax-gl-cand-info">
+                <div class="smax-gl-cand-title">${Utils.escapeHtml(s.method)} <span class="smax-gl-badge">${Utils.escapeHtml(s.reason)}</span></div>
+                <div class="smax-gl-cand-meta">${Utils.formatBrDateTime(s.t)} · ${Utils.escapeHtml(s.url)}</div>
+                <div class="smax-gl-cand-meta" style="font-family:Consolas,monospace;white-space:pre-wrap;word-break:break-all;">${Utils.escapeHtml(s.preview)}</div>
+              </div>
+            </div>`).join('')}
+          <div style="margin-top:10px;">
+            <button class="smax-gl-btn" data-act="copiar-diagnostico">Copiar diagnóstico</button>
+          </div>
+        </details>` : '';
+
       return `
         <div class="smax-gl-note ${armed ? 'smax-gl-note-warn' : ''}">
           <strong>Como funciona</strong><br>
@@ -831,11 +934,12 @@
           <button class="smax-gl-btn ${armed ? 'smax-gl-btn-danger' : 'smax-gl-btn-primary'}" data-act="toggle-aprender">
             ${armed ? '⏹ Parar modo aprender' : '⏺ Ativar modo aprender'}
           </button>
-          ${candidates.length ? '<button class="smax-gl-btn" data-act="limpar-capturas">Limpar capturas</button>' : ''}
+          ${candidates.length || sniffed.length ? '<button class="smax-gl-btn" data-act="limpar-capturas">Limpar capturas</button>' : ''}
         </div>
 
         ${moldeBlock}
-        ${candBlock}`;
+        ${candBlock}
+        ${sniffBlock}`;
     };
 
     /* ---------- Render ---------- */
@@ -1073,6 +1177,17 @@
           render();
         }
         else if (act === 'limpar-capturas') { Capture.clear(); render(); }
+        else if (act === 'copiar-diagnostico') {
+          const dump = {
+            versao: SMAX_GLOBAL_VERSION,
+            armado: Capture.isArmed(),
+            capturas: Capture.getCandidates().length,
+            descartadas: Capture.getSniffer()
+          };
+          navigator.clipboard.writeText(JSON.stringify(dump, null, 2))
+            .then(() => infoModal('Diagnóstico copiado', '<p>Cole na conversa para análise.</p>'))
+            .catch(() => infoModal('Falha ao copiar', `<pre class="smax-gl-pre">${Utils.escapeHtml(JSON.stringify(dump, null, 2))}</pre>`));
+        }
         else if (act === 'descartar-molde') {
           if (confirm('Descartar o molde aprendido? Você precisará capturar outro para abrir chamados.')) {
             prefs.molde = null;

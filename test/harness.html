@@ -25,6 +25,8 @@
     <button onclick="simularXHR()">Simular criação via XHR</button>
     <button onclick="simularFetch()">Simular criação via fetch</button>
     <button onclick="simularRuido()">Simular tráfego irrelevante</button>
+    <button onclick="location.reload()">Recarregar página (testa persistência)</button>
+    <button onclick="localStorage.clear();location.reload()">Zerar storage</button>
   </div>
 </div>
 
@@ -43,10 +45,12 @@
     el.scrollTop = el.scrollHeight;
   };
 
-  /* ---- Stubs do Tampermonkey ---- */
-  const gmStore = {};
-  window.GM_getValue = (k) => gmStore[k];
-  window.GM_setValue = (k, v) => { gmStore[k] = v; log(`GM_setValue(${k}) → ${String(v).length} chars`, 'ok'); };
+  /* ---- Stubs do Tampermonkey ----
+     Persistem em localStorage de proposito: o GM storage real sobrevive a
+     reload, e o SMAX recarrega a pagina no meio do fluxo de aprender. Stub em
+     memoria esconderia exatamente essa classe de bug. */
+  window.GM_getValue = (k) => localStorage.getItem('gm:' + k) ?? undefined;
+  window.GM_setValue = (k, v) => { localStorage.setItem('gm:' + k, v); log(`GM_setValue(${k}) → ${String(v).length} chars`, 'ok'); };
   window.GM_addStyle = (css) => {
     const s = document.createElement('style');
     s.textContent = css;

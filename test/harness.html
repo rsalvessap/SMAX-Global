@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<title>SMAX Global — harness local</title>
+<style>
+  body { font-family:'Segoe UI',system-ui,sans-serif; background:#f4f6f9; color:#14273c; margin:0; padding:28px; }
+  h1 { font-size:18px; margin:0 0 4px; }
+  p.sub { margin:0 0 20px; color:#5a6b7e; font-size:13px; }
+  .card { background:#fff; border:1px solid #d6dfe9; border-radius:10px; padding:16px; margin-bottom:14px; max-width:820px; }
+  button { background:#0a5cc0; color:#fff; border:none; border-radius:6px; padding:9px 15px; font-size:13px; cursor:pointer; margin-right:8px; }
+  button:hover { background:#084a9e; }
+  #log { font-family:Consolas,monospace; font-size:11.5px; white-space:pre-wrap; background:#0f1623; color:#b9c8d8; padding:12px; border-radius:8px; max-height:340px; overflow:auto; }
+  .ok { color:#46c96e; } .err { color:#f06b6b; } .warn { color:#e0a83c; }
+</style>
+</head>
+<body>
+<h1>SMAX Global — harness local</h1>
+<p class="sub">Testa o script fora do SMAX. O guard de hostname é removido só aqui, no carregamento; o arquivo publicado continua intacto.</p>
+
+<div class="card">
+  <strong>1.</strong> Abra o painel pelo botão 🌐 (canto inferior direito) e vá em <em>Aprender molde</em> → <em>Ativar modo aprender</em>.<br><br>
+  <strong>2.</strong> Clique abaixo para simular o SMAX enviando uma criação de chamado. Isso exercita o interceptador real do script.
+  <div style="margin-top:12px;">
+    <button onclick="simularXHR()">Simular criação via XHR</button>
+    <button onclick="simularFetch()">Simular criação via fetch</button>
+    <button onclick="simularRuido()">Simular tráfego irrelevante</button>
+  </div>
+</div>
+
+<div class="card">
+  <strong>3.</strong> Use o candidato como molde, volte em <em>Abrir chamado</em>, preencha e clique em <em>Ver payload</em>.
+  Confira se <code>DisplayLabel</code>, <code>Description</code>, <code>Urgency</code> e <code>ImpactScope</code> foram sobrescritos
+  e se <code>Id</code>/<code>CreateTime</code>/<code>Comments</code> sumiram.
+</div>
+
+<div class="card"><div id="log">aguardando…</div></div>
+
+<script>
+  const log = (msg, cls='') => {
+    const el = document.getElementById('log');
+    el.innerHTML += `\n<span class="${cls}">${msg}</span>`;
+    el.scrollTop = el.scrollHeight;
+  };
+
+  /* ---- Stubs do Tampermonkey ---- */
+  const gmStore = {};
+  window.GM_getValue = (k) => gmStore[k];
+  window.GM_setValue = (k, v) => { gmStore[k] = v; log(`GM_setValue(${k}) → ${String(v).length} chars`, 'ok'); };
+  window.GM_addStyle = (css) => {
+    const s = document.createElement('style');
+    s.textContent = css;
+    document.head.appendChild(s);
+    log(`GM_addStyle → ${css.length} chars`, 'ok');
+  };
+  window.unsafeWindow = window;
+
+  /* ---- Payload que imita o que a UI do SMAX enviaria ao criar um Request ---- */
+  const TENANT = '213963628';
+  const fakeCreateBody = () => JSON.stringify({
+    entities: [{
+      entity_type: 'Request',
+      properties: {
+        Id: '999999',
+        DisplayLabel: 'TITULO ORIGINAL DO MOLDE',
+        Description: '<p>descricao original do molde</p>',
+        RequestedByPerson: '11111',
+        RequestedForPerson: '11111',
+        Service: '22222',
+        RequestsOffering: '33333',
+        AssignedToGroup: '44444',
+        Urgency: 'SlightDisruption',
+        ImpactScope: 'SingleUser',
+        StatusSCCDSMAX_c: 'EmAtendimento_c',
+        CreateTime: 1758000000000,
+        LastUpdateTime: 1758000000000,
+        Comments: '{"Comment":[]}'
+      }
+    }],
+    operation: 'CREATE'
+  });
+
+  const fakeResponse = JSON.stringify({
+    meta: { completion_status: 'OK' },
+    entity_result_list: [{ entity: { entity_type: 'Request', properties: { Id: '4567890' } }, completion_status: 'OK' } ]
+  });
+
+  function simularXHR() {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `/rest/${TENANT}/ems/bulk`);
+    xhr.setRequestHeader('Content-Type', 'application/json');
+    xhr.onloadend = () => log(`XHR concluído (status ${xhr.status}) — o script deve ter capturado`, 'warn');
+    xhr.send(fakeCreateBody());
+  }
+
+  function simularFetch() {
+    fetch(`/rest/${TENANT}/ems/bulk`, { method: 'POST', body: fakeCreateBody(), headers: { 'Content-Type': 'application/json' } })
+      .then(r => log(`fetch concluído (status ${r.status}) — o script deve ter capturado`, 'warn'))
+      .catch(e => log('fetch falhou: ' + e.message, 'err'));
+  }
+
+  function simularRuido() {
+    // Nada disso pode virar candidato: GET, e UPDATE sem entity Request.
+    fetch(`/rest/${TENANT}/ems/Request?layout=Id`).catch(()=>{});
+    fetch(`/rest/${TENANT}/ems/bulk`, {
+      method: 'POST',
+      body: JSON.stringify({ entities: [{ entity_type: 'Person', properties: { Id: '1' } }], operation: 'UPDATE' })
+    }).catch(()=>{});
+    log('Ruído enviado — NÃO deve aparecer candidato novo', 'warn');
+  }
+
+  /* ---- Carrega o userscript com o guard de hostname neutralizado ---- */
+  fetch('../SMAX/SMAX%20Global%20-%20TJSP.user.js')
+    .then(r => r.text())
+    .then(src => {
+      const patched = src.replace(
+        "if (window.location.hostname !== 'suporte.tjsp.jus.br') return;",
+        "/* guard removido pelo harness */"
+      );
+      if (patched === src) log('AVISO: guard de hostname não encontrado — o script vai abortar', 'err');
+      const s = document.createElement('script');
+      s.textContent = patched;
+      document.body.appendChild(s);
+      log('userscript carregado', 'ok');
+    })
+    .catch(e => log('falha ao carregar userscript: ' + e.message, 'err'));
+</script>
+</body>
+</html>

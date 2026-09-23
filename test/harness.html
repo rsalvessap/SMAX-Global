@@ -24,6 +24,7 @@
   <div style="margin-top:12px;">
     <button onclick="simularXHR()">Simular criação via XHR</button>
     <button onclick="simularFetch()">Simular criação via fetch</button>
+    <button onclick="simularMarcarGlobal()">Simular marcação "É Global"</button>
     <button onclick="simularRuido()">Simular tráfego irrelevante</button>
     <button onclick="location.reload()">Recarregar página (testa persistência)</button>
     <button onclick="localStorage.clear();location.reload()">Zerar storage</button>
@@ -58,6 +59,10 @@
     log(`GM_addStyle → ${css.length} chars`, 'ok');
   };
   window.unsafeWindow = window;
+
+  /* O script resolve o tenant a partir da pagina; aqui nao ha nada de onde
+     tirar, e sem ele o replay iria para /rest/ems/... em vez de /rest/{id}/ems/... */
+  localStorage.setItem('smaxTenantId', '213963628');
 
   /* ---- Payload que imita o que a UI do SMAX enviaria ao criar um Request ---- */
   const TENANT = '213963628';
@@ -101,6 +106,22 @@
     fetch(`/rest/${TENANT}/ems/bulk`, { method: 'POST', body: fakeCreateBody(), headers: { 'Content-Type': 'application/json' } })
       .then(r => log(`fetch concluído (status ${r.status}) — o script deve ter capturado`, 'warn'))
       .catch(e => log('fetch falhou: ' + e.message, 'err'));
+  }
+
+  // Passo 2 do procedimento: depois de salvar, o usuario marca "E Global" em
+  // Classificacao. E um UPDATE separado, e sem ele o chamado nasce comum.
+  function simularMarcarGlobal() {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', `/rest/${TENANT}/ems/bulk`);
+    xhr.setRequestHeader('Content-Type', 'application/json');
+    xhr.onloadend = () => log('marcação "É Global" enviada — deve virar candidato UPDATE', 'warn');
+    xhr.send(JSON.stringify({
+      entities: [{
+        entity_type: 'Request',
+        properties: { Id: '999999', IsGlobal_c: 'true', LastUpdateTime: 1758000000000 }
+      }],
+      operation: 'UPDATE'
+    }));
   }
 
   function simularRuido() {

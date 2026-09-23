@@ -17,11 +17,30 @@ grupo designado, campos customizados `_c`…) e esses campos variam por instala�
 Em vez de adivinhar quais são, o script **aprende observando**:
 
 1. **Aprender molde** (uma vez) — você ativa o modo aprender e abre *um* chamado global
-   normalmente, pela tela nativa do SMAX. O script intercepta o corpo da requisição que a
-   própria UI do SMAX enviou e guarda como molde.
+   normalmente, pela tela nativa do SMAX, **indo até marcar "É Global"**. O script intercepta os
+   corpos das requisições que a própria UI do SMAX enviou e guarda como molde.
 2. **Abrir chamado** (sempre) — você preenche título, descrição e urgência. O script clona o
    molde, sobrescreve esses três campos, descarta os campos de identidade do chamado antigo
    e reenvia no mesmo endpoint.
+
+### São duas requisições, não uma
+
+Pelo procedimento da equipe, **"É Global" é marcado depois de salvar**, na aba Classificação. Ou
+seja, a criação sozinha produz um chamado comum. Por isso o aprendizado tem dois moldes:
+
+| Molde | O que é | Sem ele |
+|---|---|---|
+| **molde** | o `CREATE` do chamado | não dá para abrir nada |
+| **moldeGlobal** | o `UPDATE` que marcou "É Global" | o chamado nasce comum, e o painel avisa para marcar à mão |
+
+No replay do passo 2 o script só troca o `Id` pelo do chamado recém-criado — o campo que marca
+"É Global" viaja junto no molde, então não é preciso saber o nome dele.
+
+### Molde único
+
+O procedimento pede um global por público/oferta (1º Grau, 2º Grau, Externo), e cada um muda
+solicitante e oferta — campos congelados no molde. O escopo aqui é **uma equipe só**, então um
+molde basta. Para abrir de um público diferente é preciso recapturar.
 
 Durante o aprendizado nada é enviado: o script apenas observa o tráfego que a tela do SMAX
 já faria de qualquer jeito.
@@ -70,12 +89,19 @@ Testa o script fora do SMAX, incluindo o caminho real de captura. O harness remo
 hostname só na hora de carregar; o arquivo publicado não é alterado.
 
 ```bash
-node -e "const http=require('http'),fs=require('fs'),path=require('path');const t={'.html':'text/html; charset=utf-8','.js':'text/javascript; charset=utf-8'};http.createServer((q,s)=>{const p=path.join(__dirname,decodeURIComponent(q.url.split('?')[0]));fs.readFile(p,(e,d)=>{if(e){s.writeHead(404);s.end('nf');return}s.writeHead(200,{'Content-Type':t[path.extname(p)]||'application/octet-stream'});s.end(d)})}).listen(8899,()=>console.log('http://localhost:8899/test/harness.html'))"
+node test/server.js        # http://localhost:8899/test/harness.html
 ```
 
-Os botões do harness disparam XHR/fetch imitando o SMAX criando um chamado, exercitando o
-interceptador de verdade. O botão de ruído confirma que GET e `UPDATE` de outras entidades
-**não** viram candidato a molde.
+O servidor também finge ser a API do SMAX: responde `POST /rest/{tenant}/...` com um ID novo a
+cada `CREATE`. Isso permite exercitar o replay inteiro — criação **e** marcação "É Global" — sem
+tocar em produção. O log do servidor mostra cada chamada, e é ali que se confirma que o `CREATE`
+foi sem `Id` e que o `UPDATE` seguinte usou o ID recém-criado.
+
+Os botões do harness disparam XHR/fetch imitando o SMAX: criação, marcação "É Global" e ruído.
+O botão de ruído confirma que GET e `UPDATE` de outras entidades **não** viram candidato a molde.
+
+O harness persiste o GM storage em `localStorage` e recarrega a página sob demanda — de propósito:
+com stub em memória, o bug de perder o modo aprender no reload ficava invisível.
 
 ### Convívio com os outros scripts SMAX
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SMAX Global - TJSP
 // @namespace    https://github.com/rsalvessap/SMAX-Global
-// @version      1.1
+// @version      1.2
 // @description  Abertura automatizada de chamado global no SMAX TJSP — aprende o molde a partir de uma abertura manual e replica trocando titulo, descricao e urgencia
 // @author       rsalvessap
 // @match        https://suporte.tjsp.jus.br/saw/*
@@ -23,7 +23,7 @@
   if (window.top && window.top !== window.self) return;
   if (window.location.hostname !== 'suporte.tjsp.jus.br') return;
 
-  const SMAX_GLOBAL_VERSION = '1.1';
+  const SMAX_GLOBAL_VERSION = '1.2';
 
   // O userscript roda em sandbox; quem dispara as requisicoes e a pagina.
   const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
@@ -38,6 +38,9 @@
       enableRealWrites: true,
       // Molde unico aprendido a partir de uma abertura manual
       molde: null,          // { capturedAt, url, method, properties, sampleResponse }
+      // "E Global" e marcado DEPOIS de salvar, na aba Classificacao. Sem esse
+      // segundo passo o replay gera um chamado comum, nao um global.
+      moldeGlobal: null,
       lastTitle: '',
       lastUrgency: 'med',
       // O SMAX recarrega a pagina ao navegar ate a tela de abertura, entao o
@@ -529,6 +532,17 @@
       return payload;
     };
 
+    // Passo 2: replica o UPDATE que marcou "E Global", apontando para o chamado
+    // recem-criado. Nao precisamos saber o nome do campo — ele viaja no molde.
+    const buildGlobalFlagPayload = (moldeGlobal, newId) => {
+      const payload = Utils.deepClone(moldeGlobal.body);
+      const props = payload.entities[moldeGlobal.entityIndex].properties || {};
+      ['LastUpdateTime', 'CreateTime', 'UpdateTime', 'Comments'].forEach(k => delete props[k]);
+      props.Id = newId;
+      payload.entities[moldeGlobal.entityIndex].properties = props;
+      return payload;
+    };
+
     const extractCreatedId = (res) => {
       if (!res || typeof res !== 'object') return '';
       const lists = [res.entity_result_list, res.entities, res.entity_list].filter(Array.isArray);
@@ -544,7 +558,7 @@
 
     const completionStatus = (res) => String(res?.meta?.completion_status || '').toUpperCase();
 
-    return { STRIP_KEYS, URGENCY_PRESETS, fromCandidate, getProperties, buildPayload, extractCreatedId, completionStatus };
+    return { STRIP_KEYS, URGENCY_PRESETS, fromCandidate, getProperties, buildPayload, buildGlobalFlagPayload, extractCreatedId, completionStatus };
   })();
 
   /* =========================================================
@@ -875,6 +889,20 @@
         </div>
       ` : '';
 
+      const mg = prefs.moldeGlobal;
+      const moldeGlobalBlock = mg ? `
+        <div class="smax-gl-note smax-gl-note-ok" style="margin-top:12px;">
+          <strong>Passo 2 — “É Global”</strong> — capturado em ${Utils.formatBrDateTime(mg.capturedAt)}<br>
+          <span style="font-family:Consolas,monospace;font-size:11px;">${Utils.escapeHtml(mg.method)} ${Utils.escapeHtml(mg.path)}</span>
+          <div style="margin-top:8px;">
+            <button class="smax-gl-btn smax-gl-btn-danger" data-act="descartar-molde-global">Descartar passo 2</button>
+          </div>
+        </div>` : (molde ? `
+        <div class="smax-gl-note smax-gl-note-warn" style="margin-top:12px;">
+          <strong>Passo 2 ainda não aprendido.</strong> “É Global” é marcado depois de salvar, na aba
+          Classificação — sem capturar esse momento o script cria um chamado comum, não um global.
+        </div>` : '');
+
       const candBlock = candidates.length ? `
         <div class="smax-gl-label" style="margin-top:18px;">Capturas desta sessão (${candidates.length})</div>
         ${candidates.map((c, i) => `
@@ -889,6 +917,7 @@
             </div>
             <button class="smax-gl-btn" data-act="ver-candidato" data-idx="${i}">Ver</button>
             <button class="smax-gl-btn smax-gl-btn-primary" data-act="usar-candidato" data-idx="${i}">Usar como molde</button>
+            <button class="smax-gl-btn" data-act="usar-candidato-global" data-idx="${i}" title="Use na captura do momento em que você marcou &quot;É Global&quot;">Usar como passo 2 (É Global)</button>
           </div>`).join('')}
       ` : (armed ? `
         <div class="smax-gl-note">
@@ -923,9 +952,12 @@
         <div class="smax-gl-note ${armed ? 'smax-gl-note-warn' : ''}">
           <strong>Como funciona</strong><br>
           1. Clique em <strong>Ativar modo aprender</strong>.<br>
-          2. Abra <em>um</em> chamado global normalmente, pela tela nativa do SMAX.<br>
-          3. O script grava o payload exato que o SMAX enviou e guarda como molde.<br>
-          4. A partir daí, a aba <strong>Abrir</strong> replica esse molde trocando título, descrição e urgência.<br>
+          2. Abra <em>um</em> chamado global normalmente, pela tela nativa do SMAX, e
+             <strong>siga até marcar “É Global”</strong> em Classificação. São duas requisições:
+             a criação e a marcação.<br>
+          3. Volte aqui: use a captura <em>CREATE</em> em <strong>Usar como molde</strong> e a
+             captura do <em>UPDATE</em> em <strong>Usar como passo 2</strong>.<br>
+          4. A partir daí, a aba <strong>Abrir</strong> replica os dois, trocando título, descrição e urgência.<br>
           <br>
           Nada é enviado durante o aprendizado — o script só observa o tráfego que a própria tela do SMAX já faz.
         </div>
@@ -938,6 +970,7 @@
         </div>
 
         ${moldeBlock}
+        ${moldeGlobalBlock}
         ${candBlock}
         ${sniffBlock}`;
     };
@@ -1084,6 +1117,38 @@
           prefs.lastTitle = data.title;
           prefs.lastUrgency = data.urgency;
           Store.save();
+
+          // Passo 2 — sem isso o chamado nasce comum, nao global.
+          let flagNote = `
+            <div class="smax-gl-note smax-gl-note-warn">
+              <strong>Falta marcar “É Global”.</strong> Nenhum molde do passo 2 foi aprendido,
+              então abra o chamado e marque manualmente em Classificação → É Global.
+            </div>`;
+          if (prefs.moldeGlobal) {
+            setStatus(`#${newId} criado — marcando como global…`);
+            try {
+              const resFlag = await ApiClient.request(prefs.moldeGlobal.path, {
+                method: prefs.moldeGlobal.method || 'POST',
+                body: Molde.buildGlobalFlagPayload(prefs.moldeGlobal, newId),
+                useXsrf: true
+              });
+              const okFlag = Molde.completionStatus(resFlag) === 'OK';
+              flagNote = okFlag
+                ? `<div class="smax-gl-note smax-gl-note-ok">Marcado como <strong>É Global</strong>.</div>`
+                : `<div class="smax-gl-note smax-gl-note-err">
+                     O chamado foi criado, mas a marcação <strong>É Global</strong> não foi confirmada
+                     (${Utils.escapeHtml(Molde.completionStatus(resFlag) || 'sem status')}).
+                     Marque manualmente em Classificação → É Global.
+                   </div>`;
+            } catch (errFlag) {
+              flagNote = `<div class="smax-gl-note smax-gl-note-err">
+                  O chamado foi criado, mas falhou ao marcar <strong>É Global</strong>:
+                  ${Utils.escapeHtml(errFlag.message || String(errFlag))}.
+                  Marque manualmente em Classificação → É Global.
+                </div>`;
+            }
+          }
+
           form.descriptionHtml = '';
           busy = false;
           render();
@@ -1093,6 +1158,7 @@
             <div class="smax-gl-note smax-gl-note-ok">
               <strong>Chamado #${Utils.escapeHtml(newId)}</strong> criado com sucesso.
             </div>
+            ${flagNote}
             <p style="font-size:12.5px;">
               <a href="${Utils.escapeHtml(url)}" target="_blank" rel="noopener"
                  style="color:var(--sp-accent);">Abrir #${Utils.escapeHtml(newId)} no SMAX ↗</a>
@@ -1206,10 +1272,25 @@
           if (!molde) { setStatus('Não foi possível extrair um molde dessa captura.', 'err'); return; }
           prefs.molde = molde;
           Store.save();
-          Capture.disarm();
-          activeTab = 'abrir';
+          // Nao desarma: ainda falta capturar o passo 2 ("E Global").
           render();
-          setStatus('Molde salvo. Já dá para abrir chamados.', 'ok');
+          setStatus(prefs.moldeGlobal
+            ? 'Molde salvo. Já dá para abrir chamados.'
+            : 'Molde salvo. Falta o passo 2 — capture o momento em que você marca “É Global”.', 'ok');
+        }
+        else if (act === 'usar-candidato-global') {
+          const c = Capture.getCandidates()[Number(ev.target.closest('[data-idx]').dataset.idx)];
+          const molde = c && Molde.fromCandidate(c);
+          if (!molde) { setStatus('Não foi possível extrair um molde dessa captura.', 'err'); return; }
+          prefs.moldeGlobal = molde;
+          Store.save();
+          render();
+          setStatus('Passo 2 salvo — o script vai marcar “É Global” após criar.', 'ok');
+        }
+        else if (act === 'descartar-molde-global') {
+          prefs.moldeGlobal = null;
+          Store.save();
+          render();
         }
       });
 

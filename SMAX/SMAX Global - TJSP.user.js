@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         SMAX Global - TJSP
 // @namespace    https://github.com/rsalvessap/SMAX-Global
-// @version      1.2
-// @description  Abertura automatizada de chamado global no SMAX TJSP — aprende o molde a partir de uma abertura manual e replica trocando titulo, descricao e urgencia
+// @version      1.3
+// @description  Abertura automatizada de chamado global no SMAX TJSP — aprende o molde a partir de uma abertura manual e replica trocando titulo, descricao, urgencia e solicitante
 // @author       rsalvessap
 // @match        https://suporte.tjsp.jus.br/saw/*
 // @run-at       document-start
@@ -23,7 +23,7 @@
   if (window.top && window.top !== window.self) return;
   if (window.location.hostname !== 'suporte.tjsp.jus.br') return;
 
-  const SMAX_GLOBAL_VERSION = '1.2';
+  const SMAX_GLOBAL_VERSION = '1.3';
 
   // O userscript roda em sandbox; quem dispara as requisicoes e a pagina.
   const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
@@ -48,6 +48,10 @@
       learning: false,
       candidates: [],
       sniffer: [],          // tudo que passou pelo interceptador e NAO virou candidato
+      // Cache Id -> Name de pessoas. O molde guarda so o Id do solicitante; sem
+      // isso o painel mostraria um numero ate a busca remota responder, a cada
+      // reload do SMAX.
+      personNames: {},
     };
 
     const state = JSON.parse(JSON.stringify(defaults));
@@ -296,6 +300,81 @@
   })();
 
   /* =========================================================
+   * People — busca de pessoas para o campo "Solicitado para".
+   *
+   * O SMAX rejeita LIKE/% na entidade Person, entao a busca e por
+   * range de prefixo: Name >= 'TERMO' and Name < 'TERMP'.
+   * =======================================================*/
+  const People = (() => {
+    // Os solicitantes validos para global comecam todos com isso (regra da equipe),
+    // entao o picker ja abre com os quatro na tela, sem digitar nada.
+    const SEED_TERM = 'GLOBAL EPROC';
+    const LAYOUT = 'Name,Upn,Email,FirstName,LastName,Title';
+
+    const toPeople = (payload) => (payload?.entities || [])
+      .filter(e => e?.entity_type === 'Person')
+      .map(e => {
+        const p = e.properties || {};
+        return {
+          id: p.Id != null ? String(p.Id) : '',
+          name: String(p.Name || '').trim(),
+          upn: String(p.Upn || '').trim()
+        };
+      })
+      .filter(p => p.id && p.name);
+
+    const remember = (people) => {
+      let changed = false;
+      people.forEach(p => {
+        if (prefs.personNames[p.id] !== p.name) { prefs.personNames[p.id] = p.name; changed = true; }
+      });
+      if (changed) Store.save();
+    };
+
+    const search = async (term) => {
+      const q = String(term || '').trim().replace(/'/g, "''");
+      if (q.length < 3) return [];
+      const upper = q.toUpperCase();
+      const upperBound = upper.slice(0, -1)
+        + String.fromCharCode(upper.charCodeAt(upper.length - 1) + 1);
+      const payload = await ApiClient.request('ems/Person', {
+        method: 'GET',
+        searchParams: {
+          filter: `Name >= '${upper}' and Name < '${upperBound}'`,
+          layout: LAYOUT,
+          size: '30',
+          skip: '0',
+          order: 'Name asc'
+        },
+        includeTenantParam: true
+      });
+      const people = toPeople(payload);
+      remember(people);
+      return people;
+    };
+
+    // Resolve o nome do solicitante que veio congelado no molde (que guarda so o Id).
+    const nameFor = (id) => prefs.personNames[String(id || '')] || '';
+
+    const resolveName = async (id) => {
+      const key = String(id || '').trim();
+      // Filtro vai concatenado na query — so aceita Id numerico.
+      if (!/^\d+$/.test(key)) return '';
+      if (prefs.personNames[key]) return prefs.personNames[key];
+      const payload = await ApiClient.request('ems/Person', {
+        method: 'GET',
+        searchParams: { filter: `Id = '${key}'`, layout: LAYOUT, size: '1', skip: '0' },
+        includeTenantParam: true
+      });
+      const people = toPeople(payload);
+      remember(people);
+      return people[0]?.name || '';
+    };
+
+    return { SEED_TERM, search, nameFor, resolveName };
+  })();
+
+  /* =========================================================
    * Capture — grava o payload REAL que a UI nativa envia ao criar
    * um Request, para ser usado como molde.
    *
@@ -520,12 +599,19 @@
 
     const getProperties = (molde) => (molde?.body?.entities?.[molde.entityIndex]?.properties) || {};
 
-    const buildPayload = (molde, { title, descriptionHtml, urgency }) => {
+    // "Solicitado para" no SMAX e RequestedForPerson. RequestedByPerson (quem
+    // registrou) fica como esta no molde — nao e o campo que a equipe troca.
+    const REQUESTER_KEY = 'RequestedForPerson';
+
+    const getRequesterId = (molde) => String(getProperties(molde)[REQUESTER_KEY] || '').trim();
+
+    const buildPayload = (molde, { title, descriptionHtml, urgency, requesterId }) => {
       const payload = Utils.deepClone(molde.body);
       const props = payload.entities[molde.entityIndex].properties || {};
       STRIP_KEYS.forEach(k => delete props[k]);
       if (title) props.DisplayLabel = title;
       if (descriptionHtml) props.Description = descriptionHtml;
+      if (requesterId) props[REQUESTER_KEY] = String(requesterId);
       const preset = URGENCY_PRESETS[urgency];
       if (preset) Object.assign(props, preset.props);
       payload.entities[molde.entityIndex].properties = props;
@@ -558,7 +644,7 @@
 
     const completionStatus = (res) => String(res?.meta?.completion_status || '').toUpperCase();
 
-    return { STRIP_KEYS, URGENCY_PRESETS, fromCandidate, getProperties, buildPayload, buildGlobalFlagPayload, extractCreatedId, completionStatus };
+    return { STRIP_KEYS, URGENCY_PRESETS, REQUESTER_KEY, fromCandidate, getProperties, getRequesterId, buildPayload, buildGlobalFlagPayload, extractCreatedId, completionStatus };
   })();
 
   /* =========================================================
@@ -770,6 +856,27 @@
 .smax-gl-details { border:1px solid var(--sp-border); border-radius:var(--sp-r-md); padding:10px 12px; background:var(--sp-card-bg); }
 .smax-gl-details > summary { cursor:pointer; font-size:12.5px; font-weight:600; color:var(--sp-text); }
 .smax-gl-badge-best { color:var(--sp-success); }
+
+.smax-gl-person {
+  border:1px solid var(--sp-border); border-radius:var(--sp-r-md);
+  background:var(--sp-card-bg); padding:10px 12px;
+}
+.smax-gl-person-current { display:flex; align-items:center; gap:8px; flex-wrap:wrap; font-size:12.5px; color:var(--sp-text); }
+.smax-gl-person-name { font-weight:600; flex:1 1 auto; min-width:0; word-break:break-word; }
+.smax-gl-person-search { margin-top:10px; border-top:1px solid var(--sp-border); padding-top:10px; }
+.smax-gl-person-hits { margin-top:8px; max-height:190px; overflow-y:auto; overflow-x:hidden; }
+.smax-gl-person-hit {
+  display:flex; align-items:center; gap:8px; width:100%; box-sizing:border-box; text-align:left;
+  border:1px solid transparent; background:transparent; color:var(--sp-text);
+  border-radius:var(--sp-r-sm); padding:6px 8px; font-size:12.5px; cursor:pointer; font-family:inherit;
+}
+.smax-gl-person-hit:hover { background:var(--sp-primary-bg); border-color:var(--sp-accent); }
+.smax-gl-person-hit[data-current="true"] { background:var(--sp-primary-bg); }
+/* Nome e login competem pela mesma linha; sem truncar, os dois juntos estouram
+   a largura e a lista ganha barra horizontal. */
+.smax-gl-person-hit > span, .smax-gl-person-hit small { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.smax-gl-person-hit small { flex:0 1 auto; max-width:45%; color:var(--sp-text-dim); font-family:Consolas, monospace; font-size:10.5px; }
+.smax-gl-person-msg { font-size:11.5px; color:var(--sp-text-muted); margin-top:8px; }
 `);
 
   /* =========================================================
@@ -785,8 +892,14 @@
     const form = {
       title: prefs.lastTitle || '',
       urgency: prefs.lastUrgency || 'med',
-      descriptionHtml: ''
+      descriptionHtml: '',
+      // null = usa o solicitante congelado no molde. Trocar e excecao, entao nao
+      // persiste entre aberturas do painel — senao uma troca pontual viraria padrao.
+      requester: null
     };
+
+    const personUI = { open: false, term: '', loading: false, error: '', results: [], searchSeq: 0 };
+    let personDebounce = null;
 
     const setStatus = (msg, kind = '') => {
       const el = overlay && overlay.querySelector('.smax-gl-status');
@@ -803,6 +916,113 @@
       launcher.title = Capture.isArmed()
         ? 'SMAX Global — MODO APRENDER ativo (abra um global pela tela nativa)'
         : 'SMAX Global — abrir chamado global';
+    };
+
+    /* ---------- Campo: solicitado para ---------- */
+    const defaultRequesterId = () => Molde.getRequesterId(prefs.molde);
+
+    const currentRequester = () => {
+      if (form.requester) return form.requester;
+      const id = defaultRequesterId();
+      return id ? { id, name: People.nameFor(id) } : null;
+    };
+
+    const renderPersonBox = () => {
+      const cur = currentRequester();
+      const changed = !!form.requester && form.requester.id !== defaultRequesterId();
+
+      const label = !cur
+        ? '<span class="smax-gl-person-name" style="color:var(--sp-text-dim);">O molde não trouxe solicitante</span>'
+        : `<span class="smax-gl-person-name">${Utils.escapeHtml(cur.name || `#${cur.id}`)}</span>
+           <span class="smax-gl-badge ${changed ? 'smax-gl-badge-best' : ''}">${changed ? 'alterado' : 'padrão do molde'}</span>`;
+
+      const hits = personUI.loading
+        ? '<div class="smax-gl-person-msg">Buscando…</div>'
+        : personUI.error
+          ? `<div class="smax-gl-person-msg" style="color:var(--sp-danger-text);">${Utils.escapeHtml(personUI.error)}</div>`
+          : personUI.results.length
+            ? `<div class="smax-gl-person-hits">${personUI.results.map(p => `
+                <button class="smax-gl-person-hit" data-act="escolher-pessoa"
+                        data-id="${Utils.escapeHtml(p.id)}" data-name="${Utils.escapeHtml(p.name)}"
+                        data-current="${cur && cur.id === p.id}">
+                  <span style="flex:1 1 auto;min-width:0;">${Utils.escapeHtml(p.name)}</span>
+                  <small>${Utils.escapeHtml(p.upn || p.id)}</small>
+                </button>`).join('')}</div>`
+            : `<div class="smax-gl-person-msg">${
+                personUI.term.trim().length < 3
+                  ? 'Digite ao menos 3 letras.'
+                  : 'Nenhuma pessoa encontrada com esse início de nome.'
+              }</div>`;
+
+      return `
+        <div class="smax-gl-person">
+          <div class="smax-gl-person-current">
+            ${label}
+            ${changed ? '<button class="smax-gl-btn" data-act="resetar-solicitante">Voltar ao padrão</button>' : ''}
+            <button class="smax-gl-btn" data-act="trocar-solicitante">${personUI.open ? 'Fechar busca' : 'Alterar'}</button>
+          </div>
+          ${personUI.open ? `
+            <div class="smax-gl-person-search">
+              <input id="smax-gl-person-q" class="smax-gl-input" type="text"
+                     placeholder="Nome (início) — ex.: ${Utils.escapeHtml(People.SEED_TERM)}"
+                     value="${Utils.escapeHtml(personUI.term)}">
+              ${hits}
+            </div>` : ''}
+        </div>`;
+    };
+
+    // Atualiza so a caixa do solicitante: um render() inteiro destruiria o foco
+    // e o caret do campo de busca a cada tecla.
+    const refreshPersonBox = () => {
+      const box = overlay && overlay.querySelector('#smax-gl-person-box');
+      if (!box) return;
+      const input = box.querySelector('#smax-gl-person-q');
+      const hadFocus = input && document.activeElement === input;
+      const caret = input ? input.selectionStart : null;
+      box.innerHTML = renderPersonBox();
+      const next = box.querySelector('#smax-gl-person-q');
+      if (next && hadFocus) {
+        next.focus();
+        if (caret != null) next.setSelectionRange(caret, caret);
+      }
+    };
+
+    const runPersonSearch = (term) => {
+      personUI.term = term;
+      const seq = ++personUI.searchSeq;
+      if (term.trim().length < 3) {
+        personUI.loading = false;
+        personUI.error = '';
+        personUI.results = [];
+        refreshPersonBox();
+        return;
+      }
+      personUI.loading = true;
+      personUI.error = '';
+      refreshPersonBox();
+      People.search(term)
+        .then((people) => {
+          if (seq !== personUI.searchSeq) return;   // resposta de uma busca ja superada
+          personUI.loading = false;
+          personUI.results = people;
+          refreshPersonBox();
+        })
+        .catch((err) => {
+          if (seq !== personUI.searchSeq) return;
+          personUI.loading = false;
+          personUI.results = [];
+          personUI.error = `Falha na busca: ${err.message || err}`;
+          refreshPersonBox();
+        });
+    };
+
+    // O molde guarda so o Id; busca o nome uma vez e atualiza a caixa quando chegar.
+    const ensureRequesterName = () => {
+      const id = defaultRequesterId();
+      if (!id || People.nameFor(id)) return;
+      People.resolveName(id)
+        .then((name) => { if (name) refreshPersonBox(); })
+        .catch(() => { /* fica mostrando #id — nao vale travar o painel por isso */ });
     };
 
     /* ---------- Aba: Abrir ---------- */
@@ -827,7 +1047,7 @@
         <div class="smax-gl-note smax-gl-note-ok">
           Molde aprendido em <strong>${Utils.formatBrDateTime(molde.capturedAt)}</strong> —
           ${Object.keys(Molde.getProperties(molde)).length} campos.
-          Título, descrição e urgência abaixo sobrescrevem o molde; todo o resto é replicado.
+          Título, descrição, urgência e solicitante abaixo sobrescrevem o molde; todo o resto é replicado.
         </div>
 
         <div class="smax-gl-field">
@@ -835,6 +1055,11 @@
           <input id="smax-gl-title" class="smax-gl-input" type="text"
                  placeholder="Ex.: Indisponibilidade do SAJ — Comarca de..."
                  value="${Utils.escapeHtml(form.title)}">
+        </div>
+
+        <div class="smax-gl-field">
+          <label class="smax-gl-label">Solicitado para</label>
+          <div id="smax-gl-person-box">${renderPersonBox()}</div>
         </div>
 
         <div class="smax-gl-field">
@@ -875,7 +1100,7 @@
         </div>
         <table class="smax-gl-kv">
           ${Object.entries(Molde.getProperties(molde)).map(([k, v]) => {
-            const overridden = ['DisplayLabel', 'Description', 'Urgency', 'ImpactScope'].includes(k);
+            const overridden = ['DisplayLabel', 'Description', 'Urgency', 'ImpactScope', Molde.REQUESTER_KEY].includes(k);
             const stripped = Molde.STRIP_KEYS.includes(k);
             const raw = typeof v === 'object' ? JSON.stringify(v) : String(v ?? '');
             const shown = raw.length > 220 ? raw.slice(0, 220) + '…' : raw;
@@ -998,6 +1223,7 @@
            </button>`
         : '';
 
+      if (activeTab === 'abrir' && prefs.molde) ensureRequesterName();
       syncLauncher();
     };
 
@@ -1010,7 +1236,8 @@
       return {
         title: form.title,
         urgency: form.urgency,
-        descriptionHtml: Utils.normalizeContentEditableHtml(form.descriptionHtml)
+        descriptionHtml: Utils.normalizeContentEditableHtml(form.descriptionHtml),
+        requesterId: form.requester ? form.requester.id : ''
       };
     };
 
@@ -1018,6 +1245,7 @@
       if (!prefs.molde) return 'Nenhum molde aprendido.';
       if (!data.title) return 'Informe o título do chamado.';
       if (!Utils.htmlToText(data.descriptionHtml)) return 'Informe a descrição do chamado.';
+      if (!data.requesterId && !defaultRequesterId()) return 'Escolha para quem o chamado será aberto.';
       return '';
     };
 
@@ -1230,6 +1458,28 @@
 
         if (act === 'fechar') { close(); }
         else if (act === 'tema') { ThemeManager.toggle(); }
+        else if (act === 'trocar-solicitante') {
+          personUI.open = !personUI.open;
+          refreshPersonBox();
+          if (personUI.open) {
+            const input = overlay.querySelector('#smax-gl-person-q');
+            if (input) input.focus();
+            // Abre ja com os solicitantes validos de global listados.
+            if (!personUI.results.length) runPersonSearch(personUI.term || People.SEED_TERM);
+          }
+        }
+        else if (act === 'resetar-solicitante') {
+          form.requester = null;
+          refreshPersonBox();
+          setStatus('Solicitante de volta ao padrão do molde.');
+        }
+        else if (act === 'escolher-pessoa') {
+          const btn = ev.target.closest('[data-id]');
+          form.requester = { id: btn.dataset.id, name: btn.dataset.name };
+          personUI.open = false;
+          refreshPersonBox();
+          setStatus(`Solicitado para: ${form.requester.name}.`, 'ok');
+        }
         else if (act === 'criar') { criar(); }
         else if (act === 'preview') {
           const data = readForm();
@@ -1297,6 +1547,12 @@
       overlay.addEventListener('input', (ev) => {
         if (ev.target.id === 'smax-gl-title') form.title = ev.target.value;
         if (ev.target.id === 'smax-gl-desc') form.descriptionHtml = ev.target.innerHTML;
+        if (ev.target.id === 'smax-gl-person-q') {
+          personUI.term = ev.target.value;
+          clearTimeout(personDebounce);
+          const term = personUI.term;
+          personDebounce = setTimeout(() => runPersonSearch(term), 300);
+        }
       });
 
       // Cola sempre como texto limpo — evita trazer markup do Word/Outlook.
@@ -1355,6 +1611,10 @@
       wire();
       document.addEventListener('keydown', onKeydown);
       unsubscribe = Capture.onChange(() => { if (activeTab === 'aprender') render(); syncLauncher(); });
+
+      // Solicitante volta ao padrao do molde a cada abertura do painel.
+      form.requester = null;
+      Object.assign(personUI, { open: false, term: '', loading: false, error: '', results: [] });
 
       activeTab = prefs.molde ? 'abrir' : 'aprender';
       ThemeManager.apply(ThemeManager.current());

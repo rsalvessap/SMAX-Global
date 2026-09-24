@@ -20,7 +20,7 @@ Em vez de adivinhar quais são, o script **aprende observando**:
    normalmente, pela tela nativa do SMAX, **indo até marcar "É Global"**. O script intercepta os
    corpos das requisições que a própria UI do SMAX enviou e guarda como molde.
 2. **Abrir chamado** (sempre) — você preenche título, descrição e urgência. O script clona o
-   molde, sobrescreve esses três campos, descarta os campos de identidade do chamado antigo
+   molde, sobrescreve esses campos, descarta os campos de identidade do chamado antigo
    e reenvia no mesmo endpoint.
 
 ### São duas requisições, não uma
@@ -62,8 +62,23 @@ apareceu, é ali que se vê o formato real do payload — sem precisar adivinhar
 | `DisplayLabel` | você digita |
 | `Description` | você digita (editor rich-text) |
 | `Urgency` + `ImpactScope` | preset Baixa / Média / Alta / Crítica |
+| `RequestedForPerson` | vem do molde; dá para trocar no painel |
 | `Id`, `CreateTime`, `LastUpdateTime`, `UpdateTime`, `Comments` | **descartados** |
 | todo o resto | replicado do molde |
+
+### Solicitado para
+
+O molde congela o solicitante da captura, que é o caso comum. Quando for preciso abrir para
+outro, o campo **Solicitado para** tem um seletor: ele já abre listando os usuários
+`GLOBAL EPROC` (os válidos para global), e aceita busca livre por início de nome.
+
+A escolha **não persiste** — ao reabrir o painel o campo volta ao padrão do molde. Trocar é
+exceção; se ficasse gravado, uma troca pontual viraria o padrão silencioso da próxima abertura.
+
+A entidade `Person` do SMAX rejeita `LIKE`/`%`, então a busca é por range de prefixo
+(`Name >= 'TERMO' and Name < 'TERMP'`). O molde guarda só o `Id` do solicitante, então o nome
+exibido vem de um cache `Id → Nome` em `GM_setValue` — sem ele o painel mostraria um número
+a cada recarga de página.
 
 O corpo inteiro da requisição é clonado — não só `properties` — para que qualquer campo irmão
 que o SMAX espere viaje junto no replay.
@@ -96,6 +111,9 @@ O servidor também finge ser a API do SMAX: responde `POST /rest/{tenant}/...` c
 cada `CREATE`. Isso permite exercitar o replay inteiro — criação **e** marcação "É Global" — sem
 tocar em produção. O log do servidor mostra cada chamada, e é ali que se confirma que o `CREATE`
 foi sem `Id` e que o `UPDATE` seguinte usou o ID recém-criado.
+
+O mock também serve `GET ems/Person`, reproduzindo o range de prefixo, com quatro pessoas
+`GLOBAL EPROC` e duas fora do grupo — as duas existem para provar que o filtro exclui mesmo.
 
 Os botões do harness disparam XHR/fetch imitando o SMAX: criação, marcação "É Global" e ruído.
 O botão de ruído confirma que GET e `UPDATE` de outras entidades **não** viram candidato a molde.

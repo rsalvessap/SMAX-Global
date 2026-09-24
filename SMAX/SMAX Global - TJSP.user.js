@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SMAX Global - TJSP
 // @namespace    https://github.com/rsalvessap/SMAX-Global
-// @version      1.3
+// @version      1.4
 // @description  Abertura automatizada de chamado global no SMAX TJSP — aprende o molde a partir de uma abertura manual e replica trocando titulo, descricao, urgencia e solicitante
 // @author       rsalvessap
 // @match        https://suporte.tjsp.jus.br/saw/*
@@ -23,7 +23,7 @@
   if (window.top && window.top !== window.self) return;
   if (window.location.hostname !== 'suporte.tjsp.jus.br') return;
 
-  const SMAX_GLOBAL_VERSION = '1.3';
+  const SMAX_GLOBAL_VERSION = '1.4';
 
   // O userscript roda em sandbox; quem dispara as requisicoes e a pagina.
   const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
@@ -46,6 +46,10 @@
       // O SMAX recarrega a pagina ao navegar ate a tela de abertura, entao o
       // modo aprender e as capturas precisam sobreviver a um reload.
       learning: false,
+      // Modo seco: captura o payload e CANCELA a requisicao, para aprender o
+      // molde sem abrir chamado de verdade. Padrao ligado — aprender nao
+      // deveria custar um chamado em producao.
+      learnDryRun: true,
       candidates: [],
       sniffer: [],          // tudo que passou pelo interceptador e NAO virou candidato
       // Cache Id -> Name de pessoas. O molde guarda so o Id do solicitante; sem
@@ -394,6 +398,7 @@
     // Estado vem do storage: arming e capturas precisam sobreviver ao reload
     // que o SMAX faz ao navegar ate a tela de abertura de chamado.
     let armed = !!prefs.learning;
+    let dryRun = prefs.learnDryRun !== false;
     const candidates = Array.isArray(prefs.candidates) ? prefs.candidates.slice() : [];
     const sniffer = Array.isArray(prefs.sniffer) ? prefs.sniffer.slice() : [];
 
@@ -401,6 +406,7 @@
 
     const persist = () => {
       prefs.learning = armed;
+      prefs.learnDryRun = dryRun;
       prefs.candidates = candidates.slice(0, MAX_PERSISTED);
       prefs.sniffer = sniffer.slice(0, MAX_SNIFFER);
       Store.save();
@@ -463,32 +469,68 @@
       return 0;
     };
 
-    const record = ({ method, url, body, responseText }) => {
-      if (!armed) return;
-      if (String(method || '').toUpperCase() === 'GET') return;
-
+    // Decide se um corpo vira molde SEM depender da resposta. E o que permite o
+    // modo seco: avaliar antes de a requisicao sair do navegador.
+    const evaluate = ({ method, url, body }) => {
+      if (String(method || '').toUpperCase() === 'GET') return { skip: true };
       const raw = bodyToString(body);
-
-      if (!RE_REST.test(url)) { sniff({ method, url, body, raw, reason: 'URL fora de /rest/{tenant}/' }); return; }
-
+      if (!RE_REST.test(url)) return { raw, reason: 'URL fora de /rest/{tenant}/' };
       const json = parseBody(raw);
-      if (!json) { sniff({ method, url, body, raw, reason: 'corpo nao e JSON' }); return; }
-
+      if (!json) return { raw, reason: 'corpo nao e JSON' };
       const score = scoreCandidate(json);
-      if (!score) { sniff({ method, url, body, raw, reason: 'JSON sem CREATE de Request' }); return; }
+      if (!score) return { raw, reason: 'JSON sem CREATE de Request' };
+      return { raw, json, score };
+    };
 
+    const pushCandidate = ({ method, url, json, score, responseText, blocked }) => {
       candidates.unshift({
         capturedAt: Date.now(),
         method: String(method || '').toUpperCase(),
         url,
         score,
+        blocked: !!blocked,
         body: json,
         response: parseBody(responseText)
       });
       if (candidates.length > MAX_CANDIDATES) candidates.length = MAX_CANDIDATES;
-      console.info('[SMAX Global] Candidato capturado (score %d): %s', score, url);
+      console.info('[SMAX Global] Candidato capturado (score %d%s): %s', score, blocked ? ', modo seco' : '', url);
       persist();
       notify();
+    };
+
+    const record = ({ method, url, body, responseText }) => {
+      if (!armed) return;
+      const ev = evaluate({ method, url, body });
+      if (ev.skip) return;
+      if (!ev.json) { sniff({ method, url, body, raw: ev.raw, reason: ev.reason }); return; }
+      pushCandidate({ method, url, json: ev.json, score: ev.score, responseText });
+    };
+
+    // Modo seco: captura e devolve true para o chamador CANCELAR o envio.
+    // O erro de salvamento que o SMAX mostra e a prova de que nada foi criado.
+    const interceptBeforeSend = ({ method, url, body }) => {
+      if (!armed || !dryRun) return false;
+      const ev = evaluate({ method, url, body });
+      if (ev.skip) return false;
+      if (!ev.json) { sniff({ method, url, body, raw: ev.raw, reason: ev.reason }); return false; }
+      pushCandidate({ method, url, json: ev.json, score: ev.score, blocked: true });
+      console.warn('[SMAX Global] MODO SECO — requisição capturada e CANCELADA, nada foi salvo:', url);
+      return true;
+    };
+
+    // readyState e somente leitura, entao nao da para forjar uma resposta: o que
+    // se dispara e o evento de erro, igual a uma queda de rede. Se a tela do SMAX
+    // ficar girando em vez de acusar erro, basta recarregar — nada saiu daqui.
+    const failLocally = (xhr) => {
+      setTimeout(() => {
+        try {
+          const mk = (type) => (typeof ProgressEvent === 'function' ? new ProgressEvent(type) : new Event(type));
+          xhr.dispatchEvent(mk('error'));
+          xhr.dispatchEvent(mk('loadend'));
+        } catch (err) {
+          console.warn('[SMAX Global] Falha ao sinalizar erro do XHR seco:', err);
+        }
+      }, 0);
     };
 
     const patch = () => {
@@ -506,16 +548,34 @@
 
         XHR.prototype.send = function patchedSend(body) {
           const reqBody = body;
-          this.addEventListener('load', function onLoad() {
-            try {
-              record({
-                method: this.__smaxGlobalMethod,
-                url: this.__smaxGlobalUrl || this.responseURL || '',
-                body: reqBody,
-                responseText: this.responseText
-              });
-            } catch { }
-          });
+          const method = this.__smaxGlobalMethod;
+          const url = this.__smaxGlobalUrl || '';
+
+          try {
+            if (interceptBeforeSend({ method, url, body: reqBody })) {
+              failLocally(this);
+              return;   // a requisicao nao chega a existir
+            }
+          } catch (err) {
+            // Se a avaliacao falhar, deixa seguir: bloquear por engano e pior
+            // do que perder uma captura.
+            console.warn('[SMAX Global] Falha ao avaliar XHR no modo seco:', err);
+          }
+
+          // No modo seco os nao-candidatos ja foram para o diagnostico acima;
+          // registrar de novo na resposta duplicaria tudo.
+          if (armed && !dryRun) {
+            this.addEventListener('load', function onLoad() {
+              try {
+                record({
+                  method: this.__smaxGlobalMethod,
+                  url: this.__smaxGlobalUrl || this.responseURL || '',
+                  body: reqBody,
+                  responseText: this.responseText
+                });
+              } catch { }
+            });
+          }
           return origSend.call(this, body);
         };
 
@@ -531,6 +591,24 @@
             else if (input && typeof input === 'object' && typeof input.clone === 'function') {
               bodyPromise = input.clone().text().catch(() => null);
             } else bodyPromise = Promise.resolve(null);
+
+            // Modo seco: precisa do corpo ANTES de enviar. Quando ele vem dentro
+            // de um Request so da para ler de forma assincrona, entao aqui o
+            // fetch vira async um passo antes — so enquanto aprendendo.
+            if (armed && dryRun && String(method).toUpperCase() !== 'GET') {
+              const self = this;
+              return bodyPromise.then((reqBody) => {
+                let blocked = false;
+                try {
+                  blocked = interceptBeforeSend({ method, url, body: reqBody });
+                } catch (err) {
+                  console.warn('[SMAX Global] Falha ao avaliar fetch no modo seco:', err);
+                }
+                // Mesma falha que o navegador daria sem rede.
+                if (blocked) return Promise.reject(new TypeError('Failed to fetch'));
+                return origFetch.call(self, input, init);
+              });
+            }
 
             return origFetch.call(this, input, init).then((resp) => {
               try {
@@ -555,6 +633,8 @@
       arm: () => { armed = true; persist(); notify(); },
       disarm: () => { armed = false; persist(); notify(); },
       isArmed: () => armed,
+      isDryRun: () => dryRun,
+      setDryRun: (v) => { dryRun = !!v; persist(); notify(); },
       getCandidates: () => candidates.slice(),
       getSniffer: () => sniffer.slice(),
       clear: () => { candidates.length = 0; sniffer.length = 0; persist(); notify(); },
@@ -914,7 +994,7 @@
       if (!launcher) return;
       launcher.dataset.armed = Capture.isArmed() ? 'true' : 'false';
       launcher.title = Capture.isArmed()
-        ? 'SMAX Global — MODO APRENDER ativo (abra um global pela tela nativa)'
+        ? `SMAX Global — MODO APRENDER ativo${Capture.isDryRun() ? ' (seco: o SMAX vai acusar erro ao salvar, e nada é criado)' : ' (SEM modo seco: o chamado será criado de verdade)'}`
         : 'SMAX Global — abrir chamado global';
     };
 
@@ -1137,6 +1217,7 @@
                 ${Utils.escapeHtml(String(c.body.operation || '?'))}
                 ${(c.body.entities || []).map(e => Utils.escapeHtml(String(e.entity_type || '?'))).join(', ') || '—'}
                 ${c.score >= 100 ? '<span class="smax-gl-badge smax-gl-badge-best">melhor candidato</span>' : ''}
+                ${c.blocked ? '<span class="smax-gl-badge smax-gl-badge-best">não foi salvo</span>' : '<span class="smax-gl-badge">salvo no SMAX</span>'}
               </div>
               <div class="smax-gl-cand-meta">${Utils.formatBrDateTime(c.capturedAt)} · ${Utils.escapeHtml(c.method)} ${Utils.escapeHtml(c.url)}</div>
             </div>
@@ -1173,18 +1254,37 @@
           </div>
         </details>` : '';
 
+      const dry = Capture.isDryRun();
+
       return `
         <div class="smax-gl-note ${armed ? 'smax-gl-note-warn' : ''}">
           <strong>Como funciona</strong><br>
           1. Clique em <strong>Ativar modo aprender</strong>.<br>
-          2. Abra <em>um</em> chamado global normalmente, pela tela nativa do SMAX, e
-             <strong>siga até marcar “É Global”</strong> em Classificação. São duas requisições:
-             a criação e a marcação.<br>
+          2. Preencha <em>um</em> chamado global normalmente, pela tela nativa do SMAX, e
+             <strong>salve</strong>. Depois marque <strong>“É Global”</strong> em Classificação e
+             salve de novo. São duas requisições: a criação e a marcação.<br>
           3. Volte aqui: use a captura <em>CREATE</em> em <strong>Usar como molde</strong> e a
              captura do <em>UPDATE</em> em <strong>Usar como passo 2</strong>.<br>
-          4. A partir daí, a aba <strong>Abrir</strong> replica os dois, trocando título, descrição e urgência.<br>
-          <br>
-          Nada é enviado durante o aprendizado — o script só observa o tráfego que a própria tela do SMAX já faz.
+          4. A partir daí, a aba <strong>Abrir</strong> replica os dois, trocando título, descrição,
+             urgência e solicitante.
+        </div>
+
+        <div class="smax-gl-note ${dry ? 'smax-gl-note-ok' : 'smax-gl-note-warn'}">
+          <strong>${dry ? 'Modo seco ligado — nada é salvo.' : 'Modo seco desligado — o chamado é criado de verdade.'}</strong><br>
+          ${dry
+            ? `Ao salvar, o script <strong>intercepta e cancela</strong> a requisição: ela não sai do
+               navegador. O SMAX vai <strong>acusar erro ao salvar</strong> — esse erro é justamente a
+               prova de que nada foi criado. O payload já terá sido capturado.<br>
+               Para o passo 2, marque “É Global” em um chamado comum qualquer e salve: o chamado
+               também não é alterado.<br>
+               <em>Se a tela travar em vez de acusar erro, recarregue — a captura fica guardada.</em>`
+            : `Ao salvar, a requisição vai ao SMAX normalmente e o chamado <strong>é aberto em
+               produção</strong>. Use isso só se o modo seco não funcionar nesta tela.`}
+          <div style="margin-top:8px;">
+            <button class="smax-gl-btn" data-act="toggle-seco">
+              ${dry ? 'Desligar modo seco (vai salvar de verdade)' : 'Ligar modo seco (não salva)'}
+            </button>
+          </div>
         </div>
 
         <div style="display:flex; gap:8px; margin-bottom:14px;">
@@ -1243,6 +1343,9 @@
 
     const validate = (data) => {
       if (!prefs.molde) return 'Nenhum molde aprendido.';
+      // Com o modo aprender ligado o script cancelaria a propria criacao (seco)
+      // ou capturaria a si mesmo como candidato. Nos dois casos, so confunde.
+      if (Capture.isArmed()) return 'Desligue o modo aprender antes de abrir um chamado.';
       if (!data.title) return 'Informe o título do chamado.';
       if (!Utils.htmlToText(data.descriptionHtml)) return 'Informe a descrição do chamado.';
       if (!data.requesterId && !defaultRequesterId()) return 'Escolha para quem o chamado será aberto.';
@@ -1491,6 +1594,13 @@
         else if (act === 'toggle-aprender') {
           Capture.isArmed() ? Capture.disarm() : Capture.arm();
           render();
+        }
+        else if (act === 'toggle-seco') {
+          const ligando = !Capture.isDryRun();
+          if (!ligando && !confirm('Desligar o modo seco faz o SMAX salvar de verdade: o chamado que você usar para aprender será aberto em produção. Continuar?')) return;
+          Capture.setDryRun(ligando);
+          render();
+          setStatus(ligando ? 'Modo seco ligado — nada será salvo.' : 'Modo seco desligado — o chamado será aberto de verdade.', ligando ? 'ok' : 'err');
         }
         else if (act === 'limpar-capturas') { Capture.clear(); render(); }
         else if (act === 'copiar-diagnostico') {

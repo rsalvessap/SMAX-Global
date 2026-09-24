@@ -16,9 +16,9 @@ O SMAX exige um punhado de campos para criar um `Request` (serviço, oferta, sol
 grupo designado, campos customizados `_c`…) e esses campos variam por instalação.
 Em vez de adivinhar quais são, o script **aprende observando**:
 
-1. **Aprender molde** (uma vez) — você ativa o modo aprender e abre *um* chamado global
+1. **Aprender molde** (uma vez) — você ativa o modo aprender e preenche *um* chamado global
    normalmente, pela tela nativa do SMAX, **indo até marcar "É Global"**. O script intercepta os
-   corpos das requisições que a própria UI do SMAX enviou e guarda como molde.
+   corpos das requisições que a própria UI do SMAX enviaria e guarda como molde.
 2. **Abrir chamado** (sempre) — você preenche título, descrição e urgência. O script clona o
    molde, sobrescreve esses campos, descarta os campos de identidade do chamado antigo
    e reenvia no mesmo endpoint.
@@ -42,8 +42,31 @@ O procedimento pede um global por público/oferta (1º Grau, 2º Grau, Externo),
 solicitante e oferta — campos congelados no molde. O escopo aqui é **uma equipe só**, então um
 molde basta. Para abrir de um público diferente é preciso recapturar.
 
-Durante o aprendizado nada é enviado: o script apenas observa o tráfego que a tela do SMAX
-já faria de qualquer jeito.
+### Modo seco — aprender sem abrir chamado
+
+Aprender não deveria custar um chamado em produção. Com o **modo seco** (ligado por padrão), o
+interceptador decide **antes** de a requisição sair: se o corpo serve como molde, ele é guardado
+e a requisição é **cancelada** — nada chega ao servidor.
+
+Na prática: você preenche a tela do SMAX, clica em salvar, e **o SMAX acusa erro ao salvar**.
+Esse erro é a confirmação de que nada foi criado. O molde já está capturado. Para o passo 2,
+marque "É Global" em um chamado comum qualquer e salve — o chamado também não é alterado.
+
+O cancelamento é local: o XHR recebe um evento `error` (status 0) e o `fetch` rejeita com
+`TypeError`, exatamente como numa queda de rede. Não dá para forjar `readyState`, então se
+alguma tela ficar girando em vez de acusar erro, é só recarregar — a captura fica guardada.
+
+Duas consequências que valem saber:
+
+- Enquanto o modo aprender está ligado, **qualquer** save de um `Request` é cancelado, não só o
+  do global. Não deixe o modo ligado enquanto trabalha normalmente.
+- Abrir chamado pelo painel fica bloqueado com o modo aprender ligado — senão o script cancelaria
+  a própria criação.
+
+Se em alguma tela o modo seco não funcionar, dá para desligá-lo e aprender abrindo um chamado
+de verdade (o comportamento das versões anteriores). O painel pede confirmação antes.
+
+As capturas são marcadas com **não foi salvo** ou **salvo no SMAX**, para não restar dúvida.
 
 O modo aprender e as capturas ficam em `GM_setValue`, não em memória: o SMAX recarrega a página
 ao navegar até a tela de abertura, e um estado só em memória se perderia no meio do fluxo.

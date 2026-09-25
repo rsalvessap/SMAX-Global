@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SMAX Global - TJSP
 // @namespace    https://github.com/rsalvessap/SMAX-Global
-// @version      1.4
+// @version      1.5
 // @description  Abertura automatizada de chamado global no SMAX TJSP — aprende o molde a partir de uma abertura manual e replica trocando titulo, descricao, urgencia e solicitante
 // @author       rsalvessap
 // @match        https://suporte.tjsp.jus.br/saw/*
@@ -23,7 +23,7 @@
   if (window.top && window.top !== window.self) return;
   if (window.location.hostname !== 'suporte.tjsp.jus.br') return;
 
-  const SMAX_GLOBAL_VERSION = '1.4';
+  const SMAX_GLOBAL_VERSION = '1.5';
 
   // O userscript roda em sandbox; quem dispara as requisicoes e a pagina.
   const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
@@ -56,6 +56,14 @@
       // isso o painel mostraria um numero ate a busca remota responder, a cada
       // reload do SMAX.
       personNames: {},
+      // Solucao de contorno. No SMAX ela nao e um campo do Request: e uma
+      // DISCUSSAO com FunctionalPurpose 'SolucaoContorno_c'. Por isso nao precisa
+      // de molde capturado — o payload e conhecido.
+      // O texto e um padrao da equipe, editavel a cada abertura; so o botao
+      // "salvar como padrao" persiste uma alteracao.
+      contornoPadrao: '',
+      contornoTo: 'Agent',
+      contornoPurpose: 'SolucaoContorno_c',
     };
 
     const state = JSON.parse(JSON.stringify(defaults));
@@ -728,6 +736,85 @@
   })();
 
   /* =========================================================
+   * Discussion — comentario no Request.
+   *
+   * A "solucao de contorno" do procedimento da equipe NAO e um campo do Request:
+   * e uma discussao com FunctionalPurpose 'SolucaoContorno_c'. Por isso esta parte
+   * nao usa molde capturado — o payload e conhecido e estavel.
+   *
+   * Portado do SMAX Respostas ADM (postDiscussion), que ja roda em producao.
+   * =======================================================*/
+  const Discussion = (() => {
+    // "Para" define quem ve o comentario. So 'User' e publico; o resto e interno.
+    const TO_OPTIONS = [
+      ['Agent',               '→ Agente'],
+      ['User',                '→ Usuário'],
+      ['Vendor',              '→ Fornecedor'],
+      ['ExternalServiceDesk', '→ Central Externa'],
+      ['Stakeholder',         '→ Participantes'],
+    ];
+
+    const PURPOSE_OPTIONS = [
+      ['SolucaoContorno_c',       'Solução de Contorno'],
+      ['StatusUpdate',            'Atualização de status'],
+      ['FollowUp',                'Acompanhamento'],
+      ['Resolution',              'Resolução'],
+      ['ResolutionActivity',      'Atividade de resolução'],
+      ['RequestMoreInformation',  'Solicitar mais informações'],
+      ['ProvideInformation',      'Fornecer informações'],
+      ['EndUserComment',          'Comentário do usuário'],
+      ['Diagnosis',               'Diagnóstico'],
+      ['SCCDComment_c',           'Comentário para SCCD'],
+      ['Fornecedor_c',           'Comentário para Fornecedor'],
+    ];
+
+    const randomCommentId = () => {
+      const bytes = new Uint8Array(18);
+      crypto.getRandomValues(bytes);
+      return [...bytes].map(b => b.toString(16).padStart(2, '0')).join('');
+    };
+
+    // O SMAX nao aceita "acrescentar" um comentario: o campo Comments e reescrito
+    // inteiro. Num global recem-criado a lista esta vazia, entao aqui ela comeca
+    // vazia — este script so comenta em chamado que ele mesmo acabou de abrir.
+    const buildPayload = ({ ticketId, bodyHtml, commentTo, purposeCode, submitterId = '' }) => {
+      const comment = {
+        CommentId: randomCommentId(),
+        Submitter: submitterId ? `Person/${submitterId}` : '',
+        CreateTime: Date.now(),
+        UpdateTime: 0,
+        IsSystem: false,
+        ActualInterface: 'SAW',
+        CommentMedia: 'UI',
+        CommentFrom: 'Agent',
+        FunctionalPurpose: purposeCode || 'StatusUpdate',
+        PrivacyType: commentTo === 'User' ? 'PUBLIC' : 'INTERNAL',
+        CommentTo: commentTo || 'Agent',
+        CommentBody: bodyHtml,
+        DeltaCreateTime: 1,
+        AttachmentIds: ''
+      };
+      return {
+        entities: [{
+          entity_type: 'Request',
+          properties: { Id: String(ticketId), Comments: JSON.stringify({ Comment: [comment] }) }
+        }],
+        operation: 'UPDATE'
+      };
+    };
+
+    const post = (args) => ApiClient.request('ems/bulk', {
+      method: 'POST',
+      body: buildPayload(args),
+      useXsrf: true
+    });
+
+    const labelFor = (list, key) => (list.find(([k]) => k === key) || [])[1] || key;
+
+    return { TO_OPTIONS, PURPOSE_OPTIONS, buildPayload, post, labelFor };
+  })();
+
+  /* =========================================================
    * ThemeManager
    * =======================================================*/
   const ThemeManager = (() => {
@@ -863,14 +950,17 @@
 .smax-gl-body { padding:16px; overflow-y:auto; flex:1 1 auto; }
 .smax-gl-field { margin-bottom:14px; }
 .smax-gl-label { display:block; font-size:11px; font-weight:600; color:var(--sp-text-muted); margin-bottom:5px; text-transform:uppercase; letter-spacing:.4px; }
-.smax-gl-input, .smax-gl-editor {
+.smax-gl-input, .smax-gl-editor, .smax-gl-select {
   width:100%; box-sizing:border-box; background:var(--sp-input-bg);
   border:1px solid var(--sp-input-border); color:var(--sp-input-text);
   border-radius:var(--sp-r-md); padding:8px 10px; font-size:13px;
   font-family:inherit; outline:none; transition:border-color .15s, box-shadow .15s;
 }
-.smax-gl-input:focus, .smax-gl-editor:focus { border-color:var(--sp-accent); box-shadow:0 0 0 3px var(--sp-ring); }
+.smax-gl-input:focus, .smax-gl-editor:focus, .smax-gl-select:focus { border-color:var(--sp-accent); box-shadow:0 0 0 3px var(--sp-ring); }
 .smax-gl-editor { min-height:190px; max-height:340px; overflow-y:auto; line-height:1.5; text-align:left; }
+.smax-gl-editor-sm { min-height:90px; max-height:200px; }
+.smax-gl-row { display:flex; gap:8px; align-items:flex-end; margin-top:8px; }
+.smax-gl-row > div { flex:1 1 0; min-width:0; }
 .smax-gl-editor:empty:before { content:attr(data-placeholder); color:var(--sp-text-dim); }
 
 .smax-gl-toolbar { display:flex; flex-wrap:wrap; gap:3px; padding:5px; background:var(--sp-surface-2); border:1px solid var(--sp-input-border); border-bottom:none; border-radius:var(--sp-r-md) var(--sp-r-md) 0 0; }
@@ -975,7 +1065,11 @@
       descriptionHtml: '',
       // null = usa o solicitante congelado no molde. Trocar e excecao, entao nao
       // persiste entre aberturas do painel — senao uma troca pontual viraria padrao.
-      requester: null
+      requester: null,
+      // Contorno comeca no padrao da equipe e e editavel; editar nao muda o padrao.
+      contornoHtml: prefs.contornoPadrao || '',
+      contornoTo: prefs.contornoTo || 'Agent',
+      contornoPurpose: prefs.contornoPurpose || 'SolucaoContorno_c'
     };
 
     const personUI = { open: false, term: '', loading: false, error: '', results: [], searchSeq: 0 };
@@ -1164,6 +1258,30 @@
           </div>
           <div id="smax-gl-desc" class="smax-gl-editor" contenteditable="true"
                data-placeholder="Descreva a ocorrência que este chamado global vai concentrar..."></div>
+        </div>
+
+        <div class="smax-gl-field">
+          <label class="smax-gl-label">Solução de contorno <span style="text-transform:none;font-weight:400;">— vai como discussão no chamado; deixe vazio para não postar</span></label>
+          <div id="smax-gl-contorno" class="smax-gl-editor smax-gl-editor-sm" contenteditable="true"
+               data-placeholder="Orientação de contorno para quem for atendido por este global..."></div>
+          <div class="smax-gl-row">
+            <div>
+              <label class="smax-gl-label" for="smax-gl-disc-to">Para</label>
+              <select id="smax-gl-disc-to" class="smax-gl-select">
+                ${Discussion.TO_OPTIONS.map(([v, l]) => `
+                  <option value="${v}" ${form.contornoTo === v ? 'selected' : ''}>${Utils.escapeHtml(l)}</option>`).join('')}
+              </select>
+            </div>
+            <div>
+              <label class="smax-gl-label" for="smax-gl-disc-purpose">Objetivo</label>
+              <select id="smax-gl-disc-purpose" class="smax-gl-select">
+                ${Discussion.PURPOSE_OPTIONS.map(([v, l]) => `
+                  <option value="${v}" ${form.contornoPurpose === v ? 'selected' : ''}>${Utils.escapeHtml(l)}</option>`).join('')}
+              </select>
+            </div>
+            <button class="smax-gl-btn" data-act="salvar-contorno-padrao"
+                    title="Guarda o texto e as opções atuais como padrão das próximas aberturas">Salvar como padrão</button>
+          </div>
         </div>`;
     };
 
@@ -1312,9 +1430,11 @@
 
       body.innerHTML = activeTab === 'abrir' ? renderAbrir() : renderAprender();
 
-      // Restaura o conteudo do editor (innerHTML nao sobrevive ao re-render)
+      // Restaura o conteudo dos editores (innerHTML nao sobrevive ao re-render)
       const desc = body.querySelector('#smax-gl-desc');
       if (desc) desc.innerHTML = form.descriptionHtml;
+      const contorno = body.querySelector('#smax-gl-contorno');
+      if (contorno) contorno.innerHTML = form.contornoHtml;
 
       footer.innerHTML = activeTab === 'abrir' && prefs.molde
         ? `<button class="smax-gl-btn" data-act="preview">Ver payload</button>
@@ -1331,13 +1451,24 @@
     const readForm = () => {
       const titleEl = overlay.querySelector('#smax-gl-title');
       const descEl = overlay.querySelector('#smax-gl-desc');
+      const contornoEl = overlay.querySelector('#smax-gl-contorno');
+      const toEl = overlay.querySelector('#smax-gl-disc-to');
+      const purposeEl = overlay.querySelector('#smax-gl-disc-purpose');
       if (titleEl) form.title = titleEl.value.trim();
       if (descEl) form.descriptionHtml = descEl.innerHTML;
+      if (contornoEl) form.contornoHtml = contornoEl.innerHTML;
+      if (toEl) form.contornoTo = toEl.value;
+      if (purposeEl) form.contornoPurpose = purposeEl.value;
+      const contornoHtml = Utils.normalizeContentEditableHtml(form.contornoHtml);
       return {
         title: form.title,
         urgency: form.urgency,
         descriptionHtml: Utils.normalizeContentEditableHtml(form.descriptionHtml),
-        requesterId: form.requester ? form.requester.id : ''
+        requesterId: form.requester ? form.requester.id : '',
+        // Vazio = nao posta discussao nenhuma.
+        contornoHtml: Utils.htmlToText(contornoHtml) ? contornoHtml : '',
+        contornoTo: form.contornoTo,
+        contornoPurpose: form.contornoPurpose
       };
     };
 
@@ -1353,7 +1484,7 @@
     };
 
     /* ---------- Modal de confirmacao ---------- */
-    const confirmModal = (payload) => new Promise((resolve) => {
+    const confirmModal = (payload, contornoPayload = null) => new Promise((resolve) => {
       const wrap = document.createElement('div');
       wrap.className = 'smax-gl-overlay smax-gl-modal smax-gl-root';
       wrap.dataset.theme = ThemeManager.current();
@@ -1369,7 +1500,15 @@
             <div class="smax-gl-note smax-gl-note-warn">
               Isso cria um chamado <strong>real</strong> no SMAX de produção. Revise antes de confirmar.
             </div>
+            <div class="smax-gl-label">1. Criar o chamado</div>
             <pre class="smax-gl-pre">${Utils.escapeHtml(JSON.stringify(payload, null, 2))}</pre>
+            ${prefs.moldeGlobal
+              ? '<div class="smax-gl-note smax-gl-note-ok">2. Marcar <strong>“É Global”</strong> — replay do passo 2 aprendido, com o Id do chamado novo.</div>'
+              : '<div class="smax-gl-note smax-gl-note-warn">2. <strong>“É Global” não será marcado</strong> — o passo 2 não foi aprendido. O chamado nascerá comum.</div>'}
+            ${contornoPayload ? `
+              <div class="smax-gl-label" style="margin-top:12px;">3. Postar a solução de contorno</div>
+              <pre class="smax-gl-pre">${Utils.escapeHtml(JSON.stringify(contornoPayload, null, 2))}</pre>`
+              : '<div class="smax-gl-note">3. Nenhuma solução de contorno será postada (campo vazio).</div>'}
           </div>
           <div class="smax-gl-footer">
             <div class="smax-gl-status"></div>
@@ -1422,7 +1561,17 @@
 
       const payload = Molde.buildPayload(prefs.molde, data);
 
-      if (!(await confirmModal(payload))) { setStatus('Cancelado.'); return; }
+      // O Id real so existe depois do CREATE; no preview fica um marcador.
+      const contornoPreview = data.contornoHtml
+        ? Discussion.buildPayload({
+            ticketId: '<id do chamado que será criado>',
+            bodyHtml: data.contornoHtml,
+            commentTo: data.contornoTo,
+            purposeCode: data.contornoPurpose
+          })
+        : null;
+
+      if (!(await confirmModal(payload, contornoPreview))) { setStatus('Cancelado.'); return; }
 
       if (!prefs.enableRealWrites) {
         setStatus('Escritas reais desabilitadas — nada foi enviado.', 'err');
@@ -1480,7 +1629,36 @@
             }
           }
 
+          // Passo 3 — solucao de contorno como discussao. Falhar aqui nao invalida
+          // o chamado: ele existe e ja esta marcado como global.
+          let contornoNote = '';
+          if (data.contornoHtml) {
+            const rotulo = Discussion.labelFor(Discussion.PURPOSE_OPTIONS, data.contornoPurpose);
+            setStatus(`#${newId} criado — postando ${rotulo}…`);
+            try {
+              const resDisc = await Discussion.post({
+                ticketId: newId,
+                bodyHtml: data.contornoHtml,
+                commentTo: data.contornoTo,
+                purposeCode: data.contornoPurpose
+              });
+              contornoNote = Molde.completionStatus(resDisc) === 'OK'
+                ? `<div class="smax-gl-note smax-gl-note-ok"><strong>${Utils.escapeHtml(rotulo)}</strong> postada como discussão.</div>`
+                : `<div class="smax-gl-note smax-gl-note-err">
+                     A discussão <strong>${Utils.escapeHtml(rotulo)}</strong> não foi confirmada
+                     (${Utils.escapeHtml(Molde.completionStatus(resDisc) || 'sem status')}). Poste manualmente.
+                   </div>`;
+            } catch (errDisc) {
+              contornoNote = `<div class="smax-gl-note smax-gl-note-err">
+                  Falhou ao postar <strong>${Utils.escapeHtml(rotulo)}</strong>:
+                  ${Utils.escapeHtml(errDisc.message || String(errDisc))}. Poste manualmente.
+                </div>`;
+            }
+          }
+
           form.descriptionHtml = '';
+          // O contorno volta ao padrao, nao para vazio: ele e texto de equipe.
+          form.contornoHtml = prefs.contornoPadrao || '';
           busy = false;
           render();
           const url = `${window.location.origin}/saw/Request/${encodeURIComponent(newId)}/general`;
@@ -1490,6 +1668,7 @@
               <strong>Chamado #${Utils.escapeHtml(newId)}</strong> criado com sucesso.
             </div>
             ${flagNote}
+            ${contornoNote}
             <p style="font-size:12.5px;">
               <a href="${Utils.escapeHtml(url)}" target="_blank" rel="noopener"
                  style="color:var(--sp-accent);">Abrir #${Utils.escapeHtml(newId)} no SMAX ↗</a>
@@ -1591,6 +1770,14 @@
           infoModal('Payload que será enviado', `
             <pre class="smax-gl-pre">${Utils.escapeHtml(JSON.stringify(Molde.buildPayload(prefs.molde, data), null, 2))}</pre>`);
         }
+        else if (act === 'salvar-contorno-padrao') {
+          readForm();
+          prefs.contornoPadrao = Utils.normalizeContentEditableHtml(form.contornoHtml);
+          prefs.contornoTo = form.contornoTo;
+          prefs.contornoPurpose = form.contornoPurpose;
+          Store.save();
+          setStatus('Padrão da solução de contorno salvo.', 'ok');
+        }
         else if (act === 'toggle-aprender') {
           Capture.isArmed() ? Capture.disarm() : Capture.arm();
           render();
@@ -1654,9 +1841,15 @@
         }
       });
 
+      overlay.addEventListener('change', (ev) => {
+        if (ev.target.id === 'smax-gl-disc-to') form.contornoTo = ev.target.value;
+        if (ev.target.id === 'smax-gl-disc-purpose') form.contornoPurpose = ev.target.value;
+      });
+
       overlay.addEventListener('input', (ev) => {
         if (ev.target.id === 'smax-gl-title') form.title = ev.target.value;
         if (ev.target.id === 'smax-gl-desc') form.descriptionHtml = ev.target.innerHTML;
+        if (ev.target.id === 'smax-gl-contorno') form.contornoHtml = ev.target.innerHTML;
         if (ev.target.id === 'smax-gl-person-q') {
           personUI.term = ev.target.value;
           clearTimeout(personDebounce);
@@ -1667,7 +1860,7 @@
 
       // Cola sempre como texto limpo — evita trazer markup do Word/Outlook.
       overlay.addEventListener('paste', (ev) => {
-        if (ev.target.id !== 'smax-gl-desc') return;
+        if (ev.target.id !== 'smax-gl-desc' && ev.target.id !== 'smax-gl-contorno') return;
         const html = ev.clipboardData.getData('text/html');
         if (!html) return;
         ev.preventDefault();
@@ -1722,8 +1915,12 @@
       document.addEventListener('keydown', onKeydown);
       unsubscribe = Capture.onChange(() => { if (activeTab === 'aprender') render(); syncLauncher(); });
 
-      // Solicitante volta ao padrao do molde a cada abertura do painel.
+      // Solicitante e contorno voltam ao padrao a cada abertura do painel: uma
+      // troca pontual nao deve virar o padrao silencioso da proxima abertura.
       form.requester = null;
+      form.contornoHtml = prefs.contornoPadrao || '';
+      form.contornoTo = prefs.contornoTo || 'Agent';
+      form.contornoPurpose = prefs.contornoPurpose || 'SolucaoContorno_c';
       Object.assign(personUI, { open: false, term: '', loading: false, error: '', results: [] });
 
       activeTab = prefs.molde ? 'abrir' : 'aprender';

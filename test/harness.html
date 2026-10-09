@@ -86,11 +86,67 @@
     <strong>Falha de leitura isolada.</strong> Inclua também <code>82190066</code>, para o qual o
     servidor responde o teto de 10.000, e atualize de novo. Ele tem de ficar <em>não lido</em> em
     todas as colunas — um global que estoura o teto tem <em>muitos</em> filhos, não nenhum. E os
-    outros três têm de continuar atualizando, com horário novo na coluna LIDO: a consulta falha
-    para o bloco inteiro, então o script parte o bloco ao meio até isolar o culpado. Se os quatro
-    congelarem no horário antigo, a quebra em partes regrediu. O rodapé tem de dizer
-    <strong>1</strong> não relido, batendo com o cartão — se disser 4, a contagem voltou a ser por
-    bloco. Com <code>82170044</code> (sempre 500) vale o mesmo roteiro.
+    outros três têm de continuar atualizando: a consulta falha para o bloco inteiro, então o
+    script parte o bloco ao meio até isolar o culpado. Se os quatro congelarem, a quebra em partes
+    regrediu. O rodapé tem de dizer <strong>1</strong> não relido, batendo com o cartão — se disser
+    4, a contagem voltou a ser por bloco. Com <code>82170044</code> (sempre 500) vale o mesmo
+    roteiro.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Selo “não relido”.</strong> Não existe mais coluna LIDO — o horário da rodada fica só no
+    aviso acima da tabela, porque a leitura é de todos de uma vez e repeti-lo em cada linha era a
+    mesma data seis vezes. Quando uma linha <em>diverge</em> da rodada, aí sim ela ganha um selo
+    <code>não relido</code> ao lado do número. Para forçar o caso, envelheça uma linha à mão no
+    console e recarregue:<br>
+    <code style="display:inline-block; margin-top:6px;">s=JSON.parse(localStorage['gm:smax_pg_estado']);
+    s.porId['82133910'].lidoEm=s.lidoEm-3*3600*1000;
+    localStorage['gm:smax_pg_estado']=JSON.stringify(s)</code><br>
+    Só <code>82133910</code> pode aparecer selado. Depois clique em <em>Atualizar do SMAX</em>: o
+    selo tem de sumir. Se ele aparecer em <em>todas</em> as linhas logo após uma atualização normal,
+    voltou o bug de carimbar a hora por bloco em vez de uma vez por rodada.
+  </div>
+</div>
+
+<div class="card">
+  <strong>Fase 4 — Gráficos.</strong><br>
+  Com os globais da fase 3 já lidos, inclua também <code>82133911</code> (está
+  <strong>arquivado</strong> e <strong>concluído</strong>), atualize e abra a aba <em>Gráficos</em>.
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Os números.</strong> Com arquivados <em>ocultos</em>: abertos <strong>3</strong>,
+    encerrados <strong>0</strong>, sem leitura <strong>2</strong>. Ligue <em>arquivados:
+    mostrando</em> e encerrados tem de virar <strong>1</strong> — esse é o ponto do
+    <code>82133911</code>: o servidor devolve o status dele como
+    <code>RequestStatusComplete</code>, com o prefixo do enum, enquanto os outros vêm sem
+    (<code>InProgress</code>). Se continuar <strong>0</strong>, a normalização do status quebrou e
+    um chamado encerrado está sendo contado como aberto.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Nada de pizza, e cada cartão diz o que conta.</strong> Os três cartões de eixo têm de
+    dizer <em>marcações</em> no canto, não <em>globais</em>: um global marcado em dois assuntos
+    conta duas vezes e a soma das barras passa do total — é por isso que esses três não podem ser
+    pizza. Marque um mesmo global em dois assuntos e confira: a soma das barras tem de passar do
+    número de globais, e a nota do rodapé tem de dizer quantos ficaram <em>sem nenhuma marcação
+    neste eixo</em> — esses não aparecem em barra alguma.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Zero lido ≠ não lido.</strong> Em <em>filhos absorvidos</em>, o <code>82133911</code>
+    aparece com barra de traço (0 filhos, lido) e os <strong>2</strong> não lidos ficam
+    <em>fora</em> do gráfico, citados na nota. Em <em>abertos × encerrados</em> os não lidos têm
+    barra própria — nunca podem cair em “abertos” por omissão.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Série por mês.</strong> É pela data de <em>abertura do chamado</em>, a mesma da coluna
+    ABERTURA, não pela data em que entrou no painel. Com arquivados mostrando a série vai de
+    <code>12/25</code> a <code>08/26</code> e os meses vazios (01/26 a 04/26 e 06/26) têm de
+    aparecer com um traço. Se a série pular direto de 12/25 para 05/26, o preenchimento de mês
+    vazio regrediu e a linha do tempo está falseada.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Interação.</strong> Clicar numa barra de eixo liga o filtro correspondente — o chip lá
+    em cima acende e os <em>outros</em> cartões têm de se refazer junto, sobre o mesmo subconjunto.
+    Clicar numa barra de <em>filhos</em> abre o chamado no SMAX em outra aba. Os rótulos têm de
+    estar legíveis: os gráficos são HTML e CSS, sem SVG, justamente porque o
+    <code>viewBox</code> encolhia o texto junto com o desenho.
   </div>
 </div>
 

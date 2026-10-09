@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SMAX Painel de Globais - TJSP
 // @namespace    https://github.com/rsalvessap/SMAX-Global
-// @version      1.8
+// @version      1.9
 // @description  Painel de gestao de chamados globais do SMAX TJSP — lista curada, classificacao por assunto/base/competencia, sincronizacao por arquivo no GitHub e abertura automatizada de global por molde
 // @author       rsalvessap
 // @match        https://suporte.tjsp.jus.br/saw/*
@@ -26,7 +26,7 @@
   if (window.top && window.top !== window.self) return;
   if (window.location.hostname !== 'suporte.tjsp.jus.br') return;
 
-  const SMAX_GLOBAL_VERSION = '1.8';
+  const SMAX_GLOBAL_VERSION = '1.9';
 
   // O userscript roda em sandbox; quem dispara as requisicoes e a pagina.
   const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
@@ -228,9 +228,17 @@
 
     // Grava apenas os ids que a leitura cobriu. Id ausente do lote continua com o
     // que tinha — apagar aqui transformaria "nao relido agora" em "sem dado".
+    //
+    // O carimbo da rodada e UM so, gravado aqui tanto no estado quanto em cada
+    // registro que entrou. Se cada bloco carimbasse o proprio Date.now(), todas
+    // as linhas ficariam alguns milissegundos atras do carimbo geral e a tela
+    // acusaria "nao relido" em quem acabou de ser lido.
     const mesclarEstado = (porId) => {
-      Object.assign(estado.porId, porId);
-      estado.lidoEm = Date.now();
+      const agora = Date.now();
+      Object.entries(porId).forEach(([id, e]) => {
+        estado.porId[id] = { ...e, lidoEm: agora };
+      });
+      estado.lidoEm = agora;
       salvarEstado();
     };
 
@@ -385,6 +393,19 @@
    * lugar possivel para confundir falha de leitura com ausencia de dado.
    * =======================================================*/
   const Metrica = (() => {
+    // Os 8 enums de Status do Request, com o rotulo em pt-BR. O SMAX devolve o
+    // enum ('RequestStatusComplete'), mas ha resposta vindo sem o prefixo —
+    // normalizar nos dois sentidos para a tabela e o grafico nao discordarem.
+    const STATUS_ROTULO = {
+      New: 'Novo', Ready: 'Pronto', InProgress: 'Em andamento', Pending: 'Pendente',
+      Suspended: 'Suspenso', Complete: 'Concluído', Rejected: 'Rejeitado', Cancelled: 'Cancelado'
+    };
+    // Encerrado = concluido U rejeitado U cancelado. Suspenso NAO e encerrado:
+    // e o estado de "escalado, aguardando 3o nivel", ou seja, trabalho vivo.
+    const ENCERRADOS = new Set(['Complete', 'Rejected', 'Cancelled']);
+    const chaveStatus = (s) => String(s || '').replace(/^RequestStatus/, '');
+    const rotuloStatus = (s) => STATUS_ROTULO[chaveStatus(s)] || String(s || '');
+
     const linhaDe = (g) => {
       const e = PgStore.estado().porId[g.id] || null;
       return {
@@ -428,7 +449,10 @@
     const ORDENS = {
       filhos: (a, b) => (b.filhos === null ? -1 : b.filhos) - (a.filhos === null ? -1 : a.filhos),
       numero: (a, b) => Number(b.id) - Number(a.id),
-      incluido: (a, b) => String(b.incluidoEm).localeCompare(String(a.incluidoEm)),
+      // Data de abertura do chamado no SMAX (CreateTime), nao a data em que
+      // alguem o incluiu no painel: quem olha a lista quer saber desde quando
+      // o problema existe. Nao lido vai para o fim, com criadoEm = 0.
+      abertura: (a, b) => (b.criadoEm || 0) - (a.criadoEm || 0),
       atualizado: (a, b) => (b.atualizadoEm || 0) - (a.atualizadoEm || 0)
     };
 
@@ -453,9 +477,88 @@
     };
 
     const statusConhecidos = () =>
-      [...new Set(todas().map(l => l.status).filter(Boolean))].sort();
+      [...new Set(todas().map(l => l.status).filter(Boolean))]
+        .sort((a, b) => rotuloStatus(a).localeCompare(rotuloStatus(b)));
 
-    return { todas, listar, resumo, statusConhecidos, ORDENS };
+    /* As agregacoes dos graficos moram aqui, junto das outras regras de
+     * contagem, porque "o que esta sendo contado" e pergunta de negocio e nao
+     * de desenho. Cada bloco devolve `base`, que a tela e obrigada a imprimir:
+     * os eixos contam MARCACOES (um global marcado em duas bases entra nas
+     * duas, entao a soma passa do total de globais) e o resto conta GLOBAIS.
+     * Dois graficos na mesma tela com bases diferentes e sem rotulo se
+     * contradizem sem ninguem notar. */
+    const graficos = (linhas) => {
+      const porEixo = Dados.EIXOS.map((e) => {
+        const cont = new Map();
+        linhas.forEach(l => l.marcas[e.chave].forEach((id) => {
+          cont.set(id, (cont.get(id) || 0) + 1);
+        }));
+        return {
+          chave: e.chave,
+          rotulo: e.rotulo,
+          base: 'marcações',
+          semMarca: linhas.filter(l => !l.marcas[e.chave].length).length,
+          marcacoes: [...cont.values()].reduce((s, n) => s + n, 0),
+          itens: [...cont.entries()]
+            .map(([id, n]) => ({ id, nome: Dados.nomeDe(e.chave, id) || id, valor: n }))
+            .sort((a, b) => b.valor - a.valor || a.nome.localeCompare(b.nome))
+        };
+      });
+
+      // Só quem tem contagem confiavel entra. Global sem leitura nao e barra de
+      // altura zero — ficaria indistinguivel de global que nao absorveu nada.
+      const comFilhos = linhas.filter(l => l.filhos !== null);
+      const filhos = {
+        base: 'filhos',
+        semContagem: linhas.length - comFilhos.length,
+        itens: comFilhos
+          .map(l => ({ id: l.id, nome: `#${l.id}`, titulo: l.titulo, valor: l.filhos }))
+          .sort((a, b) => b.valor - a.valor || Number(b.id) - Number(a.id))
+      };
+
+      // Tres baldes, nao dois: global sem leitura NAO pode cair em "aberto" por
+      // omissao — seria afirmar que o chamado esta vivo sem ter lido nada dele.
+      const vida = { abertos: 0, encerrados: 0, indefinidos: 0 };
+      linhas.forEach((l) => {
+        if (!l.lido || !l.status) vida.indefinidos++;
+        else if (ENCERRADOS.has(chaveStatus(l.status))) vida.encerrados++;
+        else vida.abertos++;
+      });
+
+      const porMes = new Map();
+      let semData = 0;
+      linhas.forEach((l) => {
+        if (!l.criadoEm) { semData++; return; }
+        const d = new Date(l.criadoEm);
+        const k = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+        porMes.set(k, (porMes.get(k) || 0) + 1);
+      });
+      // Meses sem nenhum global entram com zero. Sem isso, uma lacuna de dois
+      // meses encosta as barras vizinhas e a linha do tempo passa a mentir.
+      const chaves = [...porMes.keys()].sort();
+      const serie = [];
+      if (chaves.length) {
+        const [ay, am] = chaves[0].split('-').map(Number);
+        const [by, bm] = chaves[chaves.length - 1].split('-').map(Number);
+        for (let y = ay, m = am; y < by || (y === by && m <= bm); m === 12 ? (m = 1, y++) : m++) {
+          const k = `${y}-${String(m).padStart(2, '0')}`;
+          serie.push({
+            id: k,
+            nome: `${String(m).padStart(2, '0')}/${String(y).slice(2)}`,
+            valor: porMes.get(k) || 0
+          });
+        }
+      }
+
+      return {
+        porEixo,
+        filhos,
+        vida: { base: 'globais', ...vida },
+        meses: { base: 'globais', semData, itens: serie }
+      };
+    };
+
+    return { todas, listar, resumo, statusConhecidos, graficos, rotuloStatus, ORDENS };
   })();
 
   /* =========================================================
@@ -732,7 +835,19 @@
       } catch { return '—'; }
     };
 
-    return { escapeHtml, sanitizeRichText, normalizeContentEditableHtml, htmlToText, deepClone, onDomReady, formatBrDateTime };
+    const formatBrDate = (ts) => {
+      if (!ts) return '—';
+      try {
+        return new Date(ts).toLocaleDateString('pt-BR', {
+          day: '2-digit', month: '2-digit', year: 'numeric'
+        });
+      } catch { return '—'; }
+    };
+
+    return {
+      escapeHtml, sanitizeRichText, normalizeContentEditableHtml, htmlToText,
+      deepClone, onDomReady, formatBrDateTime, formatBrDate
+    };
   })();
 
   /* =========================================================
@@ -1009,13 +1124,13 @@
       await emLote(blocos, async (bloco) => {
         const falhou = await porPartes(bloco, async (parte) => {
           const ents = await lerPaginas(clausulaOu('Id', parte), LAYOUT_ESTADO);
-          const agora = Date.now();
           ents.forEach((e) => {
             const p = (e && e.properties) || {};
             const rel = (e && e.related_properties) || {};
             if (!p.Id) return;
+            // Sem `lidoEm` aqui de proposito: quem carimba a hora e o
+            // PgStore.mesclarEstado, com um carimbo unico para a rodada toda.
             porId[String(p.Id)] = {
-              lidoEm: agora,
               titulo: String(p.DisplayLabel || ''),
               status: String(p.Status || ''),
               statusOp: String(p.StatusSCCDSMAX_c || ''),
@@ -1834,6 +1949,59 @@
 .smax-gl-card b { display:block; font-size:18px; font-weight:600; color:var(--sp-text); line-height:1.2; }
 .smax-gl-card span { font-size:10px; text-transform:uppercase; letter-spacing:.4px; color:var(--sp-text-muted); }
 
+/* Graficos. HTML e CSS, sem biblioteca e sem SVG: barra e uma div com width em
+   porcentagem, e assim o texto do rotulo tem tamanho real — com viewBox de SVG
+   ele encolheria junto com o desenho e ficaria ilegivel no cartao estreito. */
+.smax-gl-grafs { display:grid; grid-template-columns:repeat(auto-fit, minmax(330px, 1fr)); gap:12px; }
+.smax-gl-graf {
+  border:1px solid var(--sp-border); border-radius:var(--sp-r-md);
+  background:var(--sp-card-bg); padding:10px 12px; min-width:0;
+}
+.smax-gl-graf-h { display:flex; align-items:baseline; gap:8px; margin-bottom:8px; }
+.smax-gl-graf-h b { font-size:12.5px; font-weight:600; color:var(--sp-text); flex:1 1 auto; }
+/* A base de contagem fica no cabecalho de todo grafico, sem excecao: dois
+   graficos na mesma tela com bases diferentes e sem rotulo se contradizem
+   sem ninguem notar. */
+.smax-gl-graf-base {
+  font-size:9.5px; text-transform:uppercase; letter-spacing:.4px; white-space:nowrap;
+  color:var(--sp-text-muted); border:1px solid var(--sp-border);
+  border-radius:9px; padding:1px 7px; background:var(--sp-surface-2);
+}
+/* A serie por mes cresce para o lado; dividir a largura com outro cartao
+   deixaria as colunas com 6px. */
+.smax-gl-graf-wide { grid-column:1 / -1; }
+.smax-gl-graf-nota { font-size:11px; line-height:1.5; color:var(--sp-text-muted); margin:8px 0 0; }
+.smax-gl-graf-nota strong { color:var(--sp-text); }
+.smax-gl-bars { display:flex; flex-direction:column; gap:3px; }
+.smax-gl-bar {
+  display:grid; grid-template-columns:minmax(0, 38%) 1fr auto;
+  align-items:center; gap:8px; padding:2px 4px; border-radius:var(--sp-r-sm);
+}
+.smax-gl-bar[data-act] { cursor:pointer; }
+.smax-gl-bar[data-act]:hover { background:var(--sp-primary-bg); }
+.smax-gl-bar[data-act]:hover .smax-gl-bar-rot { color:var(--sp-accent); }
+.smax-gl-bar[data-ativa="true"] { background:var(--sp-primary-bg); }
+.smax-gl-bar[data-ativa="true"] .smax-gl-bar-rot { color:var(--sp-accent); font-weight:600; }
+.smax-gl-bar-rot {
+  font-size:11px; color:var(--sp-text-muted); text-align:right;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+.smax-gl-bar-trilho { display:block; height:13px; border-radius:3px; background:var(--sp-surface-2); }
+.smax-gl-bar-fill { display:block; height:100%; border-radius:3px; background:var(--sp-accent); }
+/* Zero nao e barra de largura 0 — seria indistinguivel de "nao desenhou". */
+.smax-gl-bar-fill[data-zero="true"] { background:var(--sp-border); }
+.smax-gl-bar-val { font-size:11px; font-weight:600; color:var(--sp-text); font-family:Consolas, monospace; }
+
+.smax-gl-cols { display:flex; align-items:flex-end; gap:5px; overflow-x:auto; padding-bottom:2px; }
+.smax-gl-col { flex:1 1 0; min-width:28px; display:flex; flex-direction:column; align-items:center; }
+.smax-gl-col-val { font-size:10px; font-weight:600; color:var(--sp-text); height:13px; }
+.smax-gl-col-fill {
+  display:block; width:100%; max-width:30px; border-radius:3px 3px 0 0;
+  background:var(--sp-accent);
+}
+.smax-gl-col-fill[data-zero="true"] { background:var(--sp-border); }
+.smax-gl-col-rot { font-size:10px; color:var(--sp-text-muted); margin-top:4px; white-space:nowrap; }
+
 .smax-gl-person {
   border:1px solid var(--sp-border); border-radius:var(--sp-r-md);
   background:var(--sp-card-bg); padding:10px 12px;
@@ -1855,6 +2023,88 @@
 .smax-gl-person-hit small { flex:0 1 auto; max-width:45%; color:var(--sp-text-dim); font-family:Consolas, monospace; font-size:10.5px; }
 .smax-gl-person-msg { font-size:11.5px; color:var(--sp-text-muted); margin-top:8px; }
 `);
+
+  /* =========================================================
+   * Graficos — HTML e CSS, sem biblioteca.
+   *
+   * Duas decisoes aqui, e as duas tem motivo:
+   *
+   * 1. Sem biblioteca de CDN. Os graficos deste painel sao barras, e barra e
+   *    um retangulo com um texto do lado. Carregar uma biblioteca traria um
+   *    site de terceiro para dentro da pagina do SMAX em troca de muito pouco
+   *    — e e justamente o padrao (`@require` de Dexie, mammoth, pdf.js) que os
+   *    quatro scripts de terceiro analisados adotam e que aqui nao se paga.
+   *
+   * 2. Sem SVG. A primeira versao desenhava em SVG com `viewBox`, e o
+   *    `viewBox` escala TUDO junto, texto inclusive: num cartao de 340px o
+   *    rotulo de 10,5px virava ~6px, ilegivel. Em HTML a barra e uma div com
+   *    `width` em porcentagem e o texto e texto, no tamanho que foi pedido.
+   *
+   * Nenhuma funcao daqui decide O QUE contar: recebe os numeros ja agregados
+   * por `Metrica.graficos` e so desenha. As regras de contagem ficam num
+   * lugar so, que e o Metrica.
+   * =======================================================*/
+  const Graficos = (() => {
+    const ALT_COLUNA = 104;   // px uteis de altura na serie por mes
+
+    const nada = (msg) => `<div class="smax-gl-note">${Utils.escapeHtml(msg)}</div>`;
+
+    /* Barras horizontais. Horizontal e nao vertical porque o rotulo e nome
+     * livre digitado pelo usuario ("Execucao fiscal") — na vertical viraria
+     * texto girado ou cortado. */
+    const barrasH = (itens, opts = {}) => {
+      if (!itens.length) return nada(opts.vazio || 'Nada para mostrar com os filtros atuais.');
+      const max = Math.max(...itens.map(i => i.valor), 1);
+      const linhas = itens.map((it) => {
+        const atribs = [
+          `data-id="${Utils.escapeHtml(it.id)}"`,
+          `data-ativa="${(opts.ativos || []).includes(it.id)}"`,
+          opts.acao ? `data-act="${Utils.escapeHtml(opts.acao)}"` : '',
+          opts.eixo ? `data-eixo="${Utils.escapeHtml(opts.eixo)}"` : ''
+        ].filter(Boolean).join(' ');
+        // Valor zero vira um tracinho cinza. Barra de largura 0 e
+        // indistinguivel de "nao desenhou nada".
+        const zero = !it.valor;
+        const larg = zero ? '3px' : `${Math.max(2, (it.valor / max) * 100)}%`;
+        const dica = `${it.nome}${it.titulo ? ` — ${it.titulo}` : ''}: ${it.valor}`;
+        return `<div class="smax-gl-bar" ${atribs} title="${Utils.escapeHtml(dica)}">
+          <span class="smax-gl-bar-rot">${Utils.escapeHtml(it.nome)}</span>
+          <span class="smax-gl-bar-trilho">
+            <span class="smax-gl-bar-fill" data-zero="${zero}" style="width:${larg};"></span>
+          </span>
+          <span class="smax-gl-bar-val">${it.valor}</span>
+        </div>`;
+      }).join('');
+      return `<div class="smax-gl-bars">${linhas}</div>`;
+    };
+
+    /* Barras verticais, so na serie por mes — ali a ordem das barras e o
+     * tempo, e tempo se le da esquerda para a direita. */
+    const barrasV = (itens, opts = {}) => {
+      if (!itens.length) return nada(opts.vazio || 'Nada para mostrar com os filtros atuais.');
+      const max = Math.max(...itens.map(i => i.valor), 1);
+      const cols = itens.map((it) => {
+        const alt = it.valor ? Math.max(3, Math.round((it.valor / max) * ALT_COLUNA)) : 3;
+        return `<div class="smax-gl-col" title="${Utils.escapeHtml(`${it.nome}: ${it.valor}`)}">
+          <span class="smax-gl-col-val">${it.valor || ''}</span>
+          <span class="smax-gl-col-fill" data-zero="${!it.valor}" style="height:${alt}px;"></span>
+          <span class="smax-gl-col-rot">${Utils.escapeHtml(it.nome)}</span>
+        </div>`;
+      }).join('');
+      return `<div class="smax-gl-cols" style="--smax-gl-alt:${ALT_COLUNA}px;">${cols}</div>`;
+    };
+
+    const cartao = (titulo, base, grafico, nota) => `<section class="smax-gl-graf">
+      <div class="smax-gl-graf-h">
+        <b>${Utils.escapeHtml(titulo)}</b>
+        <span class="smax-gl-graf-base">${Utils.escapeHtml(base)}</span>
+      </div>
+      ${grafico}
+      ${nota ? `<p class="smax-gl-graf-nota">${nota}</p>` : ''}
+    </section>`;
+
+    return { barrasH, barrasV, cartao };
+  })();
 
   /* =========================================================
    * HUD
@@ -2246,8 +2496,7 @@
       { rot: 'Grupo' },
       { rot: 'Filhos', ordem: 'filhos' },
       { rot: 'Marcações' },
-      { rot: 'Incluído', ordem: 'incluido' },
-      { rot: 'Lido' },
+      { rot: 'Abertura', ordem: 'abertura' },
       { rot: '' }
     ];
 
@@ -2255,21 +2504,18 @@
       linha.marcas[e.chave].map(id => Dados.nomeDe(e.chave, id)).filter(Boolean)
     );
 
-    const renderPainel = () => {
+    // O painel vazio tem a mesma resposta nas duas telas que leem a lista.
+    const vazio = () => (PgStore.dados().globais.length ? '' : `<div class="smax-gl-note">
+      O painel está vazio. Vá em <strong>Incluir global</strong> para colocar o primeiro chamado,
+      e em <strong>Configuração</strong> para criar os valores de assunto, base e competência.
+    </div>`);
+
+    // Um bloco de filtros só, usado pelo Painel e pelos Gráficos: dois
+    // conjuntos de controle sobre a mesma lista daria duas respostas
+    // diferentes para a mesma pergunta.
+    const blocoFiltros = () => {
       const f = PgStore.prefs.filtros;
-      const linhas = Metrica.listar(f, PgStore.prefs.ordem);
-      const r = Metrica.resumo(linhas);
-      const totalCurado = PgStore.dados().globais.length;
-      const lidoEm = PgStore.estado().lidoEm;
-
-      if (!totalCurado) {
-        return `<div class="smax-gl-note">
-          O painel está vazio. Vá em <strong>Incluir global</strong> para colocar o primeiro chamado,
-          e em <strong>Configuração</strong> para criar os valores de assunto, base e competência.
-        </div>`;
-      }
-
-      const chipsFiltro = Dados.EIXOS.map(e => {
+      const chips = Dados.EIXOS.map(e => {
         const vals = Dados.lista(e.chave);
         if (!vals.length) return '';
         return `<div>
@@ -2284,29 +2530,70 @@
 
       const statuses = Metrica.statusConhecidos();
 
+      return `<div class="smax-gl-filtros">
+        ${chips}
+        <div>
+          <div class="smax-gl-label">Status</div>
+          <select class="smax-gl-select" id="smax-gl-f-status" style="min-width:150px;">
+            <option value="">todos</option>
+            ${statuses.map(s => `<option value="${Utils.escapeHtml(s)}" ${f.status === s ? 'selected' : ''}>${Utils.escapeHtml(Metrica.rotuloStatus(s))}</option>`).join('')}
+          </select>
+        </div>
+        <div>
+          <div class="smax-gl-label">Buscar</div>
+          <input class="smax-gl-input" id="smax-gl-f-termo" type="text" style="min-width:180px;"
+                 value="${Utils.escapeHtml(f.termo || '')}" placeholder="número, título, nota, grupo">
+        </div>
+        <div>
+          <div class="smax-gl-label">Arquivados</div>
+          <button class="smax-gl-chip" data-act="filtro-arquivados" data-active="${!!f.verArquivados}">
+            ${f.verArquivados ? 'mostrando' : 'ocultos'}
+          </button>
+        </div>
+        <div><button class="smax-gl-btn" data-act="limpar-filtros">Limpar filtros</button></div>
+      </div>`;
+    };
+
+    const renderPainel = () => {
+      const f = PgStore.prefs.filtros;
+      const linhas = Metrica.listar(f, PgStore.prefs.ordem);
+      const r = Metrica.resumo(linhas);
+      const lidoEm = PgStore.estado().lidoEm;
+
+      if (vazio()) return vazio();
+
       const corpo = linhas.length ? linhas.map(l => {
         const marcas = rotulosDe(l);
-        // Tres celulas que NAO podem mostrar vazio como se fosse fato conhecido.
+        // Celulas que NAO podem mostrar vazio como se fosse fato conhecido.
         const semLeitura = '<span class="smax-gl-naolido">não lido</span>';
+        // Antes havia uma coluna "Lido" com o horario em toda linha — mesma data
+        // repetida em todas, porque a leitura e de todos de uma vez e o rodape
+        // ja diz quando foi. O horario por linha so informa quando DIVERGE do
+        // da rodada: ai esta linha ficou para tras e isso vira um aviso.
+        const atrasado = l.lido && lidoEm && l.lidoEm < lidoEm;
         return `<tr data-arquivado="${l.arquivado}">
           <td class="smax-gl-num">
             <a href="/saw/Request/${Utils.escapeHtml(l.id)}/general" target="_blank"
                style="color:var(--sp-accent);text-decoration:none;">#${Utils.escapeHtml(l.id)}</a>
             ${l.lido && l.ehGlobal === false
               ? '<br><span class="smax-gl-badge smax-gl-badge-err">não é global</span>' : ''}
+            ${atrasado
+              ? `<br><span class="smax-gl-badge smax-gl-badge-warn"
+                     title="A última rodada não conseguiu reler este. O que está na linha é a leitura de ${Utils.escapeHtml(Utils.formatBrDateTime(l.lidoEm))}."
+                  >não relido</span>` : ''}
             ${l.arquivado ? '<br><span class="smax-gl-badge">arquivado</span>' : ''}
           </td>
           <td class="smax-gl-tit">${l.lido ? Utils.escapeHtml(l.titulo || '(sem título)') : semLeitura}
             ${l.nota ? `<div class="smax-gl-cand-meta">${Utils.escapeHtml(l.nota)}</div>` : ''}</td>
-          <td>${l.lido ? Utils.escapeHtml(l.status || '—') : semLeitura}</td>
+          <td>${l.lido ? Utils.escapeHtml(Metrica.rotuloStatus(l.status) || '—') : semLeitura}</td>
           <td>${l.lido ? Utils.escapeHtml(l.statusOp || '—') : semLeitura}</td>
           <td>${l.lido ? Utils.escapeHtml(l.grupo || '—') : semLeitura}</td>
           <td class="smax-gl-filhos">${l.filhos === null ? semLeitura : l.filhos}</td>
           <td><div class="smax-gl-marcas">${marcas.length
             ? marcas.map(n => `<span class="smax-gl-marca">${Utils.escapeHtml(n)}</span>`).join('')
             : '<span class="smax-gl-naolido">sem marcação</span>'}</div></td>
-          <td class="smax-gl-num">${Utils.escapeHtml(l.incluidoEm || '—')}</td>
-          <td class="smax-gl-num">${l.lidoEm ? Utils.escapeHtml(Utils.formatBrDateTime(l.lidoEm)) : semLeitura}</td>
+          <td class="smax-gl-num" title="Incluído no painel em ${Utils.escapeHtml(l.incluidoEm || '—')}"
+            >${l.criadoEm ? Utils.escapeHtml(Utils.formatBrDate(l.criadoEm)) : semLeitura}</td>
           <td class="smax-gl-acoes">
             <button class="smax-gl-btn" data-act="${l.arquivado ? 'desarquivar' : 'arquivar'}"
                     data-id="${Utils.escapeHtml(l.id)}">${l.arquivado ? 'Reabrir' : 'Arquivar'}</button>
@@ -2340,28 +2627,7 @@
                status, grupo e contagem de filhos aparecem como <em>não lido</em> — e não como zero.
              </div>`}
 
-        <div class="smax-gl-filtros">
-          ${chipsFiltro}
-          <div>
-            <div class="smax-gl-label">Status</div>
-            <select class="smax-gl-select" id="smax-gl-f-status" style="min-width:150px;">
-              <option value="">todos</option>
-              ${statuses.map(s => `<option value="${Utils.escapeHtml(s)}" ${f.status === s ? 'selected' : ''}>${Utils.escapeHtml(s)}</option>`).join('')}
-            </select>
-          </div>
-          <div>
-            <div class="smax-gl-label">Buscar</div>
-            <input class="smax-gl-input" id="smax-gl-f-termo" type="text" style="min-width:180px;"
-                   value="${Utils.escapeHtml(f.termo || '')}" placeholder="número, título, nota, grupo">
-          </div>
-          <div>
-            <div class="smax-gl-label">Arquivados</div>
-            <button class="smax-gl-chip" data-act="filtro-arquivados" data-active="${!!f.verArquivados}">
-              ${f.verArquivados ? 'mostrando' : 'ocultos'}
-            </button>
-          </div>
-          <div><button class="smax-gl-btn" data-act="limpar-filtros">Limpar filtros</button></div>
-        </div>
+        ${blocoFiltros()}
 
         <table class="smax-gl-tbl">
           <thead><tr>${COLUNAS.map(c => c.ordem
@@ -2369,6 +2635,110 @@
             : `<th>${c.rot}</th>`).join('')}</tr></thead>
           <tbody>${corpo}</tbody>
         </table>`;
+    };
+
+    /* ---------- Tela: graficos ----------
+     * Le a MESMA lista filtrada do painel, de proposito: grafico que ignora o
+     * filtro da tela ao lado responde outra pergunta e ninguem percebe.
+     * Quantos globais entraram na conta fica escrito no topo. */
+    const TOPO_FILHOS = 15;
+
+    const renderGraficos = () => {
+      if (vazio()) return vazio();
+
+      const f = PgStore.prefs.filtros;
+      const linhas = Metrica.listar(f, PgStore.prefs.ordem);
+      const g = Metrica.graficos(linhas);
+      const lidoEm = PgStore.estado().lidoEm;
+      const total = linhas.length;
+
+      if (!lidoEm) {
+        return `<div class="smax-gl-note smax-gl-note-warn">
+          Nada foi lido do SMAX ainda, então três dos gráficos não têm o que mostrar
+          (status, filhos e data de abertura vêm da leitura). Clique em
+          <strong>↻ Atualizar do SMAX</strong> no rodapé.
+        </div>${blocoFiltros()}`;
+      }
+
+      const cartoesEixo = g.porEixo.map(e => Graficos.cartao(
+        `Globais por ${e.rotulo.toLowerCase()}`,
+        e.base,
+        Graficos.barrasH(e.itens, {
+          acao: 'filtro-eixo',
+          eixo: e.chave,
+          ativos: f[e.chave] || [],
+          vazio: `Nenhum global com ${e.rotulo.toLowerCase()} marcado.`
+        }),
+        // Obrigatorio dizer isto: a soma das barras passa do total de globais
+        // porque um global pode estar marcado em mais de um valor do eixo. E e
+        // exatamente por isso que estes nao podem ser pizza.
+        `<strong>${e.marcacoes}</strong> marcações em <strong>${total}</strong> globais
+         — a soma das barras passa do total quando um global tem mais de uma marcação.
+         ${e.semMarca ? `<strong>${e.semMarca}</strong> sem nenhuma marcação neste eixo, fora do gráfico.` : ''}
+         Clique numa barra para filtrar.`
+      )).join('');
+
+      const vida = Graficos.cartao(
+        'Abertos × encerrados',
+        g.vida.base,
+        Graficos.barrasH([
+          { id: 'abertos', nome: 'Abertos', valor: g.vida.abertos },
+          { id: 'encerrados', nome: 'Encerrados', valor: g.vida.encerrados },
+          { id: 'indefinidos', nome: 'Sem leitura', valor: g.vida.indefinidos }
+        ]),
+        `Encerrado é <strong>concluído, rejeitado ou cancelado</strong>. Suspenso conta como
+         <strong>aberto</strong>: é o estado de escalado aguardando 3º nível, ou seja, trabalho vivo.
+         ${g.vida.indefinidos
+           ? `<strong>${g.vida.indefinidos}</strong> sem leitura ficam numa barra própria — não entram em “abertos” por omissão.`
+           : ''}`
+      );
+
+      const topo = g.filhos.itens.slice(0, TOPO_FILHOS);
+      const filhos = Graficos.cartao(
+        'Filhos absorvidos por global',
+        g.filhos.base,
+        Graficos.barrasH(topo, {
+          acao: 'abrir-chamado',
+          vazio: 'Nenhum global com contagem de filhos lida.'
+        }),
+        `Maiores primeiro${g.filhos.itens.length > TOPO_FILHOS
+          ? `, os <strong>${TOPO_FILHOS}</strong> do topo de <strong>${g.filhos.itens.length}</strong>`
+          : ''}.
+         ${g.filhos.semContagem
+           ? `<strong>${g.filhos.semContagem}</strong> global(is) sem contagem lida ficam <em>fora</em> do gráfico — barra zero diria que não absorveram nada.`
+           : ''}
+         Clique numa barra para abrir o chamado no SMAX.`
+      );
+
+      const meses = `<section class="smax-gl-graf smax-gl-graf-wide">
+        <div class="smax-gl-graf-h">
+          <b>Globais abertos por mês</b>
+          <span class="smax-gl-graf-base">${Utils.escapeHtml(g.meses.base)}</span>
+        </div>
+        ${Graficos.barrasV(g.meses.itens, { vazio: 'Nenhuma data de abertura lida.' })}
+        <p class="smax-gl-graf-nota">
+          Pela data de abertura do chamado no SMAX, não pela data em que ele entrou no painel.
+          Mês sem nenhum global aparece com um traço, e não é omitido — pular mês vazio encosta
+          as barras vizinhas e falseia a linha do tempo.
+          ${g.meses.semData
+            ? `<strong>${g.meses.semData}</strong> sem data de abertura lida, fora do gráfico.`
+            : ''}
+        </p>
+      </section>`;
+
+      return `
+        <div class="smax-gl-note">
+          Os gráficos contam os <strong>${total}</strong> globais que estão passando pelos filtros
+          abaixo — os mesmos do Painel. Estado lido do SMAX em
+          <strong>${Utils.escapeHtml(Utils.formatBrDateTime(lidoEm))}</strong>.
+        </div>
+        ${blocoFiltros()}
+        <div class="smax-gl-grafs">
+          ${vida}
+          ${filhos}
+          ${cartoesEixo}
+          ${meses}
+        </div>`;
     };
 
     /* ---------- Tela: incluir global ---------- */
@@ -2523,11 +2893,14 @@
         t.dataset.active = String(t.dataset.tab === activeTab);
       });
 
-      // A lista precisa de mais largura; as outras telas ficam estreitas de proposito.
+      // A lista e os graficos precisam de mais largura; as outras telas ficam
+      // estreitas de proposito.
       const painel = overlay.querySelector('.smax-gl-panel');
-      if (painel) painel.dataset.wide = String(activeTab === 'painel');
+      const largas = activeTab === 'painel' || activeTab === 'graficos';
+      if (painel) painel.dataset.wide = String(largas);
 
       body.innerHTML = activeTab === 'painel' ? renderPainel()
+        : activeTab === 'graficos' ? renderGraficos()
         : activeTab === 'abrir' ? renderAbrir()
         : activeTab === 'incluir' ? renderIncluir()
         : activeTab === 'config' ? renderConfig()
@@ -2539,7 +2912,7 @@
       const contorno = body.querySelector('#smax-gl-contorno');
       if (contorno) contorno.innerHTML = form.contornoHtml;
 
-      if (activeTab === 'painel') {
+      if (largas) {
         footer.innerHTML = `<button class="smax-gl-btn smax-gl-btn-primary" data-act="atualizar-smax"
              ${busy ? 'disabled' : ''}>${busy ? 'Lendo…' : '↻ Atualizar do SMAX'}</button>`;
       } else if (activeTab === 'abrir' && prefs.molde) {
@@ -3179,6 +3552,13 @@
           PgStore.salvarPrefs();
           render();
         }
+        // A barra do grafico de filhos leva ao chamado. Nao da para usar <a>
+        // dentro de SVG com o mesmo estilo das outras barras, e o numero do
+        // chamado so existe aqui como data-id.
+        else if (act === 'abrir-chamado') {
+          const id = ev.target.closest('[data-id]').dataset.id;
+          window.open(`/saw/Request/${encodeURIComponent(id)}/general`, '_blank', 'noopener');
+        }
         else if (act === 'filtro-arquivados') {
           PgStore.prefs.filtros.verArquivados = !PgStore.prefs.filtros.verArquivados;
           PgStore.salvarPrefs();
@@ -3376,6 +3756,7 @@
           </div>
           <div class="smax-gl-tabs">
             <button class="smax-gl-tab" data-tab="painel">Painel</button>
+            <button class="smax-gl-tab" data-tab="graficos">Gráficos</button>
             <button class="smax-gl-tab" data-tab="abrir">Abrir chamado</button>
             <button class="smax-gl-tab" data-tab="incluir">Incluir global</button>
             <button class="smax-gl-tab" data-tab="aprender">Aprender molde</button>

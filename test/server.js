@@ -30,10 +30,17 @@ const ID_ERRO_LEITURA = '82170044';   // responde 500 sempre
 const ID_TETO = '82190066';           // faz a consulta em lote ser recusada pelo teto
 
 const REQUESTS = [
-  { Id: '82133910', IsGlobal_c: 'true', DisplayLabel: 'GLOBAL — eproc 1o grau fora do ar', Status: 'InProgress', StatusSCCDSMAX_c: 'EmAtendimento_c', grupo: 'SUPORTE EPROC', CreateTime: 1757000000000, LastUpdateTime: 1758900000000 },
+  // As datas de CreateTime dos globais sao de meses DIFERENTES e de proposito
+  // deixam junho e setembro de 2026 vazios: e assim que se ve se o grafico de
+  // abertura por mes desenha o mes sem nenhum global em vez de pular.
+  { Id: '82133910', IsGlobal_c: 'true', DisplayLabel: 'GLOBAL — eproc 1o grau fora do ar', Status: 'InProgress', StatusSCCDSMAX_c: 'EmAtendimento_c', grupo: 'SUPORTE EPROC', CreateTime: 1778770800000, LastUpdateTime: 1758900000000 },
   // GlobalId_c apontando para si mesmo, e so em related_properties: o SMAX faz
   // isso em global de verdade, e nem a conferencia nem a contagem podem ler como filho.
-  { Id: '82140011', IsGlobal_c: true, DisplayLabel: 'GLOBAL — custas indevidas', Status: 'Ready', StatusSCCDSMAX_c: 'Aguardando_c', grupo: 'SUPORTE CUSTAS', CreateTime: 1757100000000, LastUpdateTime: 1758910000000, pai: '82140011', relOnly: true },
+  { Id: '82140011', IsGlobal_c: true, DisplayLabel: 'GLOBAL — custas indevidas', Status: 'Ready', StatusSCCDSMAX_c: 'Aguardando_c', grupo: 'SUPORTE CUSTAS', CreateTime: 1783004400000, LastUpdateTime: 1758910000000, pai: '82140011', relOnly: true },
+  // Global encerrado, para a barra de "encerrados" nao ficar sempre em zero.
+  // Status 'RequestStatusComplete' com o prefixo do enum, que e como o SMAX
+  // devolve — os outros estao sem prefixo de proposito, para exercitar os dois.
+  { Id: '82133911', IsGlobal_c: 'true', DisplayLabel: 'GLOBAL — mandados em lote (encerrado)', Status: 'RequestStatusComplete', StatusSCCDSMAX_c: 'Concluido_c', grupo: 'SUPORTE EPROC', CreateTime: 1764774000000, LastUpdateTime: 1758915000000 },
   { Id: '82150022', IsGlobal_c: 'false', DisplayLabel: 'Chamado comum de usuario', Status: 'Ready', grupo: 'ATENDIMENTO', CreateTime: 1757200000000, LastUpdateTime: 1758920000000 },
   { Id: '82160033', IsGlobal_c: 'false', DisplayLabel: 'Filho do global', Status: 'Ready', grupo: 'ATENDIMENTO', CreateTime: 1757300000000, LastUpdateTime: 1758930000000, pai: '82133910', relOnly: true },
   // Mais filhos, para a contagem dar numero diferente por pai (3 e 1).
@@ -45,13 +52,13 @@ const REQUESTS = [
   // Global valido na leitura individual (da para incluir), mas qualquer consulta
   // em lote que o cite e recusada pelo teto de 10.000 — e assim que se testa o
   // bloco que fica sem leitura no painel.
-  { Id: ID_TETO, IsGlobal_c: 'true', DisplayLabel: 'GLOBAL — consulta estoura o teto', Status: 'InProgress', grupo: 'SUPORTE EPROC', CreateTime: 1757600000000, LastUpdateTime: 1758960000000 }
+  { Id: ID_TETO, IsGlobal_c: 'true', DisplayLabel: 'GLOBAL — consulta estoura o teto', Status: 'InProgress', grupo: 'SUPORTE EPROC', CreateTime: 1790866800000, LastUpdateTime: 1758960000000 }
 ];
 
 // Um global com 600 filhos: passa da pagina de 250 do script e por isso exercita
 // o laco de paginacao. Sem ele, um lote truncado passaria batido no teste.
 const ID_MUITOS = '82210088';
-REQUESTS.push({ Id: ID_MUITOS, IsGlobal_c: 'true', DisplayLabel: 'GLOBAL — migracao de base (muitos filhos)', Status: 'InProgress', StatusSCCDSMAX_c: 'EmAtendimento_c', grupo: 'SUPORTE MIGRACAO', CreateTime: 1757500000000, LastUpdateTime: 1758950000000 });
+REQUESTS.push({ Id: ID_MUITOS, IsGlobal_c: 'true', DisplayLabel: 'GLOBAL — migracao de base (muitos filhos)', Status: 'InProgress', StatusSCCDSMAX_c: 'EmAtendimento_c', grupo: 'SUPORTE MIGRACAO', CreateTime: 1787151600000, LastUpdateTime: 1758950000000 });
 for (let i = 0; i < 600; i++) {
   REQUESTS.push({
     Id: String(83000000 + i), IsGlobal_c: 'false', DisplayLabel: `Filho em massa ${i + 1}`,

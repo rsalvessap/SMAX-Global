@@ -179,6 +179,58 @@
 </div>
 
 <div class="card">
+  <strong>v1.12 — Ordenar, arquivar e ver o chamado.</strong><br>
+  Quatro ajustes pedidos sobre o painel pronto: rótulo do status operacional, ordenação por
+  coluna, o que “arquivar” faz, e um visualizador do chamado sem sair da lista.
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Operacional mostra o rótulo, não o código.</strong> A coluna <em>OPERACIONAL</em> tem de
+    dizer <em>Em Atendimento</em>, e nunca <code>EmAtendimento_c</code>. Esse campo é lista
+    customizada e a API só devolve o código — o mapa de 57 pares foi transcrito do SMAX Toolkit.
+    Código novo, que ainda não esteja no mapa, cai na regra de emergência (tira o <code>_c</code>,
+    quebra o camelCase): aceitável, mas se aparecer algo assim na tela é sinal de que falta um par.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Ordenação por clique nas 8 colunas.</strong> Clicar troca de coluna e abre na direção
+    natural dela — A→Z em texto, maior/mais recente primeiro em número e data. Clicar de novo na
+    mesma coluna inverte, e a seta (▴/▾) tem de acompanhar; nas outras fica um ↕ apagado.
+    <em>O teste que importa:</em> linha <em>não lido</em> fica no fim nas <strong>duas</strong>
+    direções. Se inverter e ela subir ao topo, o painel passou a tratar falta de dado como se
+    fosse o menor valor — que é exatamente a mentira que este projeto não aceita.
+    <em>Marcações</em> ordena por quantidade, não por nome: a pergunta útil é quem está sem
+    classificação.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Arquivar tira do painel, não do histórico.</strong> Arquivar some com a linha da lista
+    e preserva marcações, nota e <code>incluidoEm</code> — o oposto de <em>Remover</em>. Mas vá
+    aos <em>Gráficos</em>: o arquivado tem de continuar contado, o total do topo pode ficar
+    <em>maior</em> que o do Painel, e no lugar do chip de arquivados tem de haver o selo
+    <em>sempre contados</em>. Se arquivar fizesse o gráfico encolher, bastaria arquivar os
+    encerrados para o “abertos × encerrados” virar 100% aberto.
+    Com um encerrado na tela aparece o aviso de sugestão: ele lista os chamados no modal antes de
+    confirmar, e <em>Cancelar</em> não pode gravar nada. O script nunca arquiva sozinho, e nunca
+    arquiva quem está <em>não lido</em> — não se arquiva por falta de informação.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Ver o chamado (botão <em>Ver</em>).</strong> Lê pelo endpoint da tela nativa
+    (<code>entity-page/initializationDataByLayout</code>), porque o
+    <code>ems/Request/{id}?layout=Description,Solution,Comments</code> devolve esses campos vazios
+    em parte dos chamados — falha silenciosa que o Leonardo já tinha documentado. Os fixtures do
+    mock cobrem um caso cada:
+    <br><code>82133910</code> normal — imagem de 2400px e tabela não podem estourar o modal;
+    comentário de sistema fica de fora; o <em>interno</em> vem com selo e barra lateral, porque
+    quem lê pode estar prestes a copiar aquilo para uma resposta pública.
+    <br><code>82140011</code> HTML <em>duplamente escapado</em> — tem de aparecer em negrito de
+    verdade, e não as tags como texto.
+    <br><code>82210088</code> três tentativas de XSS (<code>&lt;script&gt;</code>,
+    <code>onerror</code>, <code>href="javascript:"</code>) — nenhuma pode executar nem sobrar no
+    HTML; e o <code>Comments</code> inválido só derruba a <em>Discussão</em>, com descrição e
+    solução intactas.
+    <br><code>82220099</code> responde 200 numa forma inesperada — tem de dizer isso e apontar o
+    <em>Abrir no SMAX</em>, nunca abrir um modal vazio que pareça “chamado sem conteúdo”.
+  </div>
+</div>
+
+<div class="card">
   <strong>3.</strong> Use o candidato como molde, volte em <em>Abrir chamado</em>, preencha e clique em <em>Ver payload</em>.
   Confira se <code>DisplayLabel</code>, <code>Description</code>, <code>Urgency</code> e <code>ImpactScope</code> foram sobrescritos
   e se <code>Id</code>/<code>CreateTime</code>/<code>Comments</code> sumiram.

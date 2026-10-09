@@ -36,11 +36,11 @@ const REQUESTS = [
   { Id: '82133910', IsGlobal_c: 'true', DisplayLabel: 'GLOBAL — eproc 1o grau fora do ar', Status: 'InProgress', StatusSCCDSMAX_c: 'EmAtendimento_c', grupo: 'SUPORTE EPROC', CreateTime: 1778770800000, LastUpdateTime: 1758900000000 },
   // GlobalId_c apontando para si mesmo, e so em related_properties: o SMAX faz
   // isso em global de verdade, e nem a conferencia nem a contagem podem ler como filho.
-  { Id: '82140011', IsGlobal_c: true, DisplayLabel: 'GLOBAL — custas indevidas', Status: 'Ready', StatusSCCDSMAX_c: 'Aguardando_c', grupo: 'SUPORTE CUSTAS', CreateTime: 1783004400000, LastUpdateTime: 1758910000000, pai: '82140011', relOnly: true },
+  { Id: '82140011', IsGlobal_c: true, DisplayLabel: 'GLOBAL — custas indevidas', Status: 'Ready', StatusSCCDSMAX_c: 'Aguardando3Nivel_c', grupo: 'SUPORTE CUSTAS', CreateTime: 1783004400000, LastUpdateTime: 1758910000000, pai: '82140011', relOnly: true },
   // Global encerrado, para a barra de "encerrados" nao ficar sempre em zero.
   // Status 'RequestStatusComplete' com o prefixo do enum, que e como o SMAX
   // devolve — os outros estao sem prefixo de proposito, para exercitar os dois.
-  { Id: '82133911', IsGlobal_c: 'true', DisplayLabel: 'GLOBAL — mandados em lote (encerrado)', Status: 'RequestStatusComplete', StatusSCCDSMAX_c: 'Concluido_c', grupo: 'SUPORTE EPROC', CreateTime: 1764774000000, LastUpdateTime: 1758915000000 },
+  { Id: '82133911', IsGlobal_c: 'true', DisplayLabel: 'GLOBAL — mandados em lote (encerrado)', Status: 'RequestStatusComplete', StatusSCCDSMAX_c: 'Fechado_c', grupo: 'SUPORTE EPROC', CreateTime: 1764774000000, LastUpdateTime: 1758915000000 },
   { Id: '82150022', IsGlobal_c: 'false', DisplayLabel: 'Chamado comum de usuario', Status: 'Ready', grupo: 'ATENDIMENTO', CreateTime: 1757200000000, LastUpdateTime: 1758920000000 },
   { Id: '82160033', IsGlobal_c: 'false', DisplayLabel: 'Filho do global', Status: 'Ready', grupo: 'ATENDIMENTO', CreateTime: 1757300000000, LastUpdateTime: 1758930000000, pai: '82133910', relOnly: true },
   // Mais filhos, para a contagem dar numero diferente por pai (3 e 1).
@@ -48,7 +48,7 @@ const REQUESTS = [
   { Id: '82160035', IsGlobal_c: 'false', DisplayLabel: 'Filho 3', Status: 'Ready', grupo: 'ATENDIMENTO', pai: '82133910', relOnly: true },
   { Id: '82160036', IsGlobal_c: 'false', DisplayLabel: 'Filho de outro global', Status: 'Ready', grupo: 'ATENDIMENTO', pai: '82140011' },
   // Marcado no painel mas desmarcado no SMAX: o painel tem de avisar.
-  { Id: '82200077', IsGlobal_c: 'false', DisplayLabel: 'Era global e alguem desmarcou', Status: 'Complete', StatusSCCDSMAX_c: 'Concluido_c', grupo: 'SUPORTE EPROC', CreateTime: 1757400000000, LastUpdateTime: 1758940000000 },
+  { Id: '82200077', IsGlobal_c: 'false', DisplayLabel: 'Era global e alguem desmarcou', Status: 'Complete', StatusSCCDSMAX_c: 'Fechado_c', grupo: 'SUPORTE EPROC', CreateTime: 1757400000000, LastUpdateTime: 1758940000000 },
   // Global valido na leitura individual (da para incluir), mas qualquer consulta
   // em lote que o cite e recusada pelo teto de 10.000 — e assim que se testa o
   // bloco que fica sem leitura no painel.
@@ -176,6 +176,87 @@ http.createServer(async (req, res) => {
     }
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ meta: { completion_status: 'OK' }, entities: [entidadeDe(reg)] }));
+    return;
+  }
+
+  /* Endpoint do visualizador — o que a tela nativa do chamado usa. A forma da
+   * resposta e diferente dos outros: os campos vem em `EntityData.properties`,
+   * e `Comments` e uma STRING com JSON dentro. Ambas as armadilhas estao
+   * reproduzidas aqui de proposito, senao o mock validaria um codigo que falha
+   * em producao.
+   *
+   * Cada fixture forca um caso:
+   *  - 82133910: HTML normal, com imagem larga e tabela (testa o CSS de conteudo
+   *    de terceiro), comentario interno + publico, e um comentario de sistema
+   *    que o script tem de esconder.
+   *  - 82140011: descricao DUPLAMENTE escapada, que e o caso em que renderizar
+   *    direto mostra as tags como texto.
+   *  - 82210088: tentativa de XSS na descricao, em tres formas. Nenhuma pode
+   *    executar nem sobrar no HTML renderizado.
+   *  - 82133911: encerrado, com solucao preenchida.
+   *  - 82220099: resposta na FORMA ERRADA (sem EntityData), para exercitar a
+   *    mensagem de "formato inesperado" em vez de um modal vazio.
+   *  - ID_ERRO_LEITURA: 500. */
+  const FORM_FIXTURES = {
+    '82133910': {
+      Description: '<p>O <b>eproc de 1º grau</b> está fora do ar desde as 08h.</p>'
+        + '<p><img src="/img/print-gigante.png" width="2400" alt="print"></p>'
+        + '<table><tr><th>Base</th><th>Afetados</th></tr><tr><td>SP</td><td>muitos</td></tr></table>',
+      Solution: '',
+      Comments: JSON.stringify({ Comment: [
+        { Submitter: 'Person/10001', IsSystem: false, CommentBody: '<p>Acionado o 3º nível.</p>', CreateTime: 1758900100000, PrivacyType: 'AGENTPUBLIC' },
+        { Submitter: 'Person/10002', IsSystem: false, CommentBody: '<p>Fornecedor confirmou falha no storage. <b>Não repassar ao solicitante.</b></p>', CreateTime: 1758900200000, PrivacyType: 'INTERNAL' },
+        { Submitter: 'Person/0', IsSystem: true, CommentBody: 'Status alterado de Pronto para Em andamento', CreateTime: 1758900050000, PrivacyType: 'AGENTPUBLIC' }
+      ] })
+    },
+    '82140011': {
+      Description: '&lt;p&gt;Custas &lt;b&gt;indevidas&lt;/b&gt; sendo cobradas em 2ª instância.&lt;/p&gt;',
+      Solution: '',
+      Comments: ''
+    },
+    '82210088': {
+      Description: '<p>Migração travada.</p>'
+        + '<script>window.__XSS_SCRIPT = true;</script>'
+        + '<img src="x" onerror="window.__XSS_ONERROR = true">'
+        + '<a href="javascript:window.__XSS_HREF=true">clique</a>',
+      Solution: '',
+      // JSON invalido de proposito: a discussao tem de falhar sozinha, sem
+      // derrubar descricao e solucao.
+      Comments: '{"Comment":[{"CommentBody":'
+    },
+    '82133911': {
+      Description: '<p>Mandados em lote não eram gerados.</p>',
+      Solution: '<p>Reprocessada a fila. <i>Validado com a unidade.</i></p>',
+      Comments: JSON.stringify({ Comment: [
+        { Submitter: 'Person/10001', IsSystem: false, CommentBody: '<p>Encerrando.</p>', CreateTime: 1758915000000, PrivacyType: 'AGENTPUBLIC' }
+      ] })
+    }
+  };
+
+  const umForm = /^\/rest\/\d+\/entity-page\/initializationDataByLayout\/Request\/(\d+)$/i.exec(url);
+  if (umForm && req.method === 'GET') {
+    const id = umForm[1];
+    console.log(`[mock] GET entity-page/.../Request/${id}`);
+    if (id === ID_ERRO_LEITURA) { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end('{"meta":{"completion_status":"FAILED"}}'); return; }
+    // Antes do 404 de proposito: aqui o chamado responde 200, o problema e a
+    // FORMA da resposta — e isso tem de ser distinguivel de "nao existe".
+    if (id === '82220099') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end('{"meta":{"completion_status":"OK"},"OutraCoisa":{}}');
+      return;
+    }
+    const reg = REQUESTS.find(r => r.Id === id);
+    if (!reg) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end('{"error":{"message":"not found"}}'); return; }
+    const ent = entidadeDe(reg);
+    const extra = FORM_FIXTURES[id] || { Description: '', Solution: '', Comments: '' };
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      meta: { completion_status: 'OK' },
+      EntityData: {
+        properties: { ...ent.properties, ...extra },
+        related_properties: ent.related_properties
+      }
+    }));
     return;
   }
 

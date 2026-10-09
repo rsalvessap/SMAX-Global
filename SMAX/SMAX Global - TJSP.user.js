@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SMAX Painel de Globais - TJSP
 // @namespace    https://github.com/rsalvessap/SMAX-Global
-// @version      1.11
+// @version      1.12
 // @description  Painel de gestao de chamados globais do SMAX TJSP — lista curada, classificacao por assunto/base/competencia, sincronizacao por arquivo no GitHub e abertura automatizada de global por molde
 // @author       rsalvessap
 // @match        https://suporte.tjsp.jus.br/saw/*
@@ -26,7 +26,7 @@
   if (window.top && window.top !== window.self) return;
   if (window.location.hostname !== 'suporte.tjsp.jus.br') return;
 
-  const SMAX_GLOBAL_VERSION = '1.11';
+  const SMAX_GLOBAL_VERSION = '1.12';
 
   // O userscript roda em sandbox; quem dispara as requisicoes e a pagina.
   const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
@@ -130,7 +130,8 @@
       // Ultimos filtros do painel. Ficam aqui, e nao em smax_pg_dados, porque sao
       // escolha desta maquina — nao entram no arquivo publicado.
       filtros: { assunto: [], base: [], competencia: [], status: '', termo: '', verArquivados: false },
-      ordem: 'filhos'
+      ordem: 'filhos',
+      ordemAsc: false
     };
 
     const saneaValores = (arr) => Array.isArray(arr)
@@ -420,6 +421,89 @@
     const chaveStatus = (s) => String(s || '').replace(/^RequestStatus/, '');
     const rotuloStatus = (s) => STATUS_ROTULO[chaveStatus(s)] || String(s || '');
 
+    // Recebe a LINHA, nao o status, de proposito: linha sem leitura nao tem
+    // status nenhum, e `ENCERRADOS.has(chaveStatus(''))` daria `false` — ou
+    // seja, "nao lido" passaria por "aberto" em silencio. Aqui nao: devolve
+    // `null` para "nao se sabe", e quem chama tem de decidir o que fazer.
+    const encerrada = (l) => (l.lido ? ENCERRADOS.has(chaveStatus(l.status)) : null);
+
+    // Status operacional (`StatusSCCDSMAX_c`) e campo de lista customizado: a API
+    // devolve o CODIGO ('EmAtendimento_c'), nunca o rotulo que o SMAX mostra na
+    // tela. Este mapa foi transcrito do `STATUS_SCCD_LABELS` do SMAX Toolkit
+    // (`SGS221-Triagem/SMAX/SMAX Toolkit - TJSP.user.js:5696-5754`), onde ja
+    // estava mantido a mao; os mesmos 57 pares aparecem identicos no Respostas
+    // ADM e em dois scripts de terceiro, o que e a melhor evidencia disponivel
+    // de que estao certos — nao existe endpoint que devolva esses rotulos.
+    const STATUS_OP_ROTULO = {
+      Agendado_c:                              'Agendado',
+      Aguardando3Nivel_c:                      'Aguardando 3º Nível',
+      AguardandoAceiteDefinitivo_c:            'Aguardando Aceite Definitivo',
+      AguardandoAceiteCancelamento_c:          'Aguardando Aceite do Cancelamento',
+      AguardandoAtendimento_c:                 'Aguardando Atendimento',
+      AguardandoCliente_c:                     'Aguardando Cliente',
+      AguardandoClienteContato1_c:             'Aguardando Cliente – Contato 1',
+      AguardandoClienteContato1DiaZero_c:      'Aguardando Cliente – Contato 1 (Dia Zero)',
+      AguardandoClienteContato2_c:             'Aguardando Cliente – Contato 2',
+      AguardandoClienteContato3_c:             'Aguardando Cliente – Contato 3',
+      AguardandoColeta_c:                      'Aguardando Coleta',
+      AguardandoContinuidadeAtendimento_c:     'Aguardando Continuidade de Atendimento',
+      AguardandoDocumentacao_c:                'Aguardando Documentação',
+      AguardandoEquipeConfiguracao_c:          'Aguardando Equipe de Configuração',
+      AguardandoGarantiaFabricante_c:          'Aguardando Garantia do Fabricante',
+      AguardandoInformacaoProcedimento_c:      'Aguardando Informação de Procedimento',
+      AguardandoInstalacaoProducao_c:          'Aguardando Instalação em Produção',
+      AguardandoOutraEquipe_c:                 'Aguardando Outra Equipe',
+      AguardandoPeca_c:                        'Aguardando Peça',
+      AguardandoRetornoCliente_c:              'Aguardando Retorno do Cliente',
+      AguardandoRetornoFornecedor_c:           'Aguardando Retorno do Fornecedor',
+      AguardandoSTI_c:                         'Aguardando STI',
+      ATUALIZADOUSUARIOTEAMS_c:                'Atualizado pelo Usuário do Teams',
+      DevolucaoFaltaSubsidio_c:                'Devolução falta de subsídio',
+      DevolucaoAtendimentoIT2B_c:              'Devolução para Atendimento IT2B',
+      AnaliseATIPG_c:                          'Em Análise ATIPG',
+      EmAnaliseEmpresa_c:                      'Em Análise Empresa',
+      AnaliseSAAB_c:                           'Em Análise SAAB',
+      EmAnaliseTJSP_c:                         'Em Análise TJSP',
+      EmAtendimento_c:                         'Em Atendimento',
+      EmRota_c:                                'Em Rota',
+      EnviaGSE_c:                              'Envia para GSE',
+      EnviadoReparoExterno_c:                  'Enviado para Reparo Externo',
+      EquipamentoEnviadoReparo_c:              'Equipamento Enviado para Reparo',
+      ErroIntegracao_c:                        'Erro na Integração',
+      Fechado_c:                               'Fechado',
+      DecursoPrazo_c:                          'Fechado por Decurso de Prazo',
+      DecursoDePrazo_c:                        'Fechado por Decurso de Prazo',
+      GarantiaRecusada_c:                      'Garantia Recusada',
+      LaudoDescarte_c:                         'Laudo para Descarte',
+      MetricaAguardando_c:                     'Métricas - Aguardando',
+      MetricaCancelada_c:                      'Métricas - Cancelada',
+      MetricaAnalisa_c:                        'Métricas - Em Análise',
+      MetricaEmExecucao_c:                     'Métricas - Em Execução',
+      MetricaHomologada_c:                     'Métricas - Homologada',
+      MetricaRejeitada_c:                      'Métricas - Rejeitada',
+      PecaDevolvida_c:                         'Peça Devolvida',
+      PecaEnviada_c:                           'Peça Enviada',
+      PedidoPeca_c:                            'Pedido de Peça',
+      PedidoPecaComBackup_c:                   'Pedido de Peça com Backup',
+      PedidoRecategorizacao_c:                 'Pedido de Recategorização',
+      RatAnexada_c:                            'Rat Anexada',
+      ReparoLaboratorio_c:                     'Reparo em Laboratório',
+      RetornoAnalise_c:                        'Retorno Análise',
+      RetornoAtividade_c:                      'Retorno de Atividade',
+      TarefaConcluidaLogista_c:                'Tarefa Concluída Logística',
+      TarefaConcluidaParcialLogisti_c:         'Tarefa Concluída Parcial Logística',
+    };
+    // Codigo fora do mapa nao pode voltar a aparecer cru na tela: o sufixo sai e
+    // o camelCase vira espaco ('EmAndamento_c' -> 'Em Andamento'). Acentua menos
+    // que o mapa e erra em casos como 'Aguardando3Nivel_c', mas o mapa cobre
+    // justamente esses; isto e so a rede de seguranca para codigo novo.
+    const rotuloStatusOp = (s) => {
+      const bruto = String(s || '').trim();
+      if (!bruto) return '';
+      return STATUS_OP_ROTULO[bruto]
+        || bruto.replace(/_c$/i, '').replace(/([a-z0-9à-ü])([A-Z])/g, '$1 $2');
+    };
+
     const linhaDe = (g) => {
       const e = PgStore.estado().porId[g.id] || null;
       return {
@@ -460,18 +544,55 @@
       return true;
     };
 
-    const ORDENS = {
-      filhos: (a, b) => (b.filhos === null ? -1 : b.filhos) - (a.filhos === null ? -1 : a.filhos),
-      numero: (a, b) => Number(b.id) - Number(a.id),
+    /* Ordenacao: estas sao funcoes de CHAVE, nao comparadores. A direcao e
+     * aplicada uma unica vez em `comparador` — com comparador por coluna, cada
+     * uma teria de saber inverter sozinha e a oitava esqueceria.
+     * Convencao: devolver `null` quer dizer "nao se sabe" (chamado nao lido, ou
+     * contagem de filhos que falhou), nunca zero nem string vazia. */
+    const CHAVES = {
+      numero:    l => Number(l.id),
+      titulo:    l => (l.lido ? l.titulo || '' : null),
+      status:    l => (l.lido ? rotuloStatus(l.status) : null),
+      statusOp:  l => (l.lido ? rotuloStatusOp(l.statusOp) : null),
+      grupo:     l => (l.lido ? l.grupo || '' : null),
+      filhos:    l => l.filhos,
+      // Quantas marcacoes tem, somando os tres eixos. Ordenar por nome nao faria
+      // sentido num campo multivalorado; por quantidade responde a pergunta util,
+      // que e "quais ainda estao sem classificacao".
+      marcacoes: l => l.marcas.assunto.length + l.marcas.base.length + l.marcas.competencia.length,
       // Data de abertura do chamado no SMAX (CreateTime), nao a data em que
       // alguem o incluiu no painel: quem olha a lista quer saber desde quando
-      // o problema existe. Nao lido vai para o fim, com criadoEm = 0.
-      abertura: (a, b) => (b.criadoEm || 0) - (a.criadoEm || 0),
-      atualizado: (a, b) => (b.atualizadoEm || 0) - (a.atualizadoEm || 0)
+      // o problema existe.
+      abertura:  l => l.criadoEm || null,
+      atualizado: l => l.atualizadoEm || null
     };
 
-    const listar = (filtros, ordem) =>
-      todas().filter(l => passaFiltro(l, filtros || {})).sort(ORDENS[ordem] || ORDENS.filhos);
+    /* Direcao do PRIMEIRO clique na coluna. Em texto o esperado e A-Z; em numero
+     * e data o esperado e o maior / mais recente primeiro. Nao da para ter uma
+     * direcao padrao unica sem que metade das colunas abra ao contrario. */
+    const ASC_PRIMEIRO = new Set(['titulo', 'status', 'statusOp', 'grupo']);
+
+    const comparador = (ordem, asc) => {
+      const chave = CHAVES[ordem] || CHAVES.filhos;
+      const dir = asc ? 1 : -1;
+      return (a, b) => {
+        const va = chave(a), vb = chave(b);
+        // Desconhecido vai para o fim nas DUAS direcoes. Ausencia de dado nao e
+        // um valor pequeno — e a falta de um valor; inverter a ordem nao pode
+        // fazer o que nao foi lido subir ao topo como se fosse resposta.
+        if (va === null || vb === null) {
+          if (va === vb) return 0;
+          return va === null ? 1 : -1;
+        }
+        if (typeof va === 'string' || typeof vb === 'string') {
+          return String(va).localeCompare(String(vb), 'pt-BR') * dir;
+        }
+        return (va - vb) * dir;
+      };
+    };
+
+    const listar = (filtros, ordem, asc) =>
+      todas().filter(l => passaFiltro(l, filtros || {})).sort(comparador(ordem, asc));
 
     const resumo = (linhas) => {
       const comFilhos = linhas.filter(l => l.filhos !== null);
@@ -572,7 +693,7 @@
       };
     };
 
-    return { todas, listar, resumo, statusConhecidos, graficos, rotuloStatus, ORDENS };
+    return { todas, listar, resumo, statusConhecidos, graficos, rotuloStatus, rotuloStatusOp, encerrada, CHAVES, ASC_PRIMEIRO };
   })();
 
   /* =========================================================
@@ -769,10 +890,16 @@
         .replace(/'/g, '&#39;');
     };
 
+    /* `DOMParser` e nao `div.innerHTML`: o documento que o DOMParser devolve e
+     * INERTE — nao busca recurso nem dispara evento. Num div solto, mesmo fora
+     * do documento, o Chrome ainda tenta carregar `<img src>`, e um
+     * `<img src=x onerror=...>` roda antes desta funcao chegar a tirar o
+     * atributo. Isso era aceitavel enquanto a entrada era so o que o proprio
+     * usuario digitava no editor; deixou de ser quando o visualizador de chamado
+     * passou a renderizar descricao escrita por qualquer solicitante. */
     const sanitizeRichText = (html) => {
       if (!html) return '';
-      const tmp = document.createElement('div');
-      tmp.innerHTML = html;
+      const tmp = new DOMParser().parseFromString(String(html), 'text/html').body;
       tmp.querySelectorAll('script, style, iframe, object, embed, form, input, textarea, select, button, svg, math, template, link, meta, base, noscript').forEach(el => el.remove());
       tmp.querySelectorAll('*').forEach((node) => {
         if (!SAFE_TAGS.has(node.tagName.toLowerCase())) {
@@ -823,6 +950,23 @@
       return (tmp.textContent || '').replace(/\u00a0/g, ' ').trim();
     };
 
+    /* O SMAX devolve `Description` e `Comments` as vezes com o HTML escapado
+     * DUAS vezes: chega `&lt;p&gt;texto&lt;/p&gt;` em vez de `<p>texto</p>`, e
+     * renderizar isso direto mostra as tags como texto na tela
+     * (Automacoes-compiladas.user.js:977-990 trata o mesmo caso com `<textarea>`;
+     * aqui o DOMParser faz o mesmo e e inerte).
+     * Decide pelo conteudo, nao por configuracao: so desescapa se NAO houver tag
+     * de verdade e houver entidade que pareca tag. Desescapar sempre quebraria o
+     * caso normal, em que `&lt;` no meio do texto e literalmente o sinal de menor
+     * que alguem digitou. */
+    const unescapeIfDoubleEscaped = (html) => {
+      const s = String(html || '');
+      if (!s) return '';
+      if (/<[a-z!/]/i.test(s)) return s;
+      if (!/&lt;\s*\/?[a-z]/i.test(s)) return s;
+      return new DOMParser().parseFromString(s, 'text/html').body.textContent || '';
+    };
+
     const deepClone = (value) => {
       if (Array.isArray(value)) return value.map(deepClone);
       if (value && typeof value === 'object') {
@@ -860,7 +1004,7 @@
 
     return {
       escapeHtml, sanitizeRichText, normalizeContentEditableHtml, htmlToText,
-      deepClone, onDomReady, formatBrDateTime, formatBrDate
+      unescapeIfDoubleEscaped, deepClone, onDomReady, formatBrDateTime, formatBrDate
     };
   })();
 
@@ -1204,7 +1348,92 @@
       return { porPai, falhas };
     };
 
-    return { conferir, emLote, extrairGlobalId, lerEstado, contarFilhos, motivoDeErro };
+    /* (3) O chamado inteiro, para o visualizador.
+     *
+     * NAO usa `ems/Request/{id}?layout=Description,Solution,Comments`. Esse e o
+     * caminho obvio e ele falha em silencio: devolve os tres campos VAZIOS em
+     * parte dos chamados que claramente tem conteudo — o proprio Leonardo
+     * documentou isso em smax-extracao-avancada.user.js:1591-1596 e trocou pelo
+     * endpoint que a tela nativa do chamado usa, que e este. Preferir o endpoint
+     * da tela nativa tem o efeito colateral bom de ser o que o SMAX mais testa.
+     *
+     * Os dois layouts vao juntos de proposito: `withoutResolution` traz os campos
+     * do chamado e `onlyResolution` traz a solucao; pedir so o primeiro devolve
+     * a solucao vazia, o que e indistinguivel de "nao tem solucao".
+     *
+     * Armadilha da forma da resposta: o dado vem em `EntityData.properties`, e
+     * NAO em `properties` como nos outros endpoints. As tres formas abaixo sao as
+     * que o Leonardo aceita (:1600-1606) — ele viu as tres em producao. */
+    const LAYOUTS_FORM = 'FORM_LAYOUT.withoutResolution,FORM_LAYOUT.onlyResolution';
+
+    const propsDoForm = (resp) => (resp && resp.EntityData && resp.EntityData.properties)
+      || (resp && resp.properties)
+      || (resp && Array.isArray(resp.entities) && resp.entities[0] && resp.entities[0].properties)
+      || null;
+
+    /* `Comments` nao e array: e uma STRING com um JSON dentro, na forma
+     * {"Comment":[{Submitter,IsSystem,CommentBody,CreateTime,PrivacyType}]}.
+     * JSON invalido aqui nao pode derrubar o modal inteiro — descricao e solucao
+     * continuam valendo —, entao a falha vira lista vazia e um aviso. */
+    const parseComentarios = (bruto) => {
+      if (!bruto) return { itens: [], erro: '' };
+      let obj = bruto;
+      if (typeof bruto === 'string') {
+        try { obj = JSON.parse(bruto); }
+        catch { return { itens: [], erro: 'A discussão veio num formato que não foi possível interpretar.' }; }
+      }
+      const arr = Array.isArray(obj) ? obj : (Array.isArray(obj && obj.Comment) ? obj.Comment : []);
+      const itens = arr
+        .filter(c => c && c.IsSystem !== true && c.IsSystem !== 'true')
+        .map(c => ({
+          corpo: String(c.CommentBody || ''),
+          autorId: String(c.Submitter || '').replace(/^Person\//, ''),
+          quando: Number(c.CreateTime) || 0,
+          // PrivacyType 'INTERNAL' e o comentario que o solicitante NAO ve. Tem de
+          // aparecer marcado: quem le o modal pode estar prestes a copiar isso
+          // para uma resposta publica.
+          interno: String(c.PrivacyType || '').toUpperCase() === 'INTERNAL'
+        }))
+        .sort((a, b) => a.quando - b.quando);
+      return { itens, erro: '' };
+    };
+
+    const lerChamado = async (id) => {
+      const resp = await ApiClient.request(
+        `entity-page/initializationDataByLayout/Request/${encodeURIComponent(id)}`,
+        { searchParams: { layout: LAYOUTS_FORM }, timeout: 45000 }
+      );
+      const p = propsDoForm(resp);
+      if (!p || !p.Id) {
+        const err = new Error('A resposta do SMAX não trouxe os dados do chamado.');
+        err.formaInesperada = true;
+        throw err;
+      }
+      const rel = (resp && resp.EntityData && resp.EntityData.related_properties) || {};
+      const disc = parseComentarios(p.Comments);
+      return {
+        id: String(p.Id),
+        titulo: String(p.DisplayLabel || ''),
+        status: String(p.Status || ''),
+        statusOp: String(p.StatusSCCDSMAX_c || ''),
+        grupo: String(
+          (rel.AssignedToGroup && rel.AssignedToGroup.Name)
+          || (p.AssignedToGroup && p.AssignedToGroup.Name)
+          || p['AssignedToGroup.Name'] || ''
+        ),
+        criadoEm: Number(p.CreateTime) || 0,
+        atualizadoEm: Number(p.LastUpdateTime) || 0,
+        descricao: String(p.Description || ''),
+        solucao: String(p.Solution || ''),
+        comentarios: disc.itens,
+        erroDiscussao: disc.erro
+      };
+    };
+
+    return {
+      conferir, emLote, extrairGlobalId, lerEstado, contarFilhos, motivoDeErro,
+      lerChamado, parseComentarios
+    };
   })();
 
   /* =========================================================
@@ -1954,6 +2183,10 @@
 .smax-gl-tbl th[data-ordem] { cursor:pointer; }
 .smax-gl-tbl th[data-ordem]:hover { color:var(--sp-accent); }
 .smax-gl-tbl th[data-ativa="true"] { color:var(--sp-accent); }
+/* Na coluna inativa a seta e so a dica de que da para clicar: apagada, e so
+   aparece de verdade no hover. Na ativa ela carrega informacao (a direcao). */
+.smax-gl-tbl th[data-ativa="false"] .smax-gl-seta { opacity:.25; }
+.smax-gl-tbl th[data-ordem]:hover .smax-gl-seta { opacity:1; }
 .smax-gl-tbl td { padding:6px 8px; border-bottom:1px solid var(--sp-border); vertical-align:top; }
 .smax-gl-tbl tr[data-arquivado="true"] td { opacity:.5; }
 .smax-gl-tbl tr:hover td { background:var(--sp-primary-bg); }
@@ -1977,6 +2210,31 @@
 }
 .smax-gl-card b { display:block; font-size:18px; font-weight:600; color:var(--sp-text); line-height:1.2; }
 .smax-gl-card span { font-size:10px; text-transform:uppercase; letter-spacing:.4px; color:var(--sp-text-muted); }
+
+/* Visualizador de chamado. */
+.smax-gl-ver-dados {
+  display:grid; grid-template-columns:repeat(auto-fit, minmax(170px, 1fr)); gap:10px;
+  border:1px solid var(--sp-border); border-radius:var(--sp-r-md); padding:10px 12px;
+  background:var(--sp-card-bg); font-size:12.5px;
+}
+/* Conteudo de terceiro: limitar a largura em TUDO e obrigatorio. Chamado com
+   print colado de 2000px de largura esticava o modal e empurrava o resto da
+   tela para fora — e a tabela precisa de table-layout fixo porque tabela colada
+   do Excel ignora a largura do container sem isso. */
+.smax-gl-rico {
+  border:1px solid var(--sp-border); border-radius:var(--sp-r-md); padding:10px 12px;
+  background:var(--sp-surface); font-size:13px; line-height:1.55; color:var(--sp-text);
+  overflow-x:auto; word-break:break-word;
+}
+.smax-gl-rico img { max-width:100%; height:auto; }
+.smax-gl-rico table { max-width:100%; table-layout:fixed; border-collapse:collapse; }
+.smax-gl-rico td, .smax-gl-rico th { border:1px solid var(--sp-border); padding:4px 6px; }
+.smax-gl-rico a { color:var(--sp-accent); }
+.smax-gl-coment { margin-top:8px; }
+.smax-gl-coment .smax-gl-cand-meta { display:flex; align-items:center; gap:6px; margin-bottom:3px; }
+/* Interno e o comentario que o solicitante nao ve. A borda a esquerda existe
+   para dar para diferenciar correndo o olho pela lista, sem ler o selo. */
+.smax-gl-coment-int .smax-gl-rico { border-left:3px solid var(--sp-pending); }
 
 /* Graficos. HTML e CSS, sem biblioteca e sem SVG: barra e uma div com width em
    porcentagem, e assim o texto do rotulo tem tamanho real — com viewBox de SVG
@@ -2538,14 +2796,15 @@
     };
 
     /* ---------- Tela: painel ---------- */
+    // `ordem` e a chave em `Metrica.CHAVES`; coluna sem `ordem` nao e clicavel.
     const COLUNAS = [
       { rot: 'Nº', ordem: 'numero' },
-      { rot: 'Título' },
-      { rot: 'Status' },
-      { rot: 'Operacional' },
-      { rot: 'Grupo' },
+      { rot: 'Título', ordem: 'titulo' },
+      { rot: 'Status', ordem: 'status' },
+      { rot: 'Operacional', ordem: 'statusOp' },
+      { rot: 'Grupo', ordem: 'grupo' },
       { rot: 'Filhos', ordem: 'filhos' },
-      { rot: 'Marcações' },
+      { rot: 'Marcações', ordem: 'marcacoes' },
       { rot: 'Abertura', ordem: 'abertura' },
       { rot: '' }
     ];
@@ -2563,7 +2822,10 @@
     // Um bloco de filtros só, usado pelo Painel e pelos Gráficos: dois
     // conjuntos de controle sobre a mesma lista daria duas respostas
     // diferentes para a mesma pergunta.
-    const blocoFiltros = () => {
+    // `arquivadosFixos` e para a tela de graficos, onde o arquivado entra na
+    // conta sempre: um chip que nao muda nada e pior do que chip nenhum, porque
+    // o usuario clica, nada acontece e ele conclui que a tela esta quebrada.
+    const blocoFiltros = ({ arquivadosFixos = false } = {}) => {
       const f = PgStore.prefs.filtros;
       const chips = Dados.EIXOS.map(e => {
         const vals = Dados.lista(e.chave);
@@ -2596,21 +2858,51 @@
         </div>
         <div>
           <div class="smax-gl-label">Arquivados</div>
-          <button class="smax-gl-chip" data-act="filtro-arquivados" data-active="${!!f.verArquivados}">
-            ${f.verArquivados ? 'mostrando' : 'ocultos'}
-          </button>
+          ${arquivadosFixos
+            ? `<span class="smax-gl-badge" title="Arquivar tira da lista de trabalho, não do histórico — nos gráficos o arquivado continua contando.">sempre contados</span>`
+            : `<button class="smax-gl-chip" data-act="filtro-arquivados" data-active="${!!f.verArquivados}">
+                 ${f.verArquivados ? 'mostrando' : 'ocultos'}
+               </button>`}
         </div>
         <div><button class="smax-gl-btn" data-act="limpar-filtros">Limpar filtros</button></div>
       </div>`;
     };
 
+    /* Os encerrados que estao NA TELA agora, sem os que ja foram arquivados.
+     * A sugestao e a acao chamam esta mesma funcao de proposito: se cada uma
+     * montasse a sua lista, o aviso poderia dizer "3" e o botao arquivar 4. */
+    const encerradosNaTela = () => Metrica
+      .listar(PgStore.prefs.filtros, PgStore.prefs.ordem, PgStore.prefs.ordemAsc)
+      // `encerrada` devolve `null` para quem nao foi lido, e `=== true` deixa
+      // esses de fora de proposito: nao se arquiva por falta de informacao.
+      .filter(l => !l.arquivado && Metrica.encerrada(l) === true);
+
     const renderPainel = () => {
       const f = PgStore.prefs.filtros;
-      const linhas = Metrica.listar(f, PgStore.prefs.ordem);
+      const linhas = Metrica.listar(f, PgStore.prefs.ordem, PgStore.prefs.ordemAsc);
       const r = Metrica.resumo(linhas);
       const lidoEm = PgStore.estado().lidoEm;
 
       if (vazio()) return vazio();
+
+      /* Sugestao de arquivamento. Encerrado que continua na lista de trabalho e
+       * ruido, mas arquivar e decisao de quem cuida do painel: o script nao sabe
+       * se o chamado foi encerrado de verdade ou fechado por engano / decurso de
+       * prazo e ainda vai voltar. Por isso sugere e espera o clique — nunca
+       * arquiva sozinho. O escopo e o que esta na tela: botao que mexesse em
+       * linha escondida por filtro arquivaria o que o usuario nem viu. */
+      const aArquivar = encerradosNaTela();
+      const sugestao = aArquivar.length ? `
+        <div class="smax-gl-note smax-gl-note-warn">
+          <strong>${aArquivar.length}</strong> ${aArquivar.length === 1 ? 'global nesta tela já está encerrado' : 'globais nesta tela já estão encerrados'}
+          (concluído, rejeitado ou cancelado). Arquivar tira ${aArquivar.length === 1 ? 'ele' : 'eles'} da
+          lista sem perder nada: as marcações, a nota e a contagem de filhos ficam, e
+          <strong>os gráficos continuam contando</strong>.
+          <div style="margin-top:8px;">
+            <button class="smax-gl-btn" data-act="arquivar-encerrados"
+              >Arquivar ${aArquivar.length === 1 ? 'o encerrado' : `os ${aArquivar.length} encerrados`}</button>
+          </div>
+        </div>` : '';
 
       const corpo = linhas.length ? linhas.map(l => {
         const marcas = rotulosDe(l);
@@ -2636,7 +2928,7 @@
           <td class="smax-gl-tit">${l.lido ? Utils.escapeHtml(l.titulo || '(sem título)') : semLeitura}
             ${l.nota ? `<div class="smax-gl-cand-meta">${Utils.escapeHtml(l.nota)}</div>` : ''}</td>
           <td>${l.lido ? Utils.escapeHtml(Metrica.rotuloStatus(l.status) || '—') : semLeitura}</td>
-          <td>${l.lido ? Utils.escapeHtml(l.statusOp || '—') : semLeitura}</td>
+          <td>${l.lido ? Utils.escapeHtml(Metrica.rotuloStatusOp(l.statusOp) || '—') : semLeitura}</td>
           <td>${l.lido ? Utils.escapeHtml(l.grupo || '—') : semLeitura}</td>
           <td class="smax-gl-filhos">${l.filhos === null ? semLeitura : l.filhos}</td>
           <td><div class="smax-gl-marcas">${marcas.length
@@ -2645,6 +2937,8 @@
           <td class="smax-gl-num" title="Incluído no painel em ${Utils.escapeHtml(l.incluidoEm || '—')}"
             >${l.criadoEm ? Utils.escapeHtml(Utils.formatBrDate(l.criadoEm)) : semLeitura}</td>
           <td class="smax-gl-acoes">
+            <button class="smax-gl-btn" data-act="ver-global"
+                    data-id="${Utils.escapeHtml(l.id)}">Ver</button>
             <button class="smax-gl-btn" data-act="editar-global"
                     data-id="${Utils.escapeHtml(l.id)}">Editar</button>
             <button class="smax-gl-btn" data-act="${l.arquivado ? 'desarquivar' : 'arquivar'}"
@@ -2679,19 +2973,36 @@
                status, grupo e contagem de filhos aparecem como <em>não lido</em> — e não como zero.
              </div>`}
 
+        ${sugestao}
+
         ${blocoFiltros()}
 
         <table class="smax-gl-tbl">
-          <thead><tr>${COLUNAS.map(c => c.ordem
-            ? `<th data-ordem="${c.ordem}" data-ativa="${PgStore.prefs.ordem === c.ordem}">${c.rot} ▾</th>`
-            : `<th>${c.rot}</th>`).join('')}</tr></thead>
+          <thead><tr>${COLUNAS.map(c => {
+            if (!c.ordem) return `<th>${c.rot}</th>`;
+            const ativa = PgStore.prefs.ordem === c.ordem;
+            // A seta da coluna ativa diz a direcao real; nas outras um ↕ apagado
+            // diz apenas que da para clicar.
+            const seta = ativa ? (PgStore.prefs.ordemAsc ? '▴' : '▾') : '↕';
+            return `<th data-ordem="${c.ordem}" data-ativa="${ativa}"
+                        title="Ordenar por ${Utils.escapeHtml(c.rot)}${ativa ? ' (clique inverte)' : ''}"
+                      >${c.rot} <span class="smax-gl-seta">${seta}</span></th>`;
+          }).join('')}</tr></thead>
           <tbody>${corpo}</tbody>
         </table>`;
     };
 
     /* ---------- Tela: graficos ----------
-     * Le a MESMA lista filtrada do painel, de proposito: grafico que ignora o
+     * Le a mesma lista filtrada do painel, de proposito: grafico que ignora o
      * filtro da tela ao lado responde outra pergunta e ninguem percebe.
+     *
+     * Com UMA excecao, pedida em 2026-10-09: o filtro de arquivados nao vale
+     * aqui. Arquivar serve para tirar da lista de trabalho o que ja acabou, e
+     * nao para apagar o que aconteceu — se o grafico tambem obedecesse, bastaria
+     * arquivar os encerrados para o "abertos x encerrados" virar 100% aberto e o
+     * historico de meses encolher sozinho. Fica escrito no topo e no proprio
+     * bloco de filtros, porque grafico que discorda da tabela ao lado sem avisar
+     * e pior do que grafico nenhum.
      * Quantos globais entraram na conta fica escrito no topo. */
     const TOPO_FILHOS = 15;
 
@@ -2699,17 +3010,19 @@
       if (vazio()) return vazio();
 
       const f = PgStore.prefs.filtros;
-      const linhas = Metrica.listar(f, PgStore.prefs.ordem);
+      const linhas = Metrica.listar({ ...f, verArquivados: true },
+        PgStore.prefs.ordem, PgStore.prefs.ordemAsc);
       const g = Metrica.graficos(linhas);
       const lidoEm = PgStore.estado().lidoEm;
       const total = linhas.length;
+      const qtArquivados = linhas.filter(l => l.arquivado).length;
 
       if (!lidoEm) {
         return `<div class="smax-gl-note smax-gl-note-warn">
           Nada foi lido do SMAX ainda, então três dos gráficos não têm o que mostrar
           (status, filhos e data de abertura vêm da leitura). Clique em
           <strong>↻ Atualizar do SMAX</strong> no rodapé.
-        </div>${blocoFiltros()}`;
+        </div>${blocoFiltros({ arquivadosFixos: true })}`;
       }
 
       const cartoesEixo = g.porEixo.map(e => Graficos.cartao(
@@ -2781,10 +3094,16 @@
       return `
         <div class="smax-gl-note">
           Os gráficos contam os <strong>${total}</strong> globais que estão passando pelos filtros
-          abaixo — os mesmos do Painel. Estado lido do SMAX em
+          abaixo — os mesmos do Painel, <strong>menos o de arquivados</strong>.
+          ${qtArquivados
+            ? `<strong>${qtArquivados}</strong> ${qtArquivados === 1 ? 'está arquivado e continua' : 'estão arquivados e continuam'}
+               contado${qtArquivados === 1 ? '' : 's'} aqui: arquivar tira da lista de trabalho, não do histórico.
+               É por isso que o total acima pode ser maior do que o do Painel.`
+            : 'Nenhum arquivado no momento — quando houver, ele continua entrando nesta conta.'}
+          Estado lido do SMAX em
           <strong>${Utils.escapeHtml(Utils.formatBrDateTime(lidoEm))}</strong>.
         </div>
-        ${blocoFiltros()}
+        ${blocoFiltros({ arquivadosFixos: true })}
         <div class="smax-gl-grafs">
           ${vida}
           ${filhos}
@@ -3125,6 +3444,141 @@
       });
       document.body.appendChild(wrap);
     });
+
+    /* Arquivar em lote os encerrados da tela. Confirma mostrando a lista inteira
+     * — numero e barato de ler errado, e aqui some linha da tela de quem olha o
+     * painel todo dia. A lista e relida DEPOIS do "ok": o modal e assincrono e
+     * nesse meio-tempo uma rodada de atualizacao pode ter mudado status. */
+    const arquivarEncerrados = async () => {
+      const antes = encerradosNaTela();
+      if (!antes.length) { setStatus('Nenhum encerrado nesta tela.', 'err'); return; }
+      const corpo = `
+        <div class="smax-gl-note">
+          Vai sair da lista do painel, mas <strong>continua no arquivo e nos gráficos</strong>.
+          Marcações, nota e data de inclusão ficam como estão. Para trazer de volta,
+          ligue <strong>Arquivados: mostrando</strong> nos filtros e clique em <strong>Reabrir</strong>.
+        </div>
+        <ul style="margin:8px 0 0 18px;padding:0;">
+          ${antes.map(l => `<li>#${Utils.escapeHtml(l.id)} — ${Utils.escapeHtml(l.titulo || '(sem título)')}
+             <em>(${Utils.escapeHtml(Metrica.rotuloStatus(l.status))})</em></li>`).join('')}
+        </ul>`;
+      if (!(await askModal(`Arquivar ${antes.length} encerrado(s)`, corpo, 'Arquivar'))) {
+        setStatus('Arquivamento cancelado.');
+        return;
+      }
+      const alvos = encerradosNaTela();
+      let n = 0;
+      alvos.forEach((l) => { if (Dados.arquivar(l.id, true).ok) n++; });
+      render();
+      setStatus(n === alvos.length
+        ? `${n} global(is) arquivado(s).`
+        : `${n} de ${alvos.length} arquivado(s) — o resto já não estava no painel.`, n ? 'ok' : 'err');
+    };
+
+    /* ---------- Visualizador de chamado ----------
+     * Antes disto a unica forma de ler um global era clicar no numero e sair do
+     * painel para a tela do SMAX, perdendo filtro e ordenacao. O modal responde
+     * "do que se trata este?" sem tirar ninguem da lista; nao substitui a tela
+     * nativa, e por isso tem o link para ela no rodape.
+     *
+     * TODO o HTML aqui vem de fora e passa por `Utils.sanitizeRichText`, que usa
+     * DOMParser. Nao e paranoia de rotina: descricao de chamado e escrita por
+     * qualquer solicitante, e comentario tambem — e esta e a primeira tela do
+     * painel que renderiza HTML de terceiro em vez de texto escapado. */
+    const corpoRico = (html, vazioMsg) => {
+      const limpo = Utils.sanitizeRichText(Utils.unescapeIfDoubleEscaped(html));
+      // Checa o TEXTO, nao o HTML: `<p>&nbsp;</p>` tem 13 caracteres de HTML e
+      // nada de conteudo, e dizer "tem descricao" nesse caso e mentir.
+      if (!Utils.htmlToText(limpo)) {
+        return `<div class="smax-gl-note">${Utils.escapeHtml(vazioMsg)}</div>`;
+      }
+      return `<div class="smax-gl-rico">${limpo}</div>`;
+    };
+
+    const verModal = (id) => {
+      const wrap = document.createElement('div');
+      wrap.className = 'smax-gl-overlay smax-gl-modal smax-gl-root';
+      wrap.dataset.theme = ThemeManager.current();
+      const painel = () => wrap.querySelector('.smax-gl-body');
+      wrap.innerHTML = `
+        <div class="smax-gl-panel" style="width:min(900px,96vw);max-height:92vh;">
+          <div class="smax-gl-header">
+            <h2>#${Utils.escapeHtml(id)}</h2>
+            <div class="smax-gl-header-actions"><button data-act="fechar">✕</button></div>
+          </div>
+          <div class="smax-gl-body" style="overflow:auto;">
+            <div class="smax-gl-note">Lendo o chamado no SMAX...</div>
+          </div>
+          <div class="smax-gl-footer">
+            <div class="smax-gl-status"></div>
+            <a class="smax-gl-btn" href="/saw/Request/${Utils.escapeHtml(id)}/general" target="_blank"
+               style="text-decoration:none;">Abrir no SMAX</a>
+            <button class="smax-gl-btn" data-act="fechar">Fechar</button>
+          </div>
+        </div>`;
+      wrap.addEventListener('click', (ev) => {
+        if (ev.target === wrap || ev.target.closest('[data-act="fechar"]')) wrap.remove();
+      });
+      document.body.appendChild(wrap);
+
+      // O que o painel JA sabe deste global, que a leitura do chamado nao tem:
+      // marcacoes e nota sao dado local.
+      const g = Dados.acharGlobal(id);
+      const marcasLocais = g
+        ? Dados.EIXOS.flatMap(e => (g[e.chave] || []).map(vid => Dados.nomeDe(e.chave, vid)).filter(Boolean))
+        : [];
+
+      PgApi.lerChamado(id).then((c) => {
+        // O modal pode ter sido fechado durante a leitura. Escrever no DOM de um
+        // no removido nao da erro, mas reabriria nada — so sai fora.
+        if (!wrap.isConnected) return;
+        const campo = (rot, val) => `<div><span class="smax-gl-label">${rot}</span>
+          <div>${val}</div></div>`;
+        const discussao = c.comentarios.length
+          ? c.comentarios.map(cm => `
+              <div class="smax-gl-coment ${cm.interno ? 'smax-gl-coment-int' : ''}">
+                <div class="smax-gl-cand-meta">
+                  ${Utils.escapeHtml(Utils.formatBrDateTime(cm.quando))}
+                  ${cm.interno
+                    ? '<span class="smax-gl-badge smax-gl-badge-warn" title="O solicitante não vê este comentário.">interno</span>'
+                    : '<span class="smax-gl-badge">público</span>'}
+                </div>
+                ${corpoRico(cm.corpo, '(comentário vazio)')}
+              </div>`).join('')
+          : `<div class="smax-gl-note">${c.erroDiscussao
+               ? Utils.escapeHtml(c.erroDiscussao)
+               : 'Nenhum comentário de pessoa. Os lançamentos automáticos do SMAX ficam de fora.'}</div>`;
+
+        painel().innerHTML = `
+          <h3 style="margin:0 0 10px;">${Utils.escapeHtml(c.titulo || '(sem título)')}</h3>
+          <div class="smax-gl-ver-dados">
+            ${campo('Status', Utils.escapeHtml(Metrica.rotuloStatus(c.status) || '—'))}
+            ${campo('Operacional', Utils.escapeHtml(Metrica.rotuloStatusOp(c.statusOp) || '—'))}
+            ${campo('Grupo', Utils.escapeHtml(c.grupo || '—'))}
+            ${campo('Abertura', Utils.escapeHtml(Utils.formatBrDateTime(c.criadoEm)))}
+            ${campo('Última alteração', Utils.escapeHtml(Utils.formatBrDateTime(c.atualizadoEm)))}
+            ${campo('Classificação no painel', marcasLocais.length
+              ? marcasLocais.map(n => `<span class="smax-gl-marca">${Utils.escapeHtml(n)}</span>`).join('')
+              : '<span class="smax-gl-naolido">sem marcação</span>')}
+          </div>
+          ${g && g.nota ? `<div class="smax-gl-note">Nota do painel: ${Utils.escapeHtml(g.nota)}</div>` : ''}
+          <div class="smax-gl-label" style="margin-top:14px;">Descrição</div>
+          ${corpoRico(c.descricao, 'Sem descrição.')}
+          <div class="smax-gl-label" style="margin-top:14px;">Solução</div>
+          ${corpoRico(c.solucao, 'Sem solução registrada.')}
+          <div class="smax-gl-label" style="margin-top:14px;">Discussão</div>
+          ${discussao}`;
+      }).catch((err) => {
+        if (!wrap.isConnected) return;
+        painel().innerHTML = `<div class="smax-gl-note smax-gl-note-err">
+          Não foi possível ler o chamado: ${Utils.escapeHtml(PgApi.motivoDeErro(err))}
+          ${err.formaInesperada
+            ? '<br>A resposta chegou, mas num formato diferente do esperado — pode ser mudança de versão do SMAX.'
+            : ''}
+          <br>Use <strong>Abrir no SMAX</strong> no rodapé: a tela nativa continua funcionando.
+        </div>`;
+      });
+    };
 
     /* Reclassificar um global que ja esta no painel. Antes disto a unica saida
      * para uma marcacao errada era remover e incluir de novo — e remover apaga a
@@ -3573,7 +4027,15 @@
 
         const col = ev.target.closest('th[data-ordem]');
         if (col) {
-          PgStore.prefs.ordem = col.dataset.ordem;
+          const chave = col.dataset.ordem;
+          // Clicar na coluna que ja ordena inverte; clicar em outra troca de
+          // coluna e abre na direcao natural dela, nao na que estava em uso.
+          if (PgStore.prefs.ordem === chave) {
+            PgStore.prefs.ordemAsc = !PgStore.prefs.ordemAsc;
+          } else {
+            PgStore.prefs.ordem = chave;
+            PgStore.prefs.ordemAsc = Metrica.ASC_PRIMEIRO.has(chave);
+          }
           PgStore.salvarPrefs();
           render();
           return;
@@ -3707,11 +4169,15 @@
           PgStore.salvarPrefs();
           render();
         }
+        else if (act === 'ver-global') {
+          verModal(ev.target.closest('[data-id]').dataset.id);
+        }
         else if (act === 'editar-global') {
           const id = ev.target.closest('[data-id]').dataset.id;
           const g = Dados.acharGlobal(id);
           if (g) editarModal(g); else setStatus(`#${id} não está no painel.`, 'err');
         }
+        else if (act === 'arquivar-encerrados') { arquivarEncerrados(); }
         else if (act === 'arquivar' || act === 'desarquivar') {
           const id = ev.target.closest('[data-id]').dataset.id;
           const r = Dados.arquivar(id, act === 'arquivar');

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SMAX Painel de Globais - TJSP
 // @namespace    https://github.com/rsalvessap/SMAX-Global
-// @version      1.9
+// @version      1.10
 // @description  Painel de gestao de chamados globais do SMAX TJSP — lista curada, classificacao por assunto/base/competencia, sincronizacao por arquivo no GitHub e abertura automatizada de global por molde
 // @author       rsalvessap
 // @match        https://suporte.tjsp.jus.br/saw/*
@@ -26,7 +26,7 @@
   if (window.top && window.top !== window.self) return;
   if (window.location.hostname !== 'suporte.tjsp.jus.br') return;
 
-  const SMAX_GLOBAL_VERSION = '1.9';
+  const SMAX_GLOBAL_VERSION = '1.10';
 
   // O userscript roda em sandbox; quem dispara as requisicoes e a pagina.
   const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
@@ -1795,6 +1795,9 @@
 #smax-global-btn[data-armed="true"] {
   background:var(--sp-pending); animation:smax-gl-pulse 1.6s ease-in-out infinite;
 }
+/* Com o painel em tela cheia o botao ficaria boiando por cima do conteudo,
+   sem nada atras para voltar — e o X do cabecalho ja fecha. */
+#smax-global-btn[data-aberto="true"] { display:none; }
 @keyframes smax-gl-pulse { 0%,100% { box-shadow:0 0 0 0 var(--sp-ring); } 50% { box-shadow:0 0 0 10px transparent; } }
 
 .smax-gl-overlay {
@@ -1804,11 +1807,18 @@
 .smax-gl-modal { z-index:1000000; }
 .smax-gl-panel {
   width:min(860px, 96vw); max-height:92vh; display:flex; flex-direction:column;
-  transition:width .12s ease;
   background:var(--sp-bg); color:var(--sp-text);
   border:1px solid var(--sp-border); border-radius:var(--sp-r-lg);
   box-shadow:var(--sp-shadow); overflow:hidden;
   font-family:'Segoe UI', Roboto, system-ui, sans-serif;
+}
+/* O painel vai em tela cheia: e ferramenta de trabalho, nao aviso. Os modais
+   continuam caixa centrada — ali o recorte e justamente o que separa a
+   pergunta do que esta por tras dela, e encher a tela so atrapalharia. */
+.smax-gl-overlay:not(.smax-gl-modal) { padding:0; }
+.smax-gl-overlay:not(.smax-gl-modal) > .smax-gl-panel {
+  width:100vw; max-width:none; height:100vh; max-height:none;
+  border:none; border-radius:0;
 }
 .smax-gl-header {
   background:var(--sp-header-bg); color:var(--sp-header-fg);
@@ -1912,8 +1922,13 @@
 .smax-gl-badge-warn { color:var(--sp-pending); }
 .smax-gl-badge-err { color:var(--sp-danger-text); }
 
-/* A lista do painel. Precisa de mais largura que as outras telas. */
-.smax-gl-panel[data-wide="true"] { width:min(1240px, 97vw); }
+/* A lista e os graficos usam a largura toda. As telas de formulario nao: o
+   corpo continua do tamanho da tela (a barra de rolagem fica na borda, onde
+   se espera), mas o conteudo e centrado numa coluna legivel por padding. */
+.smax-gl-panel[data-wide="false"] > .smax-gl-body {
+  padding-left:max(16px, calc((100% - 920px) / 2));
+  padding-right:max(16px, calc((100% - 920px) / 2));
+}
 .smax-gl-filtros { display:flex; flex-wrap:wrap; gap:14px; align-items:flex-end; margin-bottom:12px; }
 .smax-gl-filtros > div { min-width:0; }
 .smax-gl-tbl { width:100%; border-collapse:collapse; font-size:11.5px; }
@@ -2155,6 +2170,7 @@
 
     const syncLauncher = () => {
       if (!launcher) return;
+      launcher.dataset.aberto = overlay ? 'true' : 'false';
       launcher.dataset.armed = Capture.isArmed() ? 'true' : 'false';
       launcher.title = Capture.isArmed()
         ? `SMAX Global — MODO APRENDER ativo${Capture.isDryRun() ? ' (seco: o SMAX vai acusar erro ao salvar, e nada é criado)' : ' (SEM modo seco: o chamado será criado de verdade)'}`
@@ -2893,8 +2909,10 @@
         t.dataset.active = String(t.dataset.tab === activeTab);
       });
 
-      // A lista e os graficos precisam de mais largura; as outras telas ficam
-      // estreitas de proposito.
+      // O painel ocupa a tela toda, mas nem toda tela quer a largura toda: a
+      // lista e os graficos sim (ali largura e informacao), o resto nao —
+      // formulario esticado de ponta a ponta vira linha de texto ilegivel.
+      // Quem estreita e o CSS, por data-wide, e so o conteudo do corpo.
       const painel = overlay.querySelector('.smax-gl-panel');
       const largas = activeTab === 'painel' || activeTab === 'graficos';
       if (painel) painel.dataset.wide = String(largas);

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SMAX Painel de Globais - TJSP
 // @namespace    https://github.com/rsalvessap/SMAX-Global
-// @version      1.6
+// @version      1.7
 // @description  Painel de gestao de chamados globais do SMAX TJSP — lista curada, classificacao por assunto/base/competencia, sincronizacao por arquivo no GitHub e abertura automatizada de global por molde
 // @author       rsalvessap
 // @match        https://suporte.tjsp.jus.br/saw/*
@@ -26,7 +26,7 @@
   if (window.top && window.top !== window.self) return;
   if (window.location.hostname !== 'suporte.tjsp.jus.br') return;
 
-  const SMAX_GLOBAL_VERSION = '1.6';
+  const SMAX_GLOBAL_VERSION = '1.7';
 
   // O userscript roda em sandbox; quem dispara as requisicoes e a pagina.
   const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
@@ -287,7 +287,33 @@
       return { ok: true, limpos, msg: limpos ? `Removido — e desmarcado de ${limpos} global(is).` : 'Removido.' };
     };
 
-    return { EIXOS, chaveComparacao, lista, nomeDe, criarValor, renomearValor, removerValor, contarUsos };
+    const acharGlobal = (id) => PgStore.dados().globais.find(g => g.id === String(id)) || null;
+
+    const incluir = (id, marcas, nota) => {
+      const sid = String(id);
+      if (acharGlobal(sid)) return { ok: false, msg: `#${sid} já está no painel.` };
+      // So entra marca cujo valor ainda existe na lista do eixo.
+      const soValidas = (eixo) => {
+        const validos = new Set(lista(eixo).map(v => v.id));
+        return [...new Set((marcas && marcas[eixo]) || [])].filter(x => validos.has(x));
+      };
+      PgStore.dados().globais.push({
+        id: sid,
+        incluidoEm: new Date().toISOString().slice(0, 10),
+        assunto: soValidas('assunto'),
+        base: soValidas('base'),
+        competencia: soValidas('competencia'),
+        nota: (nota || '').trim(),
+        arquivado: false
+      });
+      PgStore.salvarDados();
+      return { ok: true, msg: `#${sid} incluído.` };
+    };
+
+    return {
+      EIXOS, chaveComparacao, lista, nomeDe, criarValor, renomearValor, removerValor, contarUsos,
+      acharGlobal, incluir
+    };
   })();
 
   /* =========================================================
@@ -681,6 +707,77 @@
     };
 
     return { getTenantId, request };
+  })();
+
+  /* =========================================================
+   * PgApi — as leituras do painel no SMAX
+   *
+   * Nesta fase, so a conferencia de um chamado na hora de incluir. As duas
+   * consultas em lote (estado dos globais e contagem de filhos) entram com a
+   * tela do painel.
+   * =======================================================*/
+  const PgApi = (() => {
+    // GlobalId_c volta como OBJETO { Id: "82133910" } e pode estar em
+    // properties OU em related_properties
+    // (Automacoes-compiladas.user.js:1052-1053, :1296).
+    const extrairGlobalId = (valor) => {
+      if (valor === null || valor === undefined || valor === '') return '';
+      const bruto = typeof valor === 'object' ? (valor.Id || valor.id || '') : valor;
+      const s = String(bruto).replace(/^IM(Rfc|chg):/i, '').replace(/\D+/g, '');
+      return /^\d{3,}$/.test(s) ? s : '';
+    };
+
+    // Uma leitura barata que responde tres coisas de uma vez: o chamado existe,
+    // ele E global, e ele nao e filho de outro.
+    const conferir = async (id) => {
+      let resp;
+      try {
+        resp = await ApiClient.request(`ems/Request/${encodeURIComponent(id)}`, {
+          searchParams: { layout: 'Id,IsGlobal_c,GlobalId_c,DisplayLabel' }
+        });
+      } catch (err) {
+        // 404 e "nao existe". Qualquer outra falha e "nao consegui ler", que e
+        // coisa diferente e nao pode virar uma recusa por inexistencia.
+        if (err.status === 404) return { estado: 'inexistente' };
+        throw err;
+      }
+
+      const ent = (resp && resp.entities && resp.entities[0]) || null;
+      const props = (ent && ent.properties) || (resp && resp.properties) || null;
+      if (!props || !props.Id) return { estado: 'inexistente' };
+
+      const rel = (ent && ent.related_properties) || (resp && resp.related_properties) || {};
+      const ig = props.IsGlobal_c;
+      const sid = String(props.Id);
+      const bruto = (props.GlobalId_c !== undefined && props.GlobalId_c !== null)
+        ? props.GlobalId_c : rel.GlobalId_c;
+      const pai = extrairGlobalId(bruto);
+
+      return {
+        estado: 'lido',
+        id: sid,
+        titulo: props.DisplayLabel || '',
+        ehGlobal: ig === true || ig === 'true' || ig === 1 || ig === '1',
+        // Auto-referencia nao e vinculo de pai.
+        paiId: pai && pai !== sid ? pai : ''
+      };
+    };
+
+    // Concorrencia limitada a 6, o mesmo que o pesquisa-avancada-smax usa (:101).
+    const emLote = async (ids, fn, limite = 6) => {
+      const saida = new Array(ids.length);
+      let proximo = 0;
+      const trabalhador = async () => {
+        while (proximo < ids.length) {
+          const i = proximo++;
+          saida[i] = await fn(ids[i], i);
+        }
+      };
+      await Promise.all(Array.from({ length: Math.min(limite, ids.length) }, trabalhador));
+      return saida;
+    };
+
+    return { conferir, emLote, extrairGlobalId };
   })();
 
   /* =========================================================
@@ -1451,6 +1548,13 @@
     const personUI = { open: false, term: '', loading: false, error: '', results: [], searchSeq: 0 };
     let personDebounce = null;
 
+    // Estado da tela "Incluir global". De proposito nao persiste: a conferencia e
+    // pontual, e resultado guardado estaria velho na proxima abertura do painel.
+    const incluirUI = {
+      texto: '', verificando: false, resultados: [], nota: '',
+      marcas: { assunto: new Set(), base: new Set(), competencia: new Set() }
+    };
+
     const setStatus = (msg, kind = '') => {
       const el = overlay && overlay.querySelector('.smax-gl-status');
       if (!el) return;
@@ -1794,6 +1898,85 @@
         ${sniffBlock}`;
     };
 
+    /* ---------- Tela: incluir global ---------- */
+    const MOTIVOS = {
+      inexistente: 'Não existe no SMAX.',
+      'nao-global': 'Existe, mas não está marcado como “É global”.',
+      filho: 'É filho de outro global.',
+      repetido: 'Já está no painel.',
+      erro: 'Não foi possível conferir.'
+    };
+
+    const renderIncluir = () => {
+      const r = incluirUI;
+      const aprovados = r.resultados.filter(x => x.estado === 'ok');
+
+      const chips = Dados.EIXOS.map(e => {
+        const vals = Dados.lista(e.chave);
+        if (!vals.length) {
+          return `<div class="smax-gl-label" style="margin-top:12px;">${e.rotulo}</div>
+                  <div class="smax-gl-note">Nenhum valor cadastrado. Crie em <strong>Configuração</strong>.</div>`;
+        }
+        return `
+          <div class="smax-gl-label" style="margin-top:12px;">${e.rotulo}</div>
+          <div style="display:flex; flex-wrap:wrap; gap:6px;">
+            ${vals.map(v => `
+              <button class="smax-gl-btn ${r.marcas[e.chave].has(v.id) ? 'smax-gl-btn-primary' : ''}"
+                      data-act="chip-marca" data-eixo="${e.chave}" data-id="${Utils.escapeHtml(v.id)}">
+                ${r.marcas[e.chave].has(v.id) ? '✓ ' : ''}${Utils.escapeHtml(v.nome)}
+              </button>`).join('')}
+          </div>`;
+      }).join('');
+
+      const listaResultados = r.resultados.length ? `
+        <div class="smax-gl-label" style="margin-top:18px;">
+          Conferência — ${aprovados.length} de ${r.resultados.length} pode(m) entrar
+        </div>
+        ${r.resultados.map(x => `
+          <div class="smax-gl-cand">
+            <div class="smax-gl-cand-info">
+              <div class="smax-gl-cand-title">
+                #${Utils.escapeHtml(x.id)}
+                ${x.estado === 'ok'
+                  ? '<span class="smax-gl-badge smax-gl-badge-best">pode entrar</span>'
+                  : `<span class="smax-gl-badge">recusado</span>`}
+              </div>
+              <div class="smax-gl-cand-meta">
+                ${x.estado === 'ok'
+                  ? Utils.escapeHtml(x.titulo || '(sem título)')
+                  : Utils.escapeHtml(x.motivo || MOTIVOS[x.estado] || 'Recusado.')}
+              </div>
+            </div>
+          </div>`).join('')}` : '';
+
+      return `
+        <div class="smax-gl-note">
+          Cole um ou vários números de chamado. O script confere cada um no SMAX antes de incluir:
+          tem de existir, estar marcado como <strong>“É global”</strong>, não ser filho de outro
+          global e ainda não estar no painel.
+        </div>
+
+        <div class="smax-gl-label">Números dos chamados</div>
+        <textarea class="smax-gl-input" id="smax-gl-ids" rows="3" style="width:100%; resize:vertical;"
+                  placeholder="82133910 82140011 — separados por espaço, vírgula ou linha">${Utils.escapeHtml(r.texto)}</textarea>
+        <div style="display:flex; gap:8px; margin-top:8px;">
+          <button class="smax-gl-btn smax-gl-btn-primary" data-act="conferir-ids" ${r.verificando ? 'disabled' : ''}>
+            ${r.verificando ? 'Conferindo…' : 'Conferir no SMAX'}
+          </button>
+          ${r.resultados.length ? '<button class="smax-gl-btn" data-act="limpar-conferencia">Limpar</button>' : ''}
+        </div>
+
+        ${listaResultados}
+
+        <div class="smax-gl-label" style="margin-top:20px;">Classificação</div>
+        <div class="smax-gl-note">Vale para todos os chamados desta inclusão. Dá para marcar mais de um valor por eixo.</div>
+        ${chips}
+
+        <div class="smax-gl-label" style="margin-top:14px;">Nota (opcional)</div>
+        <input class="smax-gl-input" id="smax-gl-nota" type="text" style="width:100%;"
+               value="${Utils.escapeHtml(r.nota)}" placeholder="texto livre">`;
+    };
+
     const renderConfig = () => {
       const d = PgStore.dados();
       const pp = PgStore.prefs;
@@ -1870,6 +2053,7 @@
       });
 
       body.innerHTML = activeTab === 'abrir' ? renderAbrir()
+        : activeTab === 'incluir' ? renderIncluir()
         : activeTab === 'config' ? renderConfig()
         : renderAprender();
 
@@ -1879,12 +2063,20 @@
       const contorno = body.querySelector('#smax-gl-contorno');
       if (contorno) contorno.innerHTML = form.contornoHtml;
 
-      footer.innerHTML = activeTab === 'abrir' && prefs.molde
-        ? `<button class="smax-gl-btn" data-act="preview">Ver payload</button>
+      if (activeTab === 'abrir' && prefs.molde) {
+        footer.innerHTML = `<button class="smax-gl-btn" data-act="preview">Ver payload</button>
            <button class="smax-gl-btn smax-gl-btn-primary" data-act="criar" ${busy ? 'disabled' : ''}>
              ${busy ? 'Criando…' : '🌐 Abrir chamado global'}
-           </button>`
-        : '';
+           </button>`;
+      } else if (activeTab === 'incluir') {
+        const n = incluirUI.resultados.filter(x => x.estado === 'ok').length;
+        footer.innerHTML = `<button class="smax-gl-btn smax-gl-btn-primary" data-act="incluir-aprovados"
+             ${n && !busy ? '' : 'disabled'}>
+             ${busy ? 'Incluindo…' : `Incluir no painel (${n})`}
+           </button>`;
+      } else {
+        footer.innerHTML = '';
+      }
 
       if (activeTab === 'abrir' && prefs.molde) ensureRequesterName();
       syncLauncher();
@@ -2020,6 +2212,79 @@
       });
       document.body.appendChild(wrap);
     });
+
+    /* ---------- Incluir global ---------- */
+    const lerIdsDigitados = () => {
+      const el = overlay.querySelector('#smax-gl-ids');
+      const txt = el ? el.value : incluirUI.texto;
+      // Aceita espaco, virgula, ponto-e-virgula, quebra de linha e "#" na frente.
+      const achados = (txt.match(/\d{3,}/g) || []);
+      return { txt, ids: [...new Set(achados)] };
+    };
+
+    const conferirIds = async () => {
+      if (incluirUI.verificando) return;
+      const { txt, ids } = lerIdsDigitados();
+      incluirUI.texto = txt;
+      if (!ids.length) {
+        setStatus('Nenhum número de chamado reconhecido no texto.', 'err');
+        return;
+      }
+      incluirUI.verificando = true;
+      incluirUI.resultados = [];
+      render();
+      setStatus(`Conferindo ${ids.length} chamado(s) no SMAX…`);
+      try {
+        incluirUI.resultados = await PgApi.emLote(ids, async (id) => {
+          // Checa o painel antes de gastar requisicao: repetido nao precisa de rede.
+          if (Dados.acharGlobal(id)) return { id, estado: 'repetido' };
+          try {
+            const r = await PgApi.conferir(id);
+            if (r.estado === 'inexistente') return { id, estado: 'inexistente' };
+            if (r.paiId) return { id, estado: 'filho', motivo: `É filho do global #${r.paiId}.` };
+            if (!r.ehGlobal) return { id, estado: 'nao-global', titulo: r.titulo };
+            return { id, estado: 'ok', titulo: r.titulo };
+          } catch (err) {
+            // Leitura que falhou nao e "nao existe": estado proprio, visivel.
+            return { id, estado: 'erro', motivo: `Não foi possível conferir: ${err.message}` };
+          }
+        });
+        const n = incluirUI.resultados.filter(x => x.estado === 'ok').length;
+        setStatus(`${n} de ${ids.length} pode(m) entrar.`, n ? 'ok' : 'err');
+      } catch (err) {
+        setStatus(`Falha na conferência: ${err.message}`, 'err');
+      } finally {
+        incluirUI.verificando = false;
+        render();
+      }
+    };
+
+    const incluirAprovados = () => {
+      if (busy) return;
+      const aprovados = incluirUI.resultados.filter(x => x.estado === 'ok');
+      if (!aprovados.length) { setStatus('Nada aprovado para incluir.', 'err'); return; }
+      const notaEl = overlay.querySelector('#smax-gl-nota');
+      incluirUI.nota = notaEl ? notaEl.value : incluirUI.nota;
+      const marcas = {
+        assunto: [...incluirUI.marcas.assunto],
+        base: [...incluirUI.marcas.base],
+        competencia: [...incluirUI.marcas.competencia]
+      };
+      const falhas = [];
+      let ok = 0;
+      aprovados.forEach(x => {
+        const r = Dados.incluir(x.id, marcas, incluirUI.nota);
+        r.ok ? ok++ : falhas.push(r.msg);
+      });
+      incluirUI.resultados = [];
+      incluirUI.texto = '';
+      incluirUI.nota = '';
+      render();
+      setStatus(
+        falhas.length ? `${ok} incluído(s). ${falhas.join(' ')}` : `${ok} global(is) incluído(s) no painel.`,
+        falhas.length ? 'err' : 'ok'
+      );
+    };
 
     /* ---------- Sincronizacao com o GitHub ---------- */
     const salvarGit = () => {
@@ -2360,6 +2625,20 @@
           render();
           setStatus(r.msg, r.ok ? 'ok' : 'err');
         }
+        else if (act === 'conferir-ids') { conferirIds(); }
+        else if (act === 'limpar-conferencia') {
+          incluirUI.resultados = [];
+          incluirUI.texto = '';
+          render();
+          setStatus('');
+        }
+        else if (act === 'chip-marca') {
+          const btn = ev.target.closest('[data-eixo]');
+          const conj = incluirUI.marcas[btn.dataset.eixo];
+          conj.has(btn.dataset.id) ? conj.delete(btn.dataset.id) : conj.add(btn.dataset.id);
+          render();
+        }
+        else if (act === 'incluir-aprovados') { incluirAprovados(); }
         else if (act === 'salvar-git') { salvarGit(); }
         else if (act === 'publicar-git') { publicarGit(); }
         else if (act === 'importar-git') { importarGit(); }
@@ -2449,6 +2728,9 @@
         if (ev.target.id === 'smax-gl-desc') form.descriptionHtml = ev.target.innerHTML;
         if (ev.target.id === 'smax-gl-contorno') form.contornoHtml = ev.target.innerHTML;
         if (ev.target.id === 'smax-gl-arquivo-url') urlDigitada = ev.target.value;
+        // Marcar um chip redesenha a tela; sem isto o que foi digitado morreria.
+        if (ev.target.id === 'smax-gl-ids') incluirUI.texto = ev.target.value;
+        if (ev.target.id === 'smax-gl-nota') incluirUI.nota = ev.target.value;
         if (ev.target.id === 'smax-gl-person-q') {
           personUI.term = ev.target.value;
           clearTimeout(personDebounce);
@@ -2500,6 +2782,7 @@
           </div>
           <div class="smax-gl-tabs">
             <button class="smax-gl-tab" data-tab="abrir">Abrir chamado</button>
+            <button class="smax-gl-tab" data-tab="incluir">Incluir global</button>
             <button class="smax-gl-tab" data-tab="aprender">Aprender molde</button>
             <button class="smax-gl-tab" data-tab="config">Configuração</button>
           </div>

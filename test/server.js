@@ -100,6 +100,32 @@ http.createServer(async (req, res) => {
     return;
   }
 
+  // Leitura de um Request so, usada pela conferencia da tela "Incluir global".
+  // Cada fixture existe para forcar um dos estados possiveis; o 500 esta aqui de
+  // proposito, porque falha de leitura tem de aparecer diferente de "nao existe".
+  const umRequest = /^\/rest\/\d+\/ems\/Request\/(\d+)$/i.exec(url);
+  if (umRequest && req.method === 'GET') {
+    const id = umRequest[1];
+    console.log(`[mock] GET ems/Request/${id}`);
+    const resp = (props, rel) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        meta: { completion_status: 'OK' },
+        entities: [{ entity_type: 'Request', properties: props, related_properties: rel || {} }]
+      }));
+    };
+    if (id === '82133910') return resp({ Id: id, IsGlobal_c: 'true', GlobalId_c: null, DisplayLabel: 'GLOBAL — eproc 1o grau fora do ar' });
+    // GlobalId_c apontando para si mesmo, e so em related_properties: o SMAX faz
+    // isso em global de verdade, e o script nao pode ler como "e filho".
+    if (id === '82140011') return resp({ Id: id, IsGlobal_c: true, DisplayLabel: 'GLOBAL — custas indevidas' }, { GlobalId_c: { Id: id } });
+    if (id === '82150022') return resp({ Id: id, IsGlobal_c: 'false', DisplayLabel: 'Chamado comum de usuario' });
+    if (id === '82160033') return resp({ Id: id, IsGlobal_c: 'false', DisplayLabel: 'Filho do global' }, { GlobalId_c: { Id: '82133910' } });
+    if (id === '82170044') { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end('{"meta":{"completion_status":"FAILED"}}'); return; }
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end('{"meta":{"completion_status":"FAILED"},"error":{"message":"not found"}}');
+    return;
+  }
+
   if (/^\/rest\/\d+\/ems\/Person$/i.test(url)) {
     const filter = new URL(req.url, 'http://x').searchParams.get('filter') || '';
     const hits = queryPeople(filter);

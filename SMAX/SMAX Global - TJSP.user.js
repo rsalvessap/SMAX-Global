@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SMAX Painel de Globais - TJSP
 // @namespace    https://github.com/rsalvessap/SMAX-Global
-// @version      1.10
+// @version      1.11
 // @description  Painel de gestao de chamados globais do SMAX TJSP — lista curada, classificacao por assunto/base/competencia, sincronizacao por arquivo no GitHub e abertura automatizada de global por molde
 // @author       rsalvessap
 // @match        https://suporte.tjsp.jus.br/saw/*
@@ -26,7 +26,7 @@
   if (window.top && window.top !== window.self) return;
   if (window.location.hostname !== 'suporte.tjsp.jus.br') return;
 
-  const SMAX_GLOBAL_VERSION = '1.10';
+  const SMAX_GLOBAL_VERSION = '1.11';
 
   // O userscript roda em sandbox; quem dispara as requisicoes e a pagina.
   const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
@@ -339,25 +339,39 @@
 
     const acharGlobal = (id) => PgStore.dados().globais.find(g => g.id === String(id)) || null;
 
+    // So entra marca cujo valor ainda existe na lista do eixo.
+    const soValidas = (marcas, eixo) => {
+      const validos = new Set(lista(eixo).map(v => v.id));
+      return [...new Set((marcas && marcas[eixo]) || [])].filter(x => validos.has(x));
+    };
+
     const incluir = (id, marcas, nota) => {
       const sid = String(id);
       if (acharGlobal(sid)) return { ok: false, msg: `#${sid} já está no painel.` };
-      // So entra marca cujo valor ainda existe na lista do eixo.
-      const soValidas = (eixo) => {
-        const validos = new Set(lista(eixo).map(v => v.id));
-        return [...new Set((marcas && marcas[eixo]) || [])].filter(x => validos.has(x));
-      };
       PgStore.dados().globais.push({
         id: sid,
         incluidoEm: new Date().toISOString().slice(0, 10),
-        assunto: soValidas('assunto'),
-        base: soValidas('base'),
-        competencia: soValidas('competencia'),
+        assunto: soValidas(marcas, 'assunto'),
+        base: soValidas(marcas, 'base'),
+        competencia: soValidas(marcas, 'competencia'),
         nota: (nota || '').trim(),
         arquivado: false
       });
       PgStore.salvarDados();
       return { ok: true, msg: `#${sid} incluído.` };
+    };
+
+    // Reclassificar depois da inclusao. Sem isto, errar a marcacao obrigava a
+    // remover e incluir de novo — e remover apaga a nota e a data de inclusao.
+    const atualizarMarcas = (id, marcas, nota) => {
+      const g = acharGlobal(id);
+      if (!g) return { ok: false, msg: 'Global não está no painel.' };
+      g.assunto = soValidas(marcas, 'assunto');
+      g.base = soValidas(marcas, 'base');
+      g.competencia = soValidas(marcas, 'competencia');
+      g.nota = (nota || '').trim();
+      PgStore.salvarDados();
+      return { ok: true, msg: `#${g.id} atualizado.` };
     };
 
     const arquivar = (id, valor) => {
@@ -380,7 +394,7 @@
 
     return {
       EIXOS, chaveComparacao, lista, nomeDe, criarValor, renomearValor, removerValor, contarUsos,
-      acharGlobal, incluir, arquivar, removerGlobal
+      acharGlobal, incluir, atualizarMarcas, arquivar, removerGlobal
     };
   })();
 
@@ -2145,7 +2159,12 @@
       // Contorno comeca no padrao da equipe e e editavel; editar nao muda o padrao.
       contornoHtml: prefs.contornoPadrao || '',
       contornoTo: prefs.contornoTo || 'Agent',
-      contornoPurpose: prefs.contornoPurpose || 'SolucaoContorno_c'
+      contornoPurpose: prefs.contornoPurpose || 'SolucaoContorno_c',
+      // Classificacao do global que esta sendo aberto. Fica aqui, e nao numa
+      // pergunta depois de criar, porque e agora — escrevendo titulo e descricao —
+      // que a pessoa sabe do que o chamado trata.
+      marcas: { assunto: new Set(), base: new Set(), competencia: new Set() },
+      incluirNoPainel: true
     };
 
     const personUI = { open: false, term: '', loading: false, error: '', results: [], searchSeq: 0 };
@@ -2366,6 +2385,21 @@
             </div>
             <button class="smax-gl-btn" data-act="salvar-contorno-padrao"
                     title="Guarda o texto e as opções atuais como padrão das próximas aberturas">Salvar como padrão</button>
+          </div>
+        </div>
+
+        <div class="smax-gl-field">
+          <label class="smax-gl-label">Classificação no painel</label>
+          <div class="smax-gl-note">
+            Marque agora, enquanto o assunto está fresco. Se errar, dá para
+            reclassificar depois pelo <strong>Editar</strong> da linha no painel.
+          </div>
+          ${chipsEixos(form.marcas, 'abrir')}
+          <div class="smax-gl-chips" style="margin-top:12px;">
+            <button class="smax-gl-chip" data-act="toggle-incluir-painel"
+                    data-active="${form.incluirNoPainel}">
+              ${form.incluirNoPainel ? 'será incluído no painel' : 'não incluir no painel'}
+            </button>
           </div>
         </div>`;
     };
@@ -2611,6 +2645,8 @@
           <td class="smax-gl-num" title="Incluído no painel em ${Utils.escapeHtml(l.incluidoEm || '—')}"
             >${l.criadoEm ? Utils.escapeHtml(Utils.formatBrDate(l.criadoEm)) : semLeitura}</td>
           <td class="smax-gl-acoes">
+            <button class="smax-gl-btn" data-act="editar-global"
+                    data-id="${Utils.escapeHtml(l.id)}">Editar</button>
             <button class="smax-gl-btn" data-act="${l.arquivado ? 'desarquivar' : 'arquivar'}"
                     data-id="${Utils.escapeHtml(l.id)}">${l.arquivado ? 'Reabrir' : 'Arquivar'}</button>
             <button class="smax-gl-btn smax-gl-btn-danger" data-act="remover-global"
@@ -2766,24 +2802,31 @@
       erro: 'Não foi possível conferir.'
     };
 
+    /* Os chips dos tres eixos. Tres telas marcam global — incluir, abrir e
+     * reclassificar — e as tres tem de oferecer exatamente os mesmos valores;
+     * uma copia a mais aqui era uma copia a mais para divergir.
+     * `marcas` e um objeto de Set por eixo, mutado no lugar por quem trata o
+     * clique. `alvo` so diz a quem pertencem os Sets, para o tratador saber. */
+    const chipsEixos = (marcas, alvo) => Dados.EIXOS.map(e => {
+      const vals = Dados.lista(e.chave);
+      if (!vals.length) {
+        return `<div class="smax-gl-label" style="margin-top:12px;">${e.rotulo}</div>
+                <div class="smax-gl-note">Nenhum valor cadastrado. Crie em <strong>Configuração</strong>.</div>`;
+      }
+      return `
+        <div class="smax-gl-label" style="margin-top:12px;">${e.rotulo}</div>
+        <div class="smax-gl-chips">
+          ${vals.map(v => `<button class="smax-gl-chip" data-act="chip-marca"
+              data-alvo="${Utils.escapeHtml(alvo)}"
+              data-eixo="${e.chave}" data-id="${Utils.escapeHtml(v.id)}"
+              data-active="${marcas[e.chave].has(v.id)}">${Utils.escapeHtml(v.nome)}</button>`).join('')}
+        </div>`;
+    }).join('');
+
     const renderIncluir = () => {
       const r = incluirUI;
       const aprovados = r.resultados.filter(x => x.estado === 'ok');
-
-      const chips = Dados.EIXOS.map(e => {
-        const vals = Dados.lista(e.chave);
-        if (!vals.length) {
-          return `<div class="smax-gl-label" style="margin-top:12px;">${e.rotulo}</div>
-                  <div class="smax-gl-note">Nenhum valor cadastrado. Crie em <strong>Configuração</strong>.</div>`;
-        }
-        return `
-          <div class="smax-gl-label" style="margin-top:12px;">${e.rotulo}</div>
-          <div class="smax-gl-chips">
-            ${vals.map(v => `<button class="smax-gl-chip" data-act="chip-marca"
-                data-eixo="${e.chave}" data-id="${Utils.escapeHtml(v.id)}"
-                data-active="${r.marcas[e.chave].has(v.id)}">${Utils.escapeHtml(v.nome)}</button>`).join('')}
-          </div>`;
-      }).join('');
+      const chips = chipsEixos(r.marcas, 'incluir');
 
       const listaResultados = r.resultados.length ? `
         <div class="smax-gl-label" style="margin-top:18px;">
@@ -3082,6 +3125,65 @@
       });
       document.body.appendChild(wrap);
     });
+
+    /* Reclassificar um global que ja esta no painel. Antes disto a unica saida
+     * para uma marcacao errada era remover e incluir de novo — e remover apaga a
+     * nota e a data de inclusao, ou seja, consertar o erro custava dado bom.
+     * O modal mexe em copias dos Sets e so grava no "Salvar": fechar no X ou no
+     * fundo tem de deixar o painel exatamente como estava. */
+    const editarModal = (global) => {
+      const marcas = {
+        assunto: new Set(global.assunto || []),
+        base: new Set(global.base || []),
+        competencia: new Set(global.competencia || [])
+      };
+      const wrap = document.createElement('div');
+      wrap.className = 'smax-gl-overlay smax-gl-modal smax-gl-root';
+      wrap.dataset.theme = ThemeManager.current();
+      wrap.innerHTML = `
+        <div class="smax-gl-panel" style="width:min(640px,94vw);">
+          <div class="smax-gl-header">
+            <h2>Reclassificar #${Utils.escapeHtml(global.id)}</h2>
+            <div class="smax-gl-header-actions"><button data-act="fechar">✕</button></div>
+          </div>
+          <div class="smax-gl-body">
+            ${chipsEixos(marcas, 'modal')}
+            <div class="smax-gl-field" style="margin-top:12px;">
+              <label class="smax-gl-label" for="smax-gl-edit-nota">Nota</label>
+              <input id="smax-gl-edit-nota" class="smax-gl-input" type="text"
+                     value="${Utils.escapeHtml(global.nota || '')}"
+                     placeholder="Observação livre sobre este global...">
+            </div>
+          </div>
+          <div class="smax-gl-footer">
+            <div class="smax-gl-status"></div>
+            <button class="smax-gl-btn" data-act="fechar">Cancelar</button>
+            <button class="smax-gl-btn smax-gl-btn-primary" data-act="salvar">Salvar</button>
+          </div>
+        </div>`;
+      wrap.addEventListener('click', (ev) => {
+        const alvo = ev.target.closest('[data-act]');
+        const act = alvo?.dataset.act;
+        if (!act) { if (ev.target === wrap) wrap.remove(); return; }
+        if (act === 'fechar') { wrap.remove(); return; }
+        if (act === 'chip-marca') {
+          // Alterna no lugar: redesenhar o modal inteiro apagaria a nota digitada.
+          const conj = marcas[alvo.dataset.eixo];
+          const marcado = conj.has(alvo.dataset.id);
+          marcado ? conj.delete(alvo.dataset.id) : conj.add(alvo.dataset.id);
+          alvo.dataset.active = String(!marcado);
+          return;
+        }
+        if (act === 'salvar') {
+          const nota = wrap.querySelector('#smax-gl-edit-nota').value;
+          const r = Dados.atualizarMarcas(global.id, marcas, nota);
+          wrap.remove();
+          render();
+          setStatus(r.msg, r.ok ? 'ok' : 'err');
+        }
+      });
+      document.body.appendChild(wrap);
+    };
 
     /* ---------- Atualizar o estado a partir do SMAX ---------- */
     const atualizarDoSmax = async () => {
@@ -3400,6 +3502,23 @@
             }
           }
 
+          // Passo 4 — registrar no painel. E escrita local, nao chega ao SMAX,
+          // entao nunca invalida o chamado; mas tambem nao pode ser silenciosa:
+          // se falhar, quem abriu precisa saber que o global ficou fora do painel.
+          let painelNote = '';
+          if (form.incluirNoPainel) {
+            const rIncl = Dados.incluir(newId, form.marcas, '');
+            painelNote = rIncl.ok
+              ? `<div class="smax-gl-note smax-gl-note-ok">Incluído no painel${
+                   Dados.EIXOS.some(e => form.marcas[e.chave].size) ? ' com a classificação marcada' : ' <strong>sem classificação</strong>'
+                 }.</div>`
+              : `<div class="smax-gl-note smax-gl-note-err">
+                   Não foi incluído no painel: ${Utils.escapeHtml(rIncl.msg)}
+                   Inclua pela aba <strong>Incluir</strong>.
+                 </div>`;
+            if (rIncl.ok) form.marcas = { assunto: new Set(), base: new Set(), competencia: new Set() };
+          }
+
           form.descriptionHtml = '';
           // O contorno volta ao padrao, nao para vazio: ele e texto de equipe.
           form.contornoHtml = prefs.contornoPadrao || '';
@@ -3413,6 +3532,7 @@
             </div>
             ${flagNote}
             ${contornoNote}
+            ${painelNote}
             <p style="font-size:12.5px;">
               <a href="${Utils.escapeHtml(url)}" target="_blank" rel="noopener"
                  style="color:var(--sp-accent);">Abrir #${Utils.escapeHtml(newId)} no SMAX ↗</a>
@@ -3587,6 +3707,11 @@
           PgStore.salvarPrefs();
           render();
         }
+        else if (act === 'editar-global') {
+          const id = ev.target.closest('[data-id]').dataset.id;
+          const g = Dados.acharGlobal(id);
+          if (g) editarModal(g); else setStatus(`#${id} não está no painel.`, 'err');
+        }
         else if (act === 'arquivar' || act === 'desarquivar') {
           const id = ev.target.closest('[data-id]').dataset.id;
           const r = Dados.arquivar(id, act === 'arquivar');
@@ -3609,8 +3734,17 @@
         }
         else if (act === 'chip-marca') {
           const btn = ev.target.closest('[data-eixo]');
-          const conj = incluirUI.marcas[btn.dataset.eixo];
+          const dono = btn.dataset.alvo === 'abrir' ? form.marcas : incluirUI.marcas;
+          const conj = dono[btn.dataset.eixo];
           conj.has(btn.dataset.id) ? conj.delete(btn.dataset.id) : conj.add(btn.dataset.id);
+          // O formulario de abrir e lido antes do redesenho, senao titulo e
+          // descricao ja digitados somem ao marcar um chip.
+          if (btn.dataset.alvo === 'abrir') readForm();
+          render();
+        }
+        else if (act === 'toggle-incluir-painel') {
+          readForm();
+          form.incluirNoPainel = !form.incluirNoPainel;
           render();
         }
         else if (act === 'incluir-aprovados') { incluirAprovados(); }

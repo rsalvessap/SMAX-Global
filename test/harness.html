@@ -151,6 +151,34 @@
 </div>
 
 <div class="card">
+  <strong>Fase 5 — Abrir já classificando, e reclassificar depois.</strong><br>
+  O fim da aba <em>Abrir chamado</em> agora tem <em>Classificação no painel</em>: os chips dos três
+  eixos mais um botão que diz se o chamado recém-aberto entra no painel.
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Marcar não pode apagar o que já foi digitado.</strong> Preencha título e descrição,
+    depois clique num chip de assunto. O texto tem de continuar lá — o formulário é relido antes do
+    redesenho. Se título ou descrição sumirem ao marcar, o <code>readForm()</code> saiu do caminho.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>A escrita no painel é visível e recusável.</strong> O botão nasce em <em>será incluído
+    no painel</em>; clicando vira <em>não incluir no painel</em>. Abra o chamado e leia o modal de
+    sucesso: ele tem de trazer uma linha sobre o painel junto das do “É Global” e da discussão —
+    <em>incluído com a classificação marcada</em>, ou <em>sem classificação</em> em negrito se
+    nenhum chip estava ligado. Com o botão desligado, nenhuma linha de painel e nenhum global novo.
+    Depois de um sucesso os chips têm de voltar desmarcados: o próximo chamado não herda a
+    classificação do anterior.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Editar na linha do painel.</strong> Cada linha tem um botão <em>Editar</em> que abre
+    <em>Reclassificar #id</em> com os chips já no estado salvo e a nota atual. Mexa nos chips, troque
+    a nota e feche no <em>✕</em> ou clicando no fundo: nada pode ter mudado na tabela. Repita e
+    clique em <em>Salvar</em>: a tabela se refaz com as marcações novas e a
+    data da coluna <em>ABERTURA</em> e o <code>incluidoEm</code> continuam os mesmos — era
+    exatamente isso que se perdia quando a única saída era remover e incluir de novo.
+  </div>
+</div>
+
+<div class="card">
   <strong>3.</strong> Use o candidato como molde, volte em <em>Abrir chamado</em>, preencha e clique em <em>Ver payload</em>.
   Confira se <code>DisplayLabel</code>, <code>Description</code>, <code>Urgency</code> e <code>ImpactScope</code> foram sobrescritos
   e se <code>Id</code>/<code>CreateTime</code>/<code>Comments</code> sumiram.

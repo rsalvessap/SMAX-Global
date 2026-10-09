@@ -231,6 +231,45 @@
 </div>
 
 <div class="card">
+  <strong>v1.13 — Redimensionar as colunas.</strong><br>
+  Arraste a divisa no cabeçalho para mudar a largura da coluna. A largura é gravada por coluna,
+  o clique duplo na divisa devolve só aquela ao padrão, e o <em>Restaurar padrão</em> devolve
+  todas.
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>O arraste não pode reordenar.</strong> Soltar o botão depois de arrastar dispara um
+    <code>click</code> no cabeçalho, e o cabeçalho ordena. Se ao acertar a largura a lista
+    reordenar junto, a proteção (janela de 300&nbsp;ms após o arraste) quebrou.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>A largura tem de sobreviver.</strong> O painel re-renderiza a cada clique — filtrar,
+    arquivar, ordenar. Ajuste uma coluna e clique num filtro: se a largura voltar ao padrão, o
+    ajuste deixou de ser gravado. Vale também para recarregar a página.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Piso de 56px e rolagem horizontal.</strong> Arraste uma coluna bem para a esquerda:
+    ela para em 56px, não desaparece. Arraste outra bem para a direita: a tabela passa a ser mais
+    larga que a tela e o corpo do painel rola na horizontal — era isso que faltava para caber a
+    tela. Nas duas pontas o cabeçalho tem de continuar colado no topo ao rolar na vertical, e
+    alinhado com as células ao rolar na horizontal.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Não pode ficar preso em modo de arraste.</strong> Arraste e solte o botão
+    <em>fora da janela do navegador</em>. Se ao voltar o cursor estiver de seta dupla em cima de
+    tudo e o texto não selecionar, o <code>pointerup</code> se perdeu — é por isso que o arraste
+    usa captura de ponteiro (<code>setPointerCapture</code>) e não <code>mouseup</code> no
+    documento.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Nota sobre a verificação.</strong> Em 2026-10-09 o arraste foi conferido disparando a
+    sequência real de eventos de ponteiro, com a geometria da tela; o arraste com o mouse físico
+    <em>não</em> pôde ser conferido, porque o emulador de input da extensão do Chrome estava
+    entregando as coordenadas multiplicadas pelo <code>devicePixelRatio</code> (1,1) e engolindo
+    os eventos de botão. Então o que falta olhar com os próprios olhos é a aparência: a espessura
+    da divisa, se o cursor vira seta dupla no lugar certo, e se a coluna de ações não fica apertada.
+  </div>
+</div>
+
+<div class="card">
   <strong>3.</strong> Use o candidato como molde, volte em <em>Abrir chamado</em>, preencha e clique em <em>Ver payload</em>.
   Confira se <code>DisplayLabel</code>, <code>Description</code>, <code>Urgency</code> e <code>ImpactScope</code> foram sobrescritos
   e se <code>Id</code>/<code>CreateTime</code>/<code>Comments</code> sumiram.

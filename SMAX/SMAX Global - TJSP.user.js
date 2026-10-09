@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SMAX Painel de Globais - TJSP
 // @namespace    https://github.com/rsalvessap/SMAX-Global
-// @version      1.12
+// @version      1.13
 // @description  Painel de gestao de chamados globais do SMAX TJSP — lista curada, classificacao por assunto/base/competencia, sincronizacao por arquivo no GitHub e abertura automatizada de global por molde
 // @author       rsalvessap
 // @match        https://suporte.tjsp.jus.br/saw/*
@@ -26,7 +26,7 @@
   if (window.top && window.top !== window.self) return;
   if (window.location.hostname !== 'suporte.tjsp.jus.br') return;
 
-  const SMAX_GLOBAL_VERSION = '1.12';
+  const SMAX_GLOBAL_VERSION = '1.13';
 
   // O userscript roda em sandbox; quem dispara as requisicoes e a pagina.
   const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
@@ -131,7 +131,13 @@
       // escolha desta maquina — nao entram no arquivo publicado.
       filtros: { assunto: [], base: [], competencia: [], status: '', termo: '', verArquivados: false },
       ordem: 'filhos',
-      ordemAsc: false
+      ordemAsc: false,
+      // Largura em px por coluna da tabela do painel, so o que o usuario
+      // arrastou — coluna ausente aqui usa o padrao definido em `COLUNAS`.
+      // Guardar o ajuste e o que faz o arraste valer a pena: o painel re-renderiza
+      // a cada clique (filtro, arquivar, ordenar), e largura so em memoria voltaria
+      // ao padrao no primeiro clique depois do ajuste.
+      larguras: {}
     };
 
     const saneaValores = (arr) => Array.isArray(arr)
@@ -192,6 +198,20 @@
     ['assunto', 'base', 'competencia'].forEach((k) => {
       if (!Array.isArray(pgPrefs.filtros[k])) pgPrefs.filtros[k] = [];
     });
+    /* Largura vem de storage, que versao anterior nao escreveu e que da para
+     * editar a mao — entao chega aqui como `undefined`, texto ou numero absurdo.
+     * O teto de 1200 nao e estetica: largura gravada de 50.000px deixaria a tabela
+     * inutilizavel ja na abertura, antes de dar para alcancar o botao de
+     * restaurar. O piso de 56 e o mesmo que o arraste respeita. */
+    (() => {
+      const lim = pgPrefs.larguras && typeof pgPrefs.larguras === 'object' ? pgPrefs.larguras : {};
+      const limpo = {};
+      Object.keys(lim).forEach((k) => {
+        const n = Math.round(Number(lim[k]));
+        if (Number.isFinite(n) && n > 0) limpo[k] = Math.max(56, Math.min(1200, n));
+      });
+      pgPrefs.larguras = limpo;
+    })();
 
     const salvarDados = () => {
       try { GM_setValue(K_DADOS, JSON.stringify(dados)); }
@@ -2083,7 +2103,11 @@
 }
 .smax-gl-tab[data-active="true"] { color:var(--sp-accent); border-bottom-color:var(--sp-accent); font-weight:600; }
 
-.smax-gl-body { padding:16px; overflow-y:auto; flex:1 1 auto; }
+/* Rola nos dois eixos, e o eixo X e declarado de proposito: a tabela do painel
+   pode ficar mais larga do que a tela quando o usuario alarga as colunas, e e
+   este elemento que tem de rolar — ele e o mesmo que rola na vertical, o que
+   mantem o cabecalho sticky funcionando. */
+.smax-gl-body { padding:16px; overflow:auto; flex:1 1 auto; }
 .smax-gl-field { margin-bottom:14px; }
 .smax-gl-label { display:block; font-size:11px; font-weight:600; color:var(--sp-text-muted); margin-bottom:5px; text-transform:uppercase; letter-spacing:.4px; }
 .smax-gl-input, .smax-gl-editor, .smax-gl-select {
@@ -2174,24 +2198,73 @@
 }
 .smax-gl-filtros { display:flex; flex-wrap:wrap; gap:14px; align-items:flex-end; margin-bottom:12px; }
 .smax-gl-filtros > div { min-width:0; }
-.smax-gl-tbl { width:100%; border-collapse:collapse; font-size:11.5px; }
+/* table-layout:fixed e o que torna a largura de coluna obedecida: em layout
+   automatico o navegador trata largura como sugestao e recalcula pelo conteudo,
+   entao arrastar a divisa nao mudaria quase nada em coluna de texto longo.
+   O preco e que agora e o <colgroup> que manda, e conteudo maior do que a
+   celula precisa de tratamento explicito (as regras de td abaixo). */
+.smax-gl-tbl { width:100%; border-collapse:collapse; font-size:11.5px; table-layout:fixed; }
 .smax-gl-tbl th {
   text-align:left; padding:6px 8px; font-size:10px; text-transform:uppercase;
   letter-spacing:.4px; color:var(--sp-text-muted); border-bottom:1px solid var(--sp-border);
   white-space:nowrap; background:var(--sp-surface-2); position:sticky; top:0; z-index:1;
+  /* position:sticky tambem serve de referencia para o absolute da alca —
+     nao precisa (nem pode) virar relative, que tiraria o cabecalho fixo. */
+  overflow:hidden;
 }
 .smax-gl-tbl th[data-ordem] { cursor:pointer; }
 .smax-gl-tbl th[data-ordem]:hover { color:var(--sp-accent); }
 .smax-gl-tbl th[data-ativa="true"] { color:var(--sp-accent); }
+/* Coluna estreitada demais corta o proprio titulo; com reticencias da para ver
+   que esta cortado, sem elas o texto simplesmente desaparece na divisa. */
+.smax-gl-th-rot { display:inline-block; max-width:calc(100% - 22px); overflow:hidden;
+  text-overflow:ellipsis; white-space:nowrap; vertical-align:bottom; }
 /* Na coluna inativa a seta e so a dica de que da para clicar: apagada, e so
    aparece de verdade no hover. Na ativa ela carrega informacao (a direcao). */
 .smax-gl-tbl th[data-ativa="false"] .smax-gl-seta { opacity:.25; }
 .smax-gl-tbl th[data-ordem]:hover .smax-gl-seta { opacity:1; }
-.smax-gl-tbl td { padding:6px 8px; border-bottom:1px solid var(--sp-border); vertical-align:top; }
+/* 8px de area de pega para uma divisa de 1px: alvo de 1px nao se acerta com o
+   mouse. Fica toda DENTRO da celula (right:0, sem valor negativo) porque o th
+   tem overflow:hidden e cortaria qualquer avanco sobre a coluna vizinha. */
+.smax-gl-grip {
+  position:absolute; top:0; right:0; width:8px; height:100%;
+  cursor:col-resize; z-index:2; background:transparent;
+  /* user-select para que apertar a alca nunca comece a selecionar o texto do
+     cabecalho; touch-action para o navegador nao confundir o arraste com rolagem
+     e cancelar o ponteiro no meio. */
+  user-select:none; touch-action:none;
+}
+.smax-gl-grip::after {
+  content:''; position:absolute; top:3px; bottom:3px; right:0; width:1px;
+  background:var(--sp-border); transition:background .12s;
+}
+.smax-gl-grip:hover::after { background:var(--sp-accent); width:2px; }
+/* Enquanto arrasta, o cursor tem de continuar de redimensionar mesmo saindo do
+   cabecalho, e a selecao de texto tem de ficar desligada — sem isso o arraste
+   vira um "selecionar a tabela toda" azul. */
+.smax-gl-root[data-redim="true"], .smax-gl-root[data-redim="true"] * {
+  cursor:col-resize !important; user-select:none !important;
+}
+.smax-gl-root[data-redim="true"] .smax-gl-grip::after { background:var(--sp-accent); width:2px; }
+.smax-gl-larg-aviso {
+  display:flex; align-items:center; justify-content:flex-end; gap:8px;
+  font-size:11px; color:var(--sp-text-muted); margin:0 0 6px;
+}
+.smax-gl-larg-aviso button { padding:2px 8px; font-size:10.5px; }
+.smax-gl-larg-aviso[data-ajustada="false"] { display:none; }
+/* Em layout fixo o conteudo nao empurra mais a coluna: ou quebra linha, ou
+   vaza por cima da vizinha. Quebrar e o certo para texto; break-word cobre o
+   titulo sem espaco, que nao tem onde quebrar naturalmente. */
+.smax-gl-tbl td {
+  padding:6px 8px; border-bottom:1px solid var(--sp-border); vertical-align:top;
+  overflow-wrap:break-word; word-break:break-word;
+}
 .smax-gl-tbl tr[data-arquivado="true"] td { opacity:.5; }
 .smax-gl-tbl tr:hover td { background:var(--sp-primary-bg); }
-.smax-gl-tbl .smax-gl-num { font-family:Consolas, monospace; white-space:nowrap; }
-.smax-gl-tbl .smax-gl-tit { min-width:200px; }
+/* Estes nao quebram (numero e data quebrados nao se leem), entao cortam. */
+.smax-gl-tbl .smax-gl-num {
+  font-family:Consolas, monospace; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
 .smax-gl-filhos { font-family:Consolas, monospace; font-weight:600; text-align:right; white-space:nowrap; }
 /* "Nao lido" nunca pode ser lido como zero: cor e texto diferentes. */
 .smax-gl-naolido { color:var(--sp-text-dim); font-style:italic; font-family:inherit; font-weight:400; }
@@ -2795,19 +2868,49 @@
         ${sniffBlock}`;
     };
 
-    /* ---------- Tela: painel ---------- */
-    // `ordem` e a chave em `Metrica.CHAVES`; coluna sem `ordem` nao e clicavel.
+    /* ---------- Tela: painel ----------
+     * `ordem` e a chave em `Metrica.CHAVES`; coluna sem `ordem` nao e clicavel.
+     * `larg` e a largura padrao em px, e `chave` identifica a coluna na largura
+     * gravada — tem de ser nome proprio, e nao a posicao, senao acrescentar
+     * coluna no meio faria toda largura ja ajustada migrar para a coluna errada.
+     * A de acoes nao tem `larg` de proposito: e ela que absorve a sobra quando a
+     * soma das outras e menor do que a tela (ver LARG_ACOES_MIN). */
     const COLUNAS = [
-      { rot: 'Nº', ordem: 'numero' },
-      { rot: 'Título', ordem: 'titulo' },
-      { rot: 'Status', ordem: 'status' },
-      { rot: 'Operacional', ordem: 'statusOp' },
-      { rot: 'Grupo', ordem: 'grupo' },
-      { rot: 'Filhos', ordem: 'filhos' },
-      { rot: 'Marcações', ordem: 'marcacoes' },
-      { rot: 'Abertura', ordem: 'abertura' },
-      { rot: '' }
+      { chave: 'numero', rot: 'Nº', ordem: 'numero', larg: 92 },
+      { chave: 'titulo', rot: 'Título', ordem: 'titulo', larg: 240 },
+      { chave: 'status', rot: 'Status', ordem: 'status', larg: 100 },
+      { chave: 'statusOp', rot: 'Operacional', ordem: 'statusOp', larg: 140 },
+      { chave: 'grupo', rot: 'Grupo', ordem: 'grupo', larg: 130 },
+      { chave: 'filhos', rot: 'Filhos', ordem: 'filhos', larg: 64 },
+      { chave: 'marcacoes', rot: 'Marcações', ordem: 'marcacoes', larg: 150 },
+      { chave: 'abertura', rot: 'Abertura', ordem: 'abertura', larg: 88 },
+      { chave: 'acoes', rot: '' }
     ];
+
+    // Os quatro botoes da coluna de acoes nao quebram linha; sem reservar isto a
+    // tabela encolheria por cima deles e eles ficariam cortados pela metade.
+    const LARG_ACOES_MIN = 264;
+    const LARG_MIN = 56;
+
+    const largDe = (c) => (PgStore.prefs.larguras[c.chave] || c.larg || 0);
+    // Alguma largura foi mexida? Decide se o aviso de restaurar aparece. So
+    // conta chave que existe hoje: largura orfa de coluna removida nao deve
+    // fazer o painel oferecer restaurar algo que o usuario nao ve.
+    const largAjustada = () => COLUNAS.some(c => PgStore.prefs.larguras[c.chave] > 0);
+
+    /* A tabela e `width:100%`, mas com este `min-width`. Os dois juntos dao o
+     * comportamento esperado nas duas pontas: quando a soma das colunas cabe na
+     * tela, a tabela ocupa tudo e a sobra vai para a coluna de acoes; quando nao
+     * cabe, o `min-width` segura o tamanho pedido e o corpo do painel rola na
+     * horizontal. Sem o `min-width`, encolher a janela espremeria as colunas de
+     * volta e o arraste do usuario nao sobreviveria a um simples redimensionar. */
+    // `over` sobrepoe a largura de uma coluna sem gravar nada: e o que o arraste
+    // usa para recalcular o total a cada movimento do mouse, antes de haver
+    // largura gravada.
+    const somaLarguras = (over) => COLUNAS.reduce((s, c) => {
+      if (!c.larg) return s + LARG_ACOES_MIN;
+      return s + ((over && over[c.chave]) || largDe(c));
+    }, 0);
 
     const rotulosDe = (linha) => Dados.EIXOS.flatMap(e =>
       linha.marcas[e.chave].map(id => Dados.nomeDe(e.chave, id)).filter(Boolean)
@@ -2925,7 +3028,7 @@
                   >não relido</span>` : ''}
             ${l.arquivado ? '<br><span class="smax-gl-badge">arquivado</span>' : ''}
           </td>
-          <td class="smax-gl-tit">${l.lido ? Utils.escapeHtml(l.titulo || '(sem título)') : semLeitura}
+          <td>${l.lido ? Utils.escapeHtml(l.titulo || '(sem título)') : semLeitura}
             ${l.nota ? `<div class="smax-gl-cand-meta">${Utils.escapeHtml(l.nota)}</div>` : ''}</td>
           <td>${l.lido ? Utils.escapeHtml(Metrica.rotuloStatus(l.status) || '—') : semLeitura}</td>
           <td>${l.lido ? Utils.escapeHtml(Metrica.rotuloStatusOp(l.statusOp) || '—') : semLeitura}</td>
@@ -2977,16 +3080,38 @@
 
         ${blocoFiltros()}
 
-        <table class="smax-gl-tbl">
+        <!-- Vai pro DOM sempre, escondido por CSS quando nao ha ajuste, em vez
+             de so existir quando ha: o arraste termina sem re-render (de
+             proposito, para nao perder a posicao da rolagem numa lista longa),
+             entao ele precisa de um elemento ja pronto para revelar. Sem isso,
+             quem arrastasse uma coluna para 56px ficaria sem a saida visivel ate
+             o proximo clique em qualquer outra coisa. -->
+        <div class="smax-gl-larg-aviso" data-ajustada="${largAjustada()}">
+          Larguras ajustadas por você.
+          <button class="smax-gl-btn" data-act="larguras-padrao">Restaurar padrão</button>
+        </div>
+
+        <table class="smax-gl-tbl" style="min-width:${somaLarguras()}px;">
+          <colgroup>${COLUNAS.map(c => (c.larg
+            ? `<col data-col="${c.chave}" style="width:${largDe(c)}px;">`
+            // Sem largura: em table-layout fixo, coluna sem largura declarada
+            // fica com o que sobrar da tabela.
+            : `<col data-col="${c.chave}">`)).join('')}</colgroup>
           <thead><tr>${COLUNAS.map(c => {
-            if (!c.ordem) return `<th>${c.rot}</th>`;
+            // A alca fica na coluna da ESQUERDA da divisa, e nao na de acoes, que
+            // nao tem largura propria para mexer.
+            const alca = c.larg
+              ? `<span class="smax-gl-grip" data-grip="${c.chave}"
+                       title="Arraste para mudar a largura desta coluna. Clique duplo volta ao padrão."></span>`
+              : '';
+            if (!c.ordem) return `<th>${c.rot}${alca}</th>`;
             const ativa = PgStore.prefs.ordem === c.ordem;
             // A seta da coluna ativa diz a direcao real; nas outras um ↕ apagado
             // diz apenas que da para clicar.
             const seta = ativa ? (PgStore.prefs.ordemAsc ? '▴' : '▾') : '↕';
             return `<th data-ordem="${c.ordem}" data-ativa="${ativa}"
                         title="Ordenar por ${Utils.escapeHtml(c.rot)}${ativa ? ' (clique inverte)' : ''}"
-                      >${c.rot} <span class="smax-gl-seta">${seta}</span></th>`;
+                      ><span class="smax-gl-th-rot">${c.rot}</span> <span class="smax-gl-seta">${seta}</span>${alca}</th>`;
           }).join('')}</tr></thead>
           <tbody>${corpo}</tbody>
         </table>`;
@@ -4019,14 +4144,111 @@
       }
     };
 
+    /* ---------- Redimensionar coluna ----------
+     * Instante em que o ultimo arraste terminou. Existe porque soltar o mouse
+     * depois de arrastar dispara `click` no cabecalho, e o cabecalho ordena: sem
+     * isto, toda vez que o usuario acertasse a largura a lista reordenaria junto.
+     * Olhar so o alvo do clique nao bastaria — se o mouse saiu da alca durante o
+     * arraste, o alvo do `click` passa a ser o `<th>`, nao a alca. */
+    let redimAte = 0;
+
+    const larguraPadrao = () => {
+      PgStore.prefs.larguras = {};
+      PgStore.salvarPrefs();
+      render();
+      setStatus('Larguras de coluna de volta ao padrão.');
+    };
+
+    const wireRedim = () => {
+      /* Evento de PONTEIRO, nao de mouse, por causa do `setPointerCapture`: com
+       * captura, o `pointerup` chega na alca mesmo que o usuario solte o botao
+       * fora da janela do navegador. Com `mouseup` no document isso nao vale —
+       * soltar fora da janela nao entrega evento nenhum, e o painel ficaria
+       * preso em modo de redimensionar (cursor de seta dupla em tudo, texto
+       * sem poder selecionar) ate fechar e reabrir. */
+      overlay.addEventListener('pointerdown', (ev) => {
+        const alca = ev.target.closest('.smax-gl-grip');
+        if (!alca || ev.button !== 0) return;
+        const chave = alca.dataset.grip;
+        const col = overlay.querySelector(`colgroup col[data-col="${chave}"]`);
+        const th = alca.closest('th');
+        if (!col || !th) return;
+
+        /* Sem `preventDefault` aqui, de proposito. Cancelar o `pointerdown`
+         * suprime os eventos de mouse compativeis que o navegador derivaria
+         * dele, e o clique duplo que restaura a coluna depende justamente
+         * desses. Quem impede a selecao de texto durante o arraste e o CSS
+         * (`user-select:none` na alca e em tudo enquanto `data-redim` esta
+         * ligado), que para isso e mais confiavel do que `preventDefault`. */
+        const x0 = ev.clientX;
+        // Parte da largura REAL na tela, nao da gravada: na primeira vez nao ha
+        // gravada, e a largura efetiva pode ser maior do que a padrao porque a
+        // tabela e `width:100%`. Usar a padrao faria a coluna pular no primeiro
+        // pixel de movimento.
+        const l0 = th.getBoundingClientRect().width;
+        // O proprio overlay e o `.smax-gl-root` (ver `open`).
+        overlay.dataset.redim = 'true';
+        try { alca.setPointerCapture(ev.pointerId); } catch { /* sem captura, o arraste ainda funciona dentro da janela */ }
+
+        const largAqui = (e) => Math.max(LARG_MIN, Math.round(l0 + (e.clientX - x0)));
+
+        const mover = (e) => {
+          const larg = largAqui(e);
+          // Durante o arraste mexe no DOM e nao no estado: e um `col.style` por
+          // movimento do mouse, sem re-render e sem gravar em disco a cada pixel.
+          col.style.width = `${larg}px`;
+          const t = col.closest('table');
+          if (t) t.style.minWidth = `${somaLarguras({ [chave]: larg })}px`;
+        };
+
+        const soltar = (e) => {
+          alca.removeEventListener('pointermove', mover);
+          alca.removeEventListener('pointerup', soltar);
+          alca.removeEventListener('pointercancel', soltar);
+          delete overlay.dataset.redim;
+          PgStore.prefs.larguras[chave] = largAqui(e);
+          PgStore.salvarPrefs();
+          const aviso = overlay.querySelector('.smax-gl-larg-aviso');
+          if (aviso) aviso.dataset.ajustada = 'true';
+          redimAte = Date.now();
+        };
+
+        // Na alca, e nao no document: com a captura ativa e ela que recebe tudo.
+        alca.addEventListener('pointermove', mover);
+        alca.addEventListener('pointerup', soltar);
+        // `pointercancel` e o caso de o sistema tomar o ponteiro (gesto de toque
+        // virando rolagem, por exemplo). Sem tratar, ficaria preso igual.
+        alca.addEventListener('pointercancel', soltar);
+      });
+
+      // Clique duplo na alca devolve so aquela coluna ao padrao — e a saida para
+      // quem arrastou demais e nao quer perder o ajuste das outras.
+      overlay.addEventListener('dblclick', (ev) => {
+        const alca = ev.target.closest('.smax-gl-grip');
+        if (!alca) return;
+        ev.preventDefault();
+        delete PgStore.prefs.larguras[alca.dataset.grip];
+        PgStore.salvarPrefs();
+        redimAte = Date.now();
+        render();
+      });
+    };
+
     /* ---------- Eventos ---------- */
     const wire = () => {
+      wireRedim();
       overlay.addEventListener('click', (ev) => {
         const tab = ev.target.closest('.smax-gl-tab');
         if (tab) { readForm(); activeTab = tab.dataset.tab; render(); return; }
 
         const col = ev.target.closest('th[data-ordem]');
         if (col) {
+          // Nao ordena se o clique foi na alca de largura, nem no clique que
+          // vem logo depois de um arraste (ver `redimAte`). A janela de 300ms e
+          // generosa de proposito: errar para o lado de nao ordenar e so o
+          // usuario clicar de novo; errar para o outro reordena 600 linhas na
+          // cara de quem so queria mexer na largura.
+          if (ev.target.closest('.smax-gl-grip') || Date.now() - redimAte < 300) return;
           const chave = col.dataset.ordem;
           // Clicar na coluna que ja ordena inverte; clicar em outra troca de
           // coluna e abre na direcao natural dela, nao na que estava em uso.
@@ -4178,6 +4400,7 @@
           if (g) editarModal(g); else setStatus(`#${id} não está no painel.`, 'err');
         }
         else if (act === 'arquivar-encerrados') { arquivarEncerrados(); }
+        else if (act === 'larguras-padrao') { larguraPadrao(); }
         else if (act === 'arquivar' || act === 'desarquivar') {
           const id = ev.target.closest('[data-id]').dataset.id;
           const r = Dados.arquivar(id, act === 'arquivar');

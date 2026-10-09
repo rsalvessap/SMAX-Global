@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SMAX Painel de Globais - TJSP
 // @namespace    https://github.com/rsalvessap/SMAX-Global
-// @version      1.13
+// @version      1.14
 // @description  Painel de gestao de chamados globais do SMAX TJSP — lista curada, classificacao por assunto/base/competencia, sincronizacao por arquivo no GitHub e abertura automatizada de global por molde
 // @author       rsalvessap
 // @match        https://suporte.tjsp.jus.br/saw/*
@@ -26,7 +26,7 @@
   if (window.top && window.top !== window.self) return;
   if (window.location.hostname !== 'suporte.tjsp.jus.br') return;
 
-  const SMAX_GLOBAL_VERSION = '1.13';
+  const SMAX_GLOBAL_VERSION = '1.14';
 
   // O userscript roda em sandbox; quem dispara as requisicoes e a pagina.
   const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
@@ -2873,42 +2873,58 @@
      * `larg` e a largura padrao em px, e `chave` identifica a coluna na largura
      * gravada — tem de ser nome proprio, e nao a posicao, senao acrescentar
      * coluna no meio faria toda largura ja ajustada migrar para a coluna errada.
-     * A de acoes nao tem `larg` de proposito: e ela que absorve a sobra quando a
-     * soma das outras e menor do que a tela (ver LARG_ACOES_MIN). */
+     *
+     * UMA coluna e `elastica`: nao tem largura declarada, e em table-layout fixo
+     * e ela que fica com o que sobrar da tabela. E o Titulo, e nao a de acoes
+     * como na primeira tentativa (v1.13): a de acoes precisa de 238px para os
+     * quatro botoes e nao se beneficia de um pixel a mais, entao absorvendo a
+     * sobra ela ficava com 689px de vazio numa tela de 1725 — 40% da tabela
+     * desperdicada — enquanto o titulo, que e texto longo, ficava apertado em
+     * 240. Com o titulo elastico, estreitar qualquer coluna devolve o espaco a
+     * ele, que e o que "ajustar a tela" quer dizer nesta tabela.
+     *
+     * `alca: false` tira o arraste da coluna. A de acoes nao se arrasta porque
+     * esta na medida dos botoes, e a elastica nao se arrasta porque largura
+     * declarada e justamente o que ela nao tem. */
     const COLUNAS = [
       { chave: 'numero', rot: 'Nº', ordem: 'numero', larg: 92 },
-      { chave: 'titulo', rot: 'Título', ordem: 'titulo', larg: 240 },
+      { chave: 'titulo', rot: 'Título', ordem: 'titulo', elastica: true, min: 180 },
       { chave: 'status', rot: 'Status', ordem: 'status', larg: 100 },
       { chave: 'statusOp', rot: 'Operacional', ordem: 'statusOp', larg: 140 },
       { chave: 'grupo', rot: 'Grupo', ordem: 'grupo', larg: 130 },
       { chave: 'filhos', rot: 'Filhos', ordem: 'filhos', larg: 64 },
       { chave: 'marcacoes', rot: 'Marcações', ordem: 'marcacoes', larg: 150 },
       { chave: 'abertura', rot: 'Abertura', ordem: 'abertura', larg: 88 },
-      { chave: 'acoes', rot: '' }
+      // 238px e o que os quatro botoes medem na tela, mais o padding da celula.
+      { chave: 'acoes', rot: '', larg: 244, alca: false }
     ];
 
-    // Os quatro botoes da coluna de acoes nao quebram linha; sem reservar isto a
-    // tabela encolheria por cima deles e eles ficariam cortados pela metade.
-    const LARG_ACOES_MIN = 264;
     const LARG_MIN = 56;
 
+    const temAlca = (c) => !c.elastica && c.alca !== false;
     const largDe = (c) => (PgStore.prefs.larguras[c.chave] || c.larg || 0);
-    // Alguma largura foi mexida? Decide se o aviso de restaurar aparece. So
-    // conta chave que existe hoje: largura orfa de coluna removida nao deve
-    // fazer o painel oferecer restaurar algo que o usuario nao ve.
-    const largAjustada = () => COLUNAS.some(c => PgStore.prefs.larguras[c.chave] > 0);
+    /* Alguma largura foi mexida? Decide se o aviso de restaurar aparece. Conta
+     * so coluna que tem alca hoje: largura gravada por uma versao anterior para
+     * coluna que virou elastica (foi o caso do titulo, ajustavel na v1.13) nao
+     * muda nada na tela, e ofereceria restaurar um ajuste que nao se ve. */
+    const largAjustada = () => COLUNAS.some(c => temAlca(c) && PgStore.prefs.larguras[c.chave] > 0);
 
     /* A tabela e `width:100%`, mas com este `min-width`. Os dois juntos dao o
      * comportamento esperado nas duas pontas: quando a soma das colunas cabe na
-     * tela, a tabela ocupa tudo e a sobra vai para a coluna de acoes; quando nao
+     * tela, a tabela ocupa tudo e a sobra vai para a coluna elastica; quando nao
      * cabe, o `min-width` segura o tamanho pedido e o corpo do painel rola na
      * horizontal. Sem o `min-width`, encolher a janela espremeria as colunas de
-     * volta e o arraste do usuario nao sobreviveria a um simples redimensionar. */
-    // `over` sobrepoe a largura de uma coluna sem gravar nada: e o que o arraste
-    // usa para recalcular o total a cada movimento do mouse, antes de haver
-    // largura gravada.
+     * volta e o arraste do usuario nao sobreviveria a um simples redimensionar.
+     *
+     * A elastica entra pelo seu `min`, e nao por zero: em layout fixo coluna sem
+     * largura declarada pode ser espremida a nada, e o titulo sumiria antes de a
+     * barra de rolagem aparecer.
+     *
+     * `over` sobrepoe a largura de uma coluna sem gravar nada: e o que o arraste
+     * usa para recalcular o total a cada movimento do mouse, antes de haver
+     * largura gravada. */
     const somaLarguras = (over) => COLUNAS.reduce((s, c) => {
-      if (!c.larg) return s + LARG_ACOES_MIN;
+      if (c.elastica) return s + (c.min || 0);
       return s + ((over && over[c.chave]) || largDe(c));
     }, 0);
 
@@ -3092,15 +3108,13 @@
         </div>
 
         <table class="smax-gl-tbl" style="min-width:${somaLarguras()}px;">
-          <colgroup>${COLUNAS.map(c => (c.larg
-            ? `<col data-col="${c.chave}" style="width:${largDe(c)}px;">`
-            // Sem largura: em table-layout fixo, coluna sem largura declarada
-            // fica com o que sobrar da tabela.
-            : `<col data-col="${c.chave}">`)).join('')}</colgroup>
+          <colgroup>${COLUNAS.map(c => (c.elastica
+            // Sem largura declarada: em table-layout fixo e esta coluna que fica
+            // com o que sobrar da tabela.
+            ? `<col data-col="${c.chave}">`
+            : `<col data-col="${c.chave}" style="width:${largDe(c)}px;">`)).join('')}</colgroup>
           <thead><tr>${COLUNAS.map(c => {
-            // A alca fica na coluna da ESQUERDA da divisa, e nao na de acoes, que
-            // nao tem largura propria para mexer.
-            const alca = c.larg
+            const alca = temAlca(c)
               ? `<span class="smax-gl-grip" data-grip="${c.chave}"
                        title="Arraste para mudar a largura desta coluna. Clique duplo volta ao padrão."></span>`
               : '';
@@ -3109,8 +3123,13 @@
             // A seta da coluna ativa diz a direcao real; nas outras um ↕ apagado
             // diz apenas que da para clicar.
             const seta = ativa ? (PgStore.prefs.ordemAsc ? '▴' : '▾') : '↕';
+            // A elastica nao tem alca, e isso precisa de explicacao no lugar em
+            // que o usuario vai procurar por ela.
+            const dica = c.elastica
+              ? ' — esta coluna ocupa o espaço que sobra; estreite as outras para ela crescer'
+              : '';
             return `<th data-ordem="${c.ordem}" data-ativa="${ativa}"
-                        title="Ordenar por ${Utils.escapeHtml(c.rot)}${ativa ? ' (clique inverte)' : ''}"
+                        title="Ordenar por ${Utils.escapeHtml(c.rot)}${ativa ? ' (clique inverte)' : ''}${dica}"
                       ><span class="smax-gl-th-rot">${c.rot}</span> <span class="smax-gl-seta">${seta}</span>${alca}</th>`;
           }).join('')}</tr></thead>
           <tbody>${corpo}</tbody>

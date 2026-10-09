@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SMAX Painel de Globais - TJSP
 // @namespace    https://github.com/rsalvessap/SMAX-Global
-// @version      1.14
+// @version      1.15
 // @description  Painel de gestao de chamados globais do SMAX TJSP — lista curada, classificacao por assunto/base/competencia, sincronizacao por arquivo no GitHub e abertura automatizada de global por molde
 // @author       rsalvessap
 // @match        https://suporte.tjsp.jus.br/saw/*
@@ -10,6 +10,7 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_xmlhttpRequest
+// @grant        GM_notification
 // @grant        unsafeWindow
 // @connect      raw.githubusercontent.com
 // @connect      api.github.com
@@ -26,7 +27,7 @@
   if (window.top && window.top !== window.self) return;
   if (window.location.hostname !== 'suporte.tjsp.jus.br') return;
 
-  const SMAX_GLOBAL_VERSION = '1.14';
+  const SMAX_GLOBAL_VERSION = '1.15';
 
   // O userscript roda em sandbox; quem dispara as requisicoes e a pagina.
   const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
@@ -114,7 +115,16 @@
     const K_DADOS = 'smax_pg_dados';
     const K_PREFS = 'smax_pg_prefs';
     const K_ESTADO = 'smax_pg_estado';
+    /* Novidades achadas pelo monitor, e a agenda da proxima sondagem. Chaves
+     * separadas do estado porque tem ciclo de vida proprio: o estado e cache
+     * descartavel que se reescreve inteiro a cada leitura, a novidade e historico
+     * que so sai quando o usuario manda, e a agenda e coordenada ENTRE ABAS. */
+    const K_NOVID = 'smax_pg_novidades';
+    const K_MON = 'smax_pg_monitor';
     const SCHEMA = 1;
+    // Teto do historico de novidades. Um global movimentado gera varias por dia;
+    // sem teto, a chave cresceria para sempre e cada gravacao ficaria mais caras.
+    const MAX_NOVID = 200;
 
     const dadosVazio = () => ({
       _schema: SCHEMA,
@@ -137,7 +147,13 @@
       // Guardar o ajuste e o que faz o arraste valer a pena: o painel re-renderiza
       // a cada clique (filtro, arquivar, ordenar), e largura so em memoria voltaria
       // ao padrao no primeiro clique depois do ajuste.
-      larguras: {}
+      larguras: {},
+      /* Monitoramento (fase 6). `minutos` e o intervalo entre sondagens;
+       * `notificarSO` e a notificacao do sistema operacional, que e opcional de
+       * proposito — o selo no botao flutuante e o aviso na tela funcionam sempre,
+       * mas a notificacao do SO pode ser engolida pelo Assistente de Foco do
+       * Windows, e aviso que pode nao chegar nao serve como unico canal. */
+      monitor: { ligado: true, minutos: 30, notificarSO: false }
     };
 
     const saneaValores = (arr) => Array.isArray(arr)
@@ -212,6 +228,19 @@
       });
       pgPrefs.larguras = limpo;
     })();
+    /* Mesmo tratamento do `filtros` acima, pelo mesmo motivo: prefs gravada pela
+     * v1.14 nao tem `monitor`, e o `Object.assign` substitui o objeto inteiro em
+     * vez de completar campo faltante. O intervalo e preso a uma lista fechada
+     * porque e ele que decide a carga contra o SMAX: valor editado a mao para 1
+     * faria o script consultar o SMAX 60 vezes por hora, por aba. */
+    (() => {
+      const m = { ...prefsDefaults.monitor, ...(pgPrefs.monitor || {}) };
+      const permitidos = [10, 30, 60];
+      m.ligado = m.ligado !== false;
+      m.notificarSO = m.notificarSO === true;
+      m.minutos = permitidos.includes(Number(m.minutos)) ? Number(m.minutos) : 30;
+      pgPrefs.monitor = m;
+    })();
 
     const salvarDados = () => {
       try { GM_setValue(K_DADOS, JSON.stringify(dados)); }
@@ -263,12 +292,107 @@
       salvarEstado();
     };
 
+    /* ----- Novidades (fase 6) -----
+       Forma: { itens: [{ id, titulo, tipo, texto, quando }], vistoEm }.
+       Mais nova primeiro. `vistoEm` e o carimbo de quando o usuario olhou a
+       aba — o que nao foi visto e o que conta no selo do botao flutuante.
+       PERSISTIDO, e nao em memoria, por um motivo que e a razao de a fase 6
+       existir: a deteccao acontece com o painel FECHADO, e o SMAX recarrega a
+       pagina a cada navegacao. Novidade em memoria morreria antes de ser vista,
+       e o selo mentiria. */
+    let novid = { itens: [], vistoEm: 0 };
+    try {
+      const raw = GM_getValue(K_NOVID);
+      const obj = raw ? JSON.parse(raw) : null;
+      if (obj && Array.isArray(obj.itens)) {
+        novid = {
+          itens: obj.itens.filter(x => x && x.id).slice(0, MAX_NOVID),
+          vistoEm: Number(obj.vistoEm) || 0
+        };
+      }
+    } catch (err) {
+      console.warn('[SMAX Painel] smax_pg_novidades ilegivel, comecando vazio:', err);
+    }
+
+    const salvarNovid = () => {
+      try { GM_setValue(K_NOVID, JSON.stringify(novid)); }
+      catch (err) { console.warn('[SMAX Painel] falha ao gravar smax_pg_novidades:', err); }
+    };
+
+    /* Releitura do disco antes de acrescentar. Sem isto, duas abas abertas se
+       sobrescreveriam: cada uma tem sua copia em memoria desde o carregamento da
+       pagina, e a ultima a gravar apagaria as novidades que a outra registrou. */
+    const recarregarNovid = () => {
+      try {
+        const raw = GM_getValue(K_NOVID);
+        const obj = raw ? JSON.parse(raw) : null;
+        if (obj && Array.isArray(obj.itens)) {
+          novid.itens = obj.itens.filter(x => x && x.id);
+          novid.vistoEm = Number(obj.vistoEm) || novid.vistoEm;
+        }
+      } catch { /* ilegivel: segue com o que esta em memoria */ }
+    };
+
+    const registrarNovidades = (itens) => {
+      if (!itens || !itens.length) return 0;
+      recarregarNovid();
+      novid.itens = itens.concat(novid.itens).slice(0, MAX_NOVID);
+      salvarNovid();
+      return itens.length;
+    };
+
+    const marcarNovidadesVistas = () => {
+      recarregarNovid();
+      novid.vistoEm = Date.now();
+      salvarNovid();
+    };
+
+    const limparNovidades = () => {
+      novid = { itens: [], vistoEm: Date.now() };
+      salvarNovid();
+    };
+
+    const naoVistas = () => {
+      recarregarNovid();
+      return novid.itens.filter(x => Number(x.quando) > novid.vistoEm).length;
+    };
+
+    /* ----- Agenda do monitor, compartilhada entre abas -----
+       Forma: { proxima, dono, rodadaEm }.
+       Mora no storage do Tampermonkey, que e COMUM as abas, e nao num
+       `setInterval` por aba. Dois ganhos que nao se consegue de outra forma:
+       cinco abas do SMAX abertas fazem UMA rodada, nao cinco; e recarregar a
+       pagina do SMAX (o que o SMAX faz a cada navegacao) nao reinicia o relogio,
+       senao quem navega muito nunca completaria um intervalo. */
+    const lerAgenda = () => {
+      try {
+        const raw = GM_getValue(K_MON);
+        const obj = raw ? JSON.parse(raw) : null;
+        if (obj && typeof obj === 'object') {
+          return {
+            proxima: Number(obj.proxima) || 0,
+            dono: String(obj.dono || ''),
+            rodadaEm: Number(obj.rodadaEm) || 0
+          };
+        }
+      } catch { /* ilegivel: trata como agenda vazia */ }
+      return { proxima: 0, dono: '', rodadaEm: 0 };
+    };
+
+    const salvarAgenda = (a) => {
+      try { GM_setValue(K_MON, JSON.stringify(a)); }
+      catch (err) { console.warn('[SMAX Painel] falha ao gravar smax_pg_monitor:', err); }
+    };
+
     return {
       SCHEMA,
       dados: () => dados,
       prefs: pgPrefs,
       estado: () => estado,
-      sanear, salvarDados, salvarPrefs, substituirDados, mesclarEstado
+      novidades: () => novid,
+      sanear, salvarDados, salvarPrefs, substituirDados, mesclarEstado,
+      registrarNovidades, marcarNovidadesVistas, limparNovidades, naoVistas,
+      lerAgenda, salvarAgenda, MAX_NOVID
     };
   })();
 
@@ -1147,8 +1271,10 @@
   /* =========================================================
    * PgApi — as leituras do painel no SMAX
    *
-   * Tres leituras, e so tres: a conferencia de um chamado na hora de incluir, o
-   * estado dos globais marcados e a contagem de filhos. Nenhuma escrita.
+   * Leituras, e so leituras — nenhuma escrita: a conferencia de um chamado na
+   * hora de incluir, o estado dos globais marcados, a contagem de filhos, a
+   * sondagem barata dessa contagem (fase 6) e o chamado inteiro para o
+   * visualizador.
    * =======================================================*/
   const PgApi = (() => {
     // GlobalId_c volta como OBJETO { Id: "82133910" } e pode estar em
@@ -1368,6 +1494,78 @@
       return { porPai, falhas };
     };
 
+    /* (2b) A SONDAGEM do monitor: quantos filhos, sem trazer os filhos.
+     *
+     * Por que existe uma segunda forma de contar. A de cima (`contarFilhos`)
+     * ENUMERA: ela traz todos os registros filhos para atribuir cada um ao seu
+     * pai, o que e necessario porque ela pergunta por 50 pais de uma vez. O custo
+     * disso ficou visivel no global 86606075, medido em 2026-10-09: 2.614 filhos
+     * sao 11 requisicoes de 250 registros para UM global. Num ciclo automatico
+     * isso e carga demais contra o SMAX.
+     *
+     * Aqui a pergunta e outra — "o numero mudou?" — e para ela basta
+     * `size=1&meta=totalCount`: uma requisicao por global, payload praticamente
+     * zero, que e justo a consulta recomendada na secao 22.5 item 3 da analise.
+     *
+     * ⚠️ O numero daqui NAO vai para a tela, e o motivo e sutil: `total_count`
+     * conta o registro do proprio global quando ele tem `GlobalId_c` apontando
+     * para si mesmo, e a enumeracao desconta essa autorreferencia (:1356). As
+     * duas contagens podem portanto diferir em 1. Entao este valor e guardado
+     * num campo PROPRIO (`filhosSonda`) e comparado sempre contra ele mesmo —
+     * marca d'agua, nao informacao. Quem a tela mostra continua sendo `filhos`,
+     * da enumeracao. Comparar metricas diferentes faria o primeiro ciclo
+     * anunciar "+1 filho" em todo global autorreferente, que e exatamente o tipo
+     * de mentira que este painel nao pode contar. */
+    const TOTAL_KEYS = ['total_count', 'totalCount'];
+
+    /* `total_count` vem em ate 5 grafias diferentes no SMAX (analise §18.2 item
+     * 20). Ler so `meta.total_count` funciona hoje e falha calado amanha: o
+     * numero viria `undefined`, a sondagem nao veria mudanca nenhuma e o monitor
+     * simplesmente nunca avisaria nada. */
+    const lerTotal = (resp) => {
+      const fontes = [resp, resp && resp.meta, resp && resp.metadata, resp && resp.Query];
+      for (const f of fontes) {
+        if (!f) continue;
+        for (const k of TOTAL_KEYS) {
+          const n = Number(f[k]);
+          if (Number.isFinite(n) && n >= 0) return n;
+        }
+      }
+      return null;
+    };
+
+    const sondarFilhos = async (ids) => {
+      const porPai = {};
+      const falhas = [];
+      // Uma requisicao por global, em paralelo controlado — o mesmo limite que o
+      // resto do script usa para nao abrir 50 conexoes de uma vez.
+      await emLote(ids, async (id) => {
+        try {
+          const resp = await ApiClient.request('ems/Request', {
+            timeout: 30000,
+            searchParams: {
+              filter: `GlobalId_c = '${id}'`, layout: 'Id',
+              size: '1', skip: '0', meta: 'totalCount'
+            }
+          });
+          if (resp && resp.meta && resp.meta.completion_status
+              && String(resp.meta.completion_status).toUpperCase() !== 'OK') {
+            const err = new Error('consulta recusada pelo SMAX');
+            err.body = JSON.stringify(resp);
+            throw err;
+          }
+          const n = lerTotal(resp);
+          // Sem total legivel nao se inventa zero: fica como falha, e a sondagem
+          // trata o global como "nao sei", nao como "nao tem filho".
+          if (n === null) throw new Error('resposta sem total_count');
+          porPai[id] = n;
+        } catch (err) {
+          falhas.push({ ids: [id], motivo: motivoDeErro(err) });
+        }
+      });
+      return { porPai, falhas };
+    };
+
     /* (3) O chamado inteiro, para o visualizador.
      *
      * NAO usa `ems/Request/{id}?layout=Description,Solution,Comments`. Esse e o
@@ -1451,8 +1649,257 @@
     };
 
     return {
-      conferir, emLote, extrairGlobalId, lerEstado, contarFilhos, motivoDeErro,
-      lerChamado, parseComentarios
+      conferir, emLote, extrairGlobalId, lerEstado, contarFilhos, sondarFilhos,
+      motivoDeErro, lerChamado, parseComentarios
+    };
+  })();
+
+  /* =========================================================
+   * PgMonitor — fase 6: o que mudou nos globais da minha lista
+   *
+   * Duas perguntas, e so duas (analise §22.5 item 5): mudou algo num global que
+   * eu acompanho, e apareceram filhos novos. NAO e vigiar os chamados novos do
+   * SMAX — isso seria outro produto, e muito mais caro.
+   *
+   * A peca que fazia falta nao era a leitura: ela ja existia inteira em
+   * `atualizarDoSmax`. Era o DIFF. O `mesclarEstado` sobrescreve o registro, e
+   * portanto destroi a evidencia da mudanca no exato instante em que ela existe.
+   * Por isso o diff mora DENTRO do pipeline de leitura, antes do merge — com um
+   * efeito colateral bom: o "Atualizar do SMAX" manual passa a produzir novidade
+   * tambem, em vez de engoli-la.
+   * =======================================================*/
+  const PgMonitor = (() => {
+    // Quem avisar quando a lista de novidades mudar. A HUD assina no `init` para
+    // atualizar o selo do botao flutuante; sem assinante, o monitor roda igual.
+    let ouvinte = null;
+    let rodando = false;
+    let timer = null;
+    // Identidade desta aba. Serve para a reivindicacao da rodada (ver `tentar`):
+    // a aba grava a agenda e releia para conferir que o dono e ela mesma.
+    const MINHA_ABA = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
+    const TIPOS = {
+      filhos: { rot: 'Filhos', peso: 3 },
+      status: { rot: 'Status', peso: 2 },
+      grupo: { rot: 'Grupo', peso: 1 },
+      atualizado: { rot: 'Atualizado', peso: 0 }
+    };
+
+    /* O diff de UM global.
+     *
+     * A regra que nao se negocia: comparacao so acontece quando existe valor
+     * ANTERIOR. Campo que nunca foi lido vale `undefined`/`null` e significa "nao
+     * sei", nunca zero — e neste codigo `filhos: null` ja carrega esse
+     * significado (:426). Sem esse sentinela (a licao do
+     * Monitor-de-solicitacoes.user.js:512-513), a primeira rodada anunciaria
+     * "+2.614 filhos" em cada global da lista e o usuario desligaria o monitor
+     * no primeiro dia.
+     *
+     * Um global pode gerar mais de um item na mesma rodada — filhos novos E
+     * troca de status sao duas noticias diferentes. O item generico
+     * ("atualizado") sai so quando nenhum dos especificos saiu: `LastUpdateTime`
+     * cresce em toda gravacao, inclusive nas que ja foram descritas com precisao
+     * pelos outros itens, e repetir a mesma gravacao em duas linhas seria ruido. */
+    const diffGlobal = (id, antes, depois, quando) => {
+      const itens = [];
+      if (!antes) return itens; // primeira leitura deste global: nao e novidade
+      const add = (tipo, texto) => itens.push({ id, titulo: depois.titulo || antes.titulo || '', tipo, texto, quando });
+
+      const a = antes.filhosSonda;
+      const d = depois.filhosSonda;
+      if (typeof a === 'number' && typeof d === 'number' && a !== d) {
+        const delta = d - a;
+        // Queda de filho tambem e noticia, e nao se detecta de outra forma:
+        // desvincular um filho mexe no LastUpdateTime do FILHO, nao no do pai.
+        // Sem contar aqui, a queda passaria em silencio.
+        add('filhos', delta > 0
+          ? `${delta} filho(s) novo(s) — de ${a} para ${d}`
+          : `${-delta} filho(s) a menos — de ${a} para ${d}`);
+      }
+
+      if (antes.status !== undefined && depois.status !== undefined
+          && (antes.status !== depois.status || antes.statusOp !== depois.statusOp)) {
+        const de = `${Metrica.rotuloStatus(antes.status) || antes.status || '—'} / ${Metrica.rotuloStatusOp(antes.statusOp) || '—'}`;
+        const para = `${Metrica.rotuloStatus(depois.status) || depois.status || '—'} / ${Metrica.rotuloStatusOp(depois.statusOp) || '—'}`;
+        // Encerrar e o caso que merece texto proprio: e o gatilho da sugestao de
+        // arquivar, e o usuario precisa ligar uma coisa na outra.
+        // `Metrica.encerrada` recebe a LINHA e nao o status (ver o comentario na
+        // definicao: linha sem leitura tem de devolver `null`, nao `false`). Aqui
+        // os dois lados foram lidos — o `if` acima ja garantiu que ha status nos
+        // dois —, entao o `lido:true` e verdade, nao atalho.
+        const fim = (st) => Metrica.encerrada({ lido: true, status: st });
+        const virouEncerrado = !fim(antes.status) && fim(depois.status);
+        add('status', `${de} → ${para}${virouEncerrado ? ' (encerrado — dá para arquivar)' : ''}`);
+      }
+
+      if (antes.grupo !== undefined && depois.grupo !== undefined && antes.grupo !== depois.grupo) {
+        add('grupo', `${antes.grupo || '—'} → ${depois.grupo || '—'}`);
+      }
+
+      if (!itens.length
+          && typeof antes.atualizadoEm === 'number' && typeof depois.atualizadoEm === 'number'
+          && depois.atualizadoEm > antes.atualizadoEm) {
+        // De proposito nao diz O QUE mudou: a leitura enxuta nao traz comentario
+        // nem descricao, e inventar o motivo seria pior do que admitir a lacuna.
+        add('atualizado', 'alguma alteração no chamado (comentário, atribuição ou campo) — a leitura enxuta não diz qual');
+      }
+      return itens;
+    };
+
+    /* O pipeline completo de leitura, usado pelo botao "Atualizar do SMAX" e pela
+     * rodada automatica quando a sondagem acha movimento. Faz leitura, diff e
+     * merge nessa ordem — a ordem importa, porque o merge apaga o "antes". */
+    const lerTudo = async (ids, onProgresso) => {
+      const prog = onProgresso || (() => {});
+      prog('estado', 0, 0);
+      const est = await PgApi.lerEstado(ids, (f, t) => prog('estado', f, t));
+      prog('filhos', 0, 0);
+      const fil = await PgApi.contarFilhos(ids, (f, t) => prog('filhos', f, t));
+      const son = await PgApi.sondarFilhos(ids);
+
+      // A contagem entra no mesmo registro do estado. Pai sem contagem nesta
+      // passada fica SEM a chave `filhos` — a tela mostra "nao lido", nunca 0.
+      Object.entries(est.porId).forEach(([id, e]) => {
+        if (fil.porPai[id] !== undefined) e.filhos = fil.porPai[id];
+        // A marca d'agua da sondagem anda junto, senao a proxima sondagem
+        // compararia contra um valor velho e acharia movimento que nao houve.
+        if (son.porPai[id] !== undefined) e.filhosSonda = son.porPai[id];
+      });
+
+      const novidades = diffDoLote(est.porId);
+      PgStore.mesclarEstado(est.porId);
+      if (novidades.length) {
+        PgStore.registrarNovidades(novidades);
+        if (ouvinte) ouvinte(novidades);
+      }
+
+      // Id que o bloco cobriu mas o SMAX nao devolveu: existe no painel e nao
+      // volta na consulta. E leitura bem-sucedida com resposta vazia, o que
+      // normalmente significa chamado apagado ou sem permissao.
+      const cobertos = new Set(est.falhas.flatMap(x => x.ids));
+      const ausentes = ids.filter(id => !cobertos.has(id) && !est.porId[id]);
+
+      return { est, fil, son, novidades, ausentes };
+    };
+
+    /* O diff de um lote inteiro, contra o estado que esta em disco AGORA.
+     * Arquivado fica de fora: a v1.12 o esconde da lista, e avisar sobre o que
+     * nao esta na tela seria incoerente — o usuario nao teria onde olhar. */
+    const diffDoLote = (porId) => {
+      const estado = PgStore.estado().porId;
+      const arquivados = new Set(
+        PgStore.dados().globais.filter(g => g.arquivado).map(g => String(g.id))
+      );
+      const quando = Date.now();
+      const itens = [];
+      Object.entries(porId).forEach(([id, depois]) => {
+        if (arquivados.has(id)) return;
+        itens.push(...diffGlobal(id, estado[id], depois, quando));
+      });
+      // Mais relevante primeiro DENTRO da rodada: filho novo antes de "mudou
+      // alguma coisa". Entre rodadas quem ordena e a hora (a lista e empilhada).
+      itens.sort((x, y) => (TIPOS[y.tipo].peso - TIPOS[x.tipo].peso) || x.id.localeCompare(y.id));
+      return itens;
+    };
+
+    /* ---------- A rodada automatica ---------- */
+
+    const idsMonitorados = () => PgStore.dados().globais
+      .filter(g => !g.arquivado)
+      .map(g => String(g.id));
+
+    /* A sondagem: barata, e so para decidir se vale a leitura cara.
+     * Compara contra `filhosSonda` (mesma metrica, ver PgApi) e contra
+     * `atualizadoEm`. Global que nunca foi lido ENTRA na leitura completa — nao
+     * para gerar novidade (o sentinela impede), mas para a marca d'agua nascer. */
+    const rodada = async () => {
+      const ids = idsMonitorados();
+      if (!ids.length) return { pulou: 'lista vazia' };
+      const estado = PgStore.estado().porId;
+
+      const est = await PgApi.lerEstado(ids);
+      const son = await PgApi.sondarFilhos(ids);
+
+      const mexeram = ids.filter((id) => {
+        const antes = estado[id];
+        if (!antes) return true;                    // nunca lido: precisa nascer
+        const dep = est.porId[id];
+        if (!dep) return false;                     // nao voltou: nada a comparar
+        if (typeof antes.filhosSonda !== 'number') return true;
+        if (son.porPai[id] !== undefined && son.porPai[id] !== antes.filhosSonda) return true;
+        if (dep.status !== antes.status || dep.statusOp !== antes.statusOp) return true;
+        if (dep.grupo !== antes.grupo) return true;
+        return (Number(dep.atualizadoEm) || 0) > (Number(antes.atualizadoEm) || 0);
+      });
+
+      if (!mexeram.length) return { nada: true, sondados: ids.length };
+      // Leitura completa SO nos que mexeram. E aqui que o custo aparece, e e por
+      // isso que ele e pago so quando ha motivo.
+      const r = await lerTudo(mexeram);
+      return { sondados: ids.length, relidos: mexeram.length, novidades: r.novidades };
+    };
+
+    /* ---------- Agendamento ----------
+     * O tique e de 60 s, mas quem decide se a rodada acontece e a agenda
+     * compartilhada no storage do Tampermonkey (ver PgStore). Uma aba so roda se
+     * reivindicar a vez e, ao reler, confirmar que o dono e ela — e um
+     * compare-and-set pobre, e para este caso basta: o pior resultado de uma
+     * colisao e uma leitura repetida, nao dado errado. */
+    const TIQUE_MS = 60000;
+    const intervaloMs = () => Math.max(1, Number(PgStore.prefs.monitor.minutos) || 30) * 60000;
+
+    const tentar = async () => {
+      if (rodando || !PgStore.prefs.monitor.ligado) return;
+      const agora = Date.now();
+      const ag = PgStore.lerAgenda();
+
+      // Primeira vez (ou agenda apagada): nao roda agora, agenda. Rodar na hora
+      // significaria uma leitura do acervo a cada vez que o usuario abre o SMAX,
+      // que e muitas vezes por dia.
+      if (!ag.proxima) {
+        PgStore.salvarAgenda({ proxima: agora + intervaloMs(), dono: '', rodadaEm: 0 });
+        return;
+      }
+      if (agora < ag.proxima) return;
+
+      PgStore.salvarAgenda({ proxima: agora + intervaloMs(), dono: MINHA_ABA, rodadaEm: agora });
+      // Releitura: se outra aba reivindicou no mesmo tique, ela e a dona e esta
+      // aqui desiste.
+      if (PgStore.lerAgenda().dono !== MINHA_ABA) return;
+
+      rodando = true;
+      try {
+        const r = await rodada();
+        if (r && r.novidades && r.novidades.length) {
+          console.log(`[SMAX Painel] monitor: ${r.novidades.length} novidade(s) em ${r.relidos} global(is).`);
+        }
+      } catch (err) {
+        // Falha de rede nao pode matar o monitor: a proxima rodada ja esta
+        // agendada, e o painel continua dizendo a hora da ultima leitura boa.
+        console.warn('[SMAX Painel] monitor: rodada falhou:', err);
+      } finally {
+        rodando = false;
+      }
+    };
+
+    const iniciar = () => {
+      if (timer) return;
+      timer = setInterval(tentar, TIQUE_MS);
+      // Um tique logo apos o carregamento, para o caso de a agenda ja estar
+      // vencida (maquina que ficou desligada, aba reaberta de manha).
+      setTimeout(tentar, 15000);
+    };
+
+    // Chamado quando o usuario muda a configuracao: ligar tem de valer na hora, e
+    // mudar o intervalo tem de reagendar em vez de esperar o antigo vencer.
+    const reagendar = () => {
+      PgStore.salvarAgenda({ proxima: Date.now() + intervaloMs(), dono: '', rodadaEm: 0 });
+    };
+
+    return {
+      iniciar, reagendar, lerTudo, rodada, diffGlobal, TIPOS,
+      proxima: () => PgStore.lerAgenda().proxima,
+      onNovidades: (fn) => { ouvinte = fn; }
     };
   })();
 
@@ -2063,6 +2510,61 @@
 #smax-global-btn[data-aberto="true"] { display:none; }
 @keyframes smax-gl-pulse { 0%,100% { box-shadow:0 0 0 0 var(--sp-ring); } 50% { box-shadow:0 0 0 10px transparent; } }
 
+/* Selo de novidade do monitor. Fica no botao flutuante porque e o unico pedaco
+   do script que esta sempre na tela — o painel passa a maior parte do tempo
+   fechado, e novidade que so aparece depois de abrir o painel nao avisa nada.
+   Em elemento irmao e nao em ::after do proprio botao: a propriedade content nao
+   se atualiza sem reescrever a regra de CSS, e o numero muda. */
+#smax-global-selo {
+  position:fixed; right:6px; bottom:88px; z-index:1000000;
+  min-width:18px; height:18px; padding:0 5px; border-radius:9px;
+  background:var(--sp-danger); color:#fff; font-size:10.5px; font-weight:700;
+  font-family:Consolas, monospace; line-height:18px; text-align:center;
+  box-shadow:var(--sp-shadow); cursor:pointer; border:none;
+}
+#smax-global-selo[data-n="0"] { display:none; }
+/* Esconde junto com o botao: com o painel aberto a aba Novidades e que informa. */
+#smax-global-selo[data-aberto="true"] { display:none; }
+
+/* Aviso na tela. Dura 14 s e sai; o selo e que persiste. Dois canais de
+   proposito: o aviso chama a atencao de quem esta olhando o SMAX agora, o selo
+   atende quem voltou do cafe. */
+#smax-global-aviso {
+  position:fixed; right:12px; bottom:110px; z-index:1000000;
+  width:min(320px, 80vw); padding:10px 12px;
+  background:var(--sp-card-bg); color:var(--sp-text);
+  border:1px solid var(--sp-accent); border-left-width:3px;
+  border-radius:var(--sp-r-md); box-shadow:var(--sp-shadow);
+  font-size:12px; line-height:1.5; cursor:pointer;
+}
+#smax-global-aviso b { display:block; font-size:12.5px; margin-bottom:3px; }
+#smax-global-aviso ul { margin:4px 0 0; padding-left:16px; }
+#smax-global-aviso li { margin:1px 0; }
+#smax-global-aviso .smax-gl-aviso-mais { color:var(--sp-text-muted); font-size:11px; }
+
+/* Novidades */
+.smax-gl-nov { display:flex; flex-direction:column; gap:6px; }
+.smax-gl-nov-item {
+  display:grid; grid-template-columns:auto 1fr auto; align-items:start; gap:10px;
+  border:1px solid var(--sp-border); border-radius:var(--sp-r-md);
+  background:var(--sp-card-bg); padding:8px 10px;
+}
+/* Barra na lateral marca o que ainda nao foi visto. Cor de fundo inteira seria
+   forte demais numa lista que pode ter 200 linhas. */
+.smax-gl-nov-item[data-novo="true"] { border-left:3px solid var(--sp-accent); }
+.smax-gl-nov-tipo {
+  font-size:9.5px; text-transform:uppercase; letter-spacing:.4px; font-weight:600;
+  border:1px solid currentColor; border-radius:9px; padding:1px 7px; white-space:nowrap;
+}
+.smax-gl-nov-tipo[data-tipo="filhos"] { color:var(--sp-danger-text); }
+.smax-gl-nov-tipo[data-tipo="status"] { color:var(--sp-accent); }
+.smax-gl-nov-tipo[data-tipo="grupo"] { color:var(--sp-pending); }
+.smax-gl-nov-tipo[data-tipo="atualizado"] { color:var(--sp-text-muted); }
+.smax-gl-nov-tit { font-size:12.5px; color:var(--sp-text); }
+.smax-gl-nov-tit b { font-family:Consolas, monospace; }
+.smax-gl-nov-txt { font-size:11.5px; color:var(--sp-text-muted); margin-top:2px; }
+.smax-gl-nov-quando { font-size:10.5px; color:var(--sp-text-dim); white-space:nowrap; }
+
 .smax-gl-overlay {
   position:fixed; inset:0; z-index:999998; background:rgba(4,10,20,.55);
   display:flex; align-items:center; justify-content:center; padding:24px;
@@ -2472,6 +2974,7 @@
   const GlobalHUD = (() => {
     let overlay = null;
     let launcher = null;
+    let selo = null;
     let activeTab = 'painel';
     let unsubscribe = null;
     let busy = false;
@@ -2479,6 +2982,10 @@
     // nao salva nao pode morrer nesse redesenho. O token, de proposito, nao
     // sobrevive: campo de senha nunca e repreenchido.
     let urlDigitada = null;
+    // Aba em que a PROXIMA abertura deve cair. Existe para o aviso e a
+    // notificacao do monitor abrirem o painel direto nas novidades; fora disso
+    // toda abertura cai no painel, como ficou definido no pivo.
+    let abaInicial = null;
 
     const form = {
       title: prefs.lastTitle || '',
@@ -2525,6 +3032,82 @@
       launcher.title = Capture.isArmed()
         ? `SMAX Global — MODO APRENDER ativo${Capture.isDryRun() ? ' (seco: o SMAX vai acusar erro ao salvar, e nada é criado)' : ' (SEM modo seco: o chamado será criado de verdade)'}`
         : 'SMAX Global — abrir chamado global';
+      if (selo) {
+        const n = PgStore.naoVistas();
+        selo.dataset.n = String(n);
+        selo.dataset.aberto = overlay ? 'true' : 'false';
+        // 99+ e para o selo nao virar uma faixa: ele mora num botao de 40px.
+        selo.textContent = n > 99 ? '99+' : String(n);
+        selo.title = `${n} novidade(s) não vista(s) nos globais do painel — clique para abrir.`;
+      }
+    };
+
+    /* ---------- Os dois canais de aviso ----------
+     * Divisao de trabalho: o AVISO chama a atencao de quem esta olhando o SMAX
+     * agora e sai sozinho; o SELO fica e atende quem voltou depois. A
+     * notificacao do SISTEMA e o terceiro canal, opcional, para quem esta com a
+     * aba do SMAX em segundo plano — que e o caso de uso real do monitor. */
+    let avisoTimer = null;
+
+    const mostrarAviso = (itens) => {
+      if (!itens || !itens.length) return;
+      let box = document.getElementById('smax-global-aviso');
+      if (!box) {
+        box = document.createElement('div');
+        box.id = 'smax-global-aviso';
+        box.className = 'smax-gl-root';
+        box.addEventListener('click', () => {
+          box.remove();
+          abrirEm('novidades');
+        });
+        document.body.appendChild(box);
+      }
+      const tres = itens.slice(0, 3);
+      box.innerHTML = `
+        <b>🌐 ${itens.length} novidade(s) nos globais</b>
+        <ul>${tres.map(x => `<li>#${Utils.escapeHtml(x.id)} — ${Utils.escapeHtml(x.texto)}</li>`).join('')}</ul>
+        ${itens.length > tres.length
+          ? `<div class="smax-gl-aviso-mais">e mais ${itens.length - tres.length}… clique para ver a lista</div>`
+          : '<div class="smax-gl-aviso-mais">clique para ver a lista</div>'}`;
+      clearTimeout(avisoTimer);
+      // 14 s: tempo de ler tres linhas sem o aviso virar parte da tela do SMAX.
+      // Quem nao viu em 14 s ainda tem o selo, que nao expira.
+      avisoTimer = setTimeout(() => box.remove(), 14000);
+    };
+
+    const notificarSO = (titulo, texto) => {
+      if (!temNotificacao()) return;
+      try {
+        GM_notification({
+          title: titulo,
+          text: texto,
+          timeout: 15000,
+          // Clicar na notificacao traz a aba do SMAX para a frente e abre a aba
+          // Novidades — sem isso o aviso informa e deixa o usuario procurando.
+          onclick: () => {
+            try { window.focus(); } catch { /* o navegador pode recusar o foco */ }
+            abrirEm('novidades');
+          }
+        });
+      } catch (err) {
+        console.warn('[SMAX Painel] GM_notification falhou:', err);
+      }
+    };
+
+    // Chamado pelo PgMonitor ao fim de uma rodada que achou algo.
+    const aoNovidades = (itens) => {
+      syncLauncher();
+      mostrarAviso(itens);
+      if (PgStore.prefs.monitor.notificarSO) {
+        const porId = new Set(itens.map(x => x.id));
+        notificarSO(
+          `SMAX: ${itens.length} novidade(s) em ${porId.size} global(is)`,
+          itens.slice(0, 3).map(x => `#${x.id} — ${x.texto}`).join('\n')
+        );
+      }
+      // Painel aberto na aba de novidades: redesenha para a lista nao ficar velha
+      // na frente do usuario.
+      if (overlay && activeTab === 'novidades') render();
     };
 
     /* ---------- Campo: solicitado para ---------- */
@@ -3340,10 +3923,72 @@
                value="${Utils.escapeHtml(r.nota)}" placeholder="texto livre">`;
     };
 
+    /* ---------- Novidades (fase 6) ---------- */
+
+    // `GM_notification` pode nao existir: a permissao e nova na v1.15, e o
+    // Tampermonkey so a concede depois de o usuario aceitar a atualizacao do
+    // script. Antes disso a funcao simplesmente nao esta definida.
+    const temNotificacao = () => typeof GM_notification === 'function';
+
+    const proximaTexto = () => {
+      const p = PgMonitor.proxima();
+      if (!PgStore.prefs.monitor.ligado) return '<br>Monitoramento <strong>desligado</strong>.';
+      if (!p) return '<br>Primeira sondagem sendo agendada.';
+      const faltam = Math.max(0, Math.round((p - Date.now()) / 60000));
+      return `<br>Próxima sondagem ${faltam <= 0 ? 'no próximo minuto' : `em ~${faltam} min`}
+              (<strong>${Utils.escapeHtml(Utils.formatBrDateTime(p))}</strong>).`;
+    };
+
+    const renderNovidades = () => {
+      const n = PgStore.novidades();
+      const vistoEm = n.vistoEm;
+      if (!n.itens.length) {
+        return `
+          <div class="smax-gl-note">
+            Nada registrado ainda. O monitor compara cada leitura com a anterior e anota aqui o que
+            mudou nos globais não arquivados: filhos novos, troca de status, troca de grupo e
+            alteração genérica.
+            ${PgStore.prefs.monitor.ligado
+              ? proximaTexto()
+              : '<br><strong>O monitoramento está desligado</strong> — ligue em Configuração, ou use “↻ Atualizar do SMAX”, que também compara.'}
+          </div>`;
+      }
+
+      const itens = n.itens.map((x) => {
+        const t = PgMonitor.TIPOS[x.tipo] || { rot: x.tipo };
+        return `
+          <div class="smax-gl-nov-item" data-novo="${Number(x.quando) > vistoEm}">
+            <span class="smax-gl-nov-tipo" data-tipo="${Utils.escapeHtml(x.tipo)}">${Utils.escapeHtml(t.rot)}</span>
+            <div>
+              <div class="smax-gl-nov-tit"><b>#${Utils.escapeHtml(x.id)}</b> ${Utils.escapeHtml(x.titulo || '(sem título)')}</div>
+              <div class="smax-gl-nov-txt">${Utils.escapeHtml(x.texto)}</div>
+            </div>
+            <div style="display:flex; align-items:center; gap:8px;">
+              <span class="smax-gl-nov-quando">${Utils.escapeHtml(Utils.formatBrDateTime(x.quando))}</span>
+              <button class="smax-gl-btn" data-act="ver-global" data-id="${Utils.escapeHtml(x.id)}">Ver</button>
+            </div>
+          </div>`;
+      }).join('');
+
+      const naoVistas = n.itens.filter(x => Number(x.quando) > vistoEm).length;
+      return `
+        <div class="smax-gl-note">
+          O que mudou nos globais da lista desde a leitura anterior.
+          ${naoVistas ? `<strong>${naoVistas}</strong> ainda não vista(s).` : 'Todas vistas.'}
+          Guarda as ${PgStore.MAX_NOVID} mais recentes.${proximaTexto()}
+        </div>
+        <div style="display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap;">
+          <button class="smax-gl-btn" data-act="novid-vistas" ${naoVistas ? '' : 'disabled'}>Marcar todas como vistas</button>
+          <button class="smax-gl-btn smax-gl-btn-danger" data-act="novid-limpar">Limpar histórico</button>
+        </div>
+        <div class="smax-gl-nov">${itens}</div>`;
+    };
+
     const renderConfig = () => {
       const d = PgStore.dados();
       const pp = PgStore.prefs;
       const temToken = !!(pp.githubToken || '').trim();
+      const mon = pp.monitor;
 
       const eixosBlock = Dados.EIXOS.map(e => {
         const vals = Dados.lista(e.chave);
@@ -3402,6 +4047,37 @@
           <button class="smax-gl-btn smax-gl-btn-primary" data-act="publicar-git" ${temToken ? '' : 'disabled'}>
             ⬆ Publicar no GitHub
           </button>
+        </div>
+
+        <div class="smax-gl-label" style="margin-top:22px;">Monitoramento</div>
+        <div class="smax-gl-note">
+          Em segundo plano, o script sonda os globais <strong>não arquivados</strong> da lista e
+          registra o que mudou na aba <strong>Novidades</strong>. A sondagem é barata: uma consulta
+          por global, sem trazer os registros. Só quando algum número se move é que ele faz a
+          leitura completa — e apenas nos globais afetados.
+          ${proximaTexto()}
+        </div>
+        <!-- Chip, e nao caixa de marcar: o CSS do SMAX zera a aparencia de
+             input[type=checkbox] e escopar numa classe raiz nao resolve controle
+             de formulario (analise §18.2 item 32, medido no Localizador). O
+             script inteiro nao tem uma caixa de marcar por esse motivo. -->
+        <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+          <button class="smax-gl-chip" data-act="mon-ligado" data-active="${mon.ligado}">
+            ${mon.ligado ? '● Monitorando' : '○ Desligado'}
+          </button>
+          <span class="smax-gl-note" style="margin:0;">sondar a cada</span>
+          <select class="smax-gl-select" data-act="mon-minutos" style="width:auto;">
+            ${[10, 30, 60].map(m => `<option value="${m}" ${mon.minutos === m ? 'selected' : ''}>${m} minutos</option>`).join('')}
+          </select>
+          <button class="smax-gl-chip" data-act="mon-so" data-active="${mon.notificarSO}">
+            ${mon.notificarSO ? '🔔 Notifica no sistema' : '🔕 Só na página'}
+          </button>
+        </div>
+        <div class="smax-gl-note" style="margin-top:6px;">
+          O selo no botão flutuante e o aviso na tela aparecem sempre. A notificação do sistema é
+          opcional porque <strong>pode não chegar</strong>: o Assistente de Foco do Windows a
+          engole sem avisar, e aviso que às vezes não chega não serve como canal único.
+          ${temNotificacao() ? '' : '<br><strong>Indisponível neste navegador/Tampermonkey</strong> — a permissão <code>GM_notification</code> não está concedida.'}
         </div>`;
     };
 
@@ -3420,11 +4096,14 @@
       // formulario esticado de ponta a ponta vira linha de texto ilegivel.
       // Quem estreita e o CSS, por data-wide, e so o conteudo do corpo.
       const painel = overlay.querySelector('.smax-gl-panel');
-      const largas = activeTab === 'painel' || activeTab === 'graficos';
+      // Novidades entra nas largas: cada linha tem titulo de chamado, o texto do
+      // que mudou e a hora, e em 860px isso quebra em tres linhas por item.
+      const largas = activeTab === 'painel' || activeTab === 'graficos' || activeTab === 'novidades';
       if (painel) painel.dataset.wide = String(largas);
 
       body.innerHTML = activeTab === 'painel' ? renderPainel()
         : activeTab === 'graficos' ? renderGraficos()
+        : activeTab === 'novidades' ? renderNovidades()
         : activeTab === 'abrir' ? renderAbrir()
         : activeTab === 'incluir' ? renderIncluir()
         : activeTab === 'config' ? renderConfig()
@@ -3792,22 +4471,13 @@
       render();
       try {
         setStatus(`Lendo o estado de ${ids.length} global(is)…`);
-        const est = await PgApi.lerEstado(ids, (f, t) => setStatus(`Estado: bloco ${f} de ${t}…`));
-        setStatus('Contando os filhos…');
-        const fil = await PgApi.contarFilhos(ids, (f, t) => setStatus(`Filhos: bloco ${f} de ${t}…`));
-
-        // A contagem entra no mesmo registro do estado. Pai sem contagem nesta
-        // passada fica SEM a chave `filhos` — a tela mostra "nao lido", nunca 0.
-        Object.entries(est.porId).forEach(([id, e]) => {
-          if (fil.porPai[id] !== undefined) e.filhos = fil.porPai[id];
+        // A leitura mora no PgMonitor desde a fase 6, e nao aqui, porque a rodada
+        // automatica precisa dela com o painel fechado. O diff contra o estado
+        // anterior vem junto: atualizar a mao tambem produz novidade.
+        const { est, fil, novidades, ausentes } = await PgMonitor.lerTudo(ids, (etapa, f, t) => {
+          if (!t) setStatus(etapa === 'estado' ? 'Lendo o estado…' : 'Contando os filhos…');
+          else setStatus(`${etapa === 'estado' ? 'Estado' : 'Filhos'}: bloco ${f} de ${t}…`);
         });
-        PgStore.mesclarEstado(est.porId);
-
-        // Id que o bloco cobriu mas o SMAX nao devolveu: existe no painel e nao
-        // volta na consulta. E leitura bem-sucedida com resposta vazia, o que
-        // normalmente significa chamado apagado ou sem permissao.
-        const cobertos = new Set(est.falhas.flatMap(x => x.ids));
-        const ausentes = ids.filter(id => !cobertos.has(id) && !est.porId[id]);
 
         const avisos = [];
         if (est.falhas.length) {
@@ -3823,10 +4493,13 @@
         }
         if (ausentes.length) avisos.push(`${ausentes.length} não voltaram do SMAX (apagados ou sem permissão): ${ausentes.slice(0, 5).join(', ')}`);
 
+        const nov = novidades.length
+          ? ` ${novidades.length} novidade(s) — veja a aba Novidades.`
+          : '';
         setStatus(
           avisos.length
-            ? `Atualizado com ressalva — ${avisos.join('; ')}.`
-            : `Atualizado: ${Object.keys(est.porId).length} global(is) lido(s).`,
+            ? `Atualizado com ressalva — ${avisos.join('; ')}.${nov}`
+            : `Atualizado: ${Object.keys(est.porId).length} global(is) lido(s).${nov}`,
           avisos.length ? 'err' : 'ok'
         );
       } catch (err) {
@@ -4258,7 +4931,16 @@
       wireRedim();
       overlay.addEventListener('click', (ev) => {
         const tab = ev.target.closest('.smax-gl-tab');
-        if (tab) { readForm(); activeTab = tab.dataset.tab; render(); return; }
+        if (tab) {
+          readForm();
+          activeTab = tab.dataset.tab;
+          render();
+          /* Abrir a aba limpa o selo — DEPOIS do render, de proposito: assim a
+             tela que o usuario acabou de ver ainda destaca o que era novo, e o
+             selo nao fica aceso em cima de novidade ja lida. */
+          if (activeTab === 'novidades') { PgStore.marcarNovidadesVistas(); syncLauncher(); }
+          return;
+        }
 
         const col = ev.target.closest('th[data-ordem]');
         if (col) {
@@ -4420,6 +5102,49 @@
         }
         else if (act === 'arquivar-encerrados') { arquivarEncerrados(); }
         else if (act === 'larguras-padrao') { larguraPadrao(); }
+        else if (act === 'novid-vistas') {
+          PgStore.marcarNovidadesVistas();
+          syncLauncher();
+          render();
+        }
+        else if (act === 'novid-limpar') {
+          if (!confirm('Apagar o histórico de novidades? As marcas d\'água da comparação não são afetadas — o monitor continua achando o que mudar daqui para frente.')) return;
+          PgStore.limparNovidades();
+          syncLauncher();
+          render();
+          setStatus('Histórico de novidades apagado.');
+        }
+        else if (act === 'mon-ligado') {
+          const m = PgStore.prefs.monitor;
+          m.ligado = !m.ligado;
+          PgStore.salvarPrefs();
+          // Reagenda em vez de esperar: ligar o monitor e ver "próxima sondagem
+          // em ~28 min" (sobra da agenda antiga) parece que nao funcionou.
+          PgMonitor.reagendar();
+          render();
+          setStatus(m.ligado
+            ? `Monitoramento ligado — primeira sondagem em ${m.minutos} min.`
+            : 'Monitoramento desligado. O “↻ Atualizar do SMAX” continua comparando.');
+        }
+        else if (act === 'mon-so') {
+          const m = PgStore.prefs.monitor;
+          if (!m.notificarSO && !temNotificacao()) {
+            setStatus('O Tampermonkey não concedeu GM_notification a esta versão do script. Aceite a atualização e recarregue a página.', 'err');
+            return;
+          }
+          m.notificarSO = !m.notificarSO;
+          PgStore.salvarPrefs();
+          render();
+          if (m.notificarSO) {
+            // Notificacao de teste na hora de ligar: e o unico jeito de o usuario
+            // descobrir AGORA que o Windows esta engolindo a notificacao, em vez
+            // de descobrir dentro de uma semana ao perceber que nunca chegou uma.
+            notificarSO('SMAX Painel de Globais', 'Notificação de teste — se você está vendo isto, o canal funciona.');
+            setStatus('Notificação de teste enviada. Se ela não apareceu, o Windows está bloqueando (Assistente de Foco).');
+          } else {
+            setStatus('Notificação do sistema desligada. O selo e o aviso na tela continuam.');
+          }
+        }
         else if (act === 'arquivar' || act === 'desarquivar') {
           const id = ev.target.closest('[data-id]').dataset.id;
           const r = Dados.arquivar(id, act === 'arquivar');
@@ -4543,6 +5268,13 @@
           PgStore.salvarPrefs();
           render();
         }
+        if (ev.target.dataset && ev.target.dataset.act === 'mon-minutos') {
+          PgStore.prefs.monitor.minutos = Number(ev.target.value);
+          PgStore.salvarPrefs();
+          PgMonitor.reagendar();
+          render();
+          setStatus(`Sondagem a cada ${PgStore.prefs.monitor.minutos} minutos.`);
+        }
       });
 
       overlay.addEventListener('input', (ev) => {
@@ -4617,6 +5349,7 @@
           <div class="smax-gl-tabs">
             <button class="smax-gl-tab" data-tab="painel">Painel</button>
             <button class="smax-gl-tab" data-tab="graficos">Gráficos</button>
+            <button class="smax-gl-tab" data-tab="novidades">Novidades</button>
             <button class="smax-gl-tab" data-tab="abrir">Abrir chamado</button>
             <button class="smax-gl-tab" data-tab="incluir">Incluir global</button>
             <button class="smax-gl-tab" data-tab="aprender">Aprender molde</button>
@@ -4644,9 +5377,25 @@
 
       // Depois do pivo a casa e o painel: toda abertura cai na lista de globais.
       // Antes caia em 'abrir'/'aprender' e o painel so aparecia se clicassem na aba.
-      activeTab = 'painel';
+      activeTab = abaInicial || 'painel';
+      abaInicial = null;
       ThemeManager.apply(ThemeManager.current());
       render();
+      if (activeTab === 'novidades') { PgStore.marcarNovidadesVistas(); syncLauncher(); }
+    };
+
+    /* Abre o painel JA numa aba. Nao da para usar o `open()` direto: ele e um
+     * alterna — com o painel aberto, chamar `open()` o FECHARIA, e o usuario que
+     * clicou num aviso de novidade veria o painel desaparecer. */
+    const abrirEm = (aba) => {
+      if (overlay) {
+        activeTab = aba;
+        render();
+        if (aba === 'novidades') { PgStore.marcarNovidadesVistas(); syncLauncher(); }
+        return;
+      }
+      abaInicial = aba;
+      open();
     };
 
     const init = () => {
@@ -4655,13 +5404,27 @@
       launcher.id = 'smax-global-btn';
       launcher.className = 'smax-gl-root';
       launcher.textContent = '🌐';
-      launcher.addEventListener('click', open);
+      // Fechado numa arrow: `open` recebe argumento desde a fase 6 e passar o
+      // evento de clique no lugar da aba daria uma aba chamada "[object
+      // PointerEvent]" — tela em branco, sem erro no console.
+      launcher.addEventListener('click', () => open());
       document.body.appendChild(launcher);
+
+      // Selo de novidade, irmao do botao: quem avisa com o painel fechado.
+      selo = document.createElement('button');
+      selo.id = 'smax-global-selo';
+      selo.className = 'smax-gl-root';
+      selo.dataset.n = '0';
+      selo.addEventListener('click', () => abrirEm('novidades'));
+      document.body.appendChild(selo);
+
       syncLauncher();
       Capture.onChange(syncLauncher);
+      PgMonitor.onNovidades(aoNovidades);
+      PgMonitor.iniciar();
     };
 
-    return { init, open };
+    return { init, open, abrirEm };
   })();
 
   /* =========================================================

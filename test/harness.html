@@ -283,6 +283,82 @@
 </div>
 
 <div class="card">
+  <strong>v1.15 — Monitoramento (fase 6).</strong><br>
+  O monitor sonda os globais não arquivados a cada 30&nbsp;min (configurável em <em>Config</em>:
+  10/30/60), compara com o que estava gravado e registra o que mudou na aba <em>Novidades</em>.
+  Quatro gatilhos: filhos (a mais <em>e</em> a menos), status, grupo, e um genérico
+  "mudou alguma coisa" quando só o <code>LastUpdateTime</code> cresceu.
+  <div style="margin-top:10px;">
+    <button onclick="envelhecerEstado()">Plantar mudanças (um tipo por global)</button>
+    <button onclick="envelhecerSoHora()">Plantar só "mudou alguma coisa"</button>
+    <button onclick="zerarMonitor()">Zerar novidades e agenda</button>
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>A primeira rodada tem de ser silenciosa.</strong> Limpe o storage, abra o painel e clique
+    em <em>Atualizar do SMAX</em>: o selo no botão flutuante <em>não</em> pode aparecer e a aba
+    <em>Novidades</em> tem de dizer que não há nada. Sem a sentinela de primeira execução, cada
+    global anunciaria "+N filhos" na estreia — e um deles tem 605 filhos no mock.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Mudança plantada.</strong> Depois de uma leitura, clique em
+    <em>Plantar mudanças</em>: ele dá um papel a cada global não arquivado (status, grupo, filhos),
+    escreve no log qual foi para qual, e recarrega — a releitura do storage só acontece no
+    carregamento da página, então sem o reload a próxima gravação sobrescreveria o que foi
+    plantado e o teste daria falso negativo. Clique em <em>Atualizar do SMAX</em>: tem de sair
+    <strong>exatamente uma</strong> linha por global plantado, do tipo que o log anunciou, e
+    <strong>nenhuma</strong> linha "alguma alteração" — essa só sai quando nenhuma específica saiu,
+    e é o que o outro botão testa (com ele, três linhas genéricas e mais nada).
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Arquivado não notifica.</strong> Arquive um global, envelheça o estado e atualize: ele
+    não pode aparecer em <em>Novidades</em>. Arquivar é a forma de dizer "não quero mais saber
+    deste"; se ele continuasse avisando, o selo viraria ruído e deixaria de ser lido.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Duas abas, uma rodada.</strong> Abra este harness em duas abas. A agenda mora no
+    storage do Tampermonkey, que é comum às abas, e a dona é escolhida por
+    <em>compare-and-set</em>: no log do servidor tem de aparecer <strong>um</strong> conjunto de
+    sondagens por intervalo, não dois. Recarregar a página também não pode reiniciar a contagem —
+    o SMAX recarrega a página em cada navegação, e com <code>setInterval</code> por aba o monitor
+    nunca chegaria aos 30&nbsp;min.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>A sondagem é barata; a releitura, não.</strong> Uma rodada pede
+    <code>size=1&amp;meta=totalCount</code> por global — sem trazer registro — e só pagina de 250 em
+    250 nos globais que se moveram. No log do servidor a ordem tem de ser: uma consulta em lote do
+    estado, depois <code>size=1 → 1/600</code> uma vez por global, e só então a paginação. O número
+    de globais paginados tem de bater com o que o botão de plantar anunciou no log; plante em
+    <em>um</em> global só (mexendo no storage à mão) e a paginação tem de aparecer para um, não
+    para três. No SMAX real cada global grande custa 11 requisições — é esse o gasto que a
+    sondagem evita.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>O número do selo não é o número da tela.</strong> O contador que o monitor compara
+    (<code>filhosSonda</code>, o <code>total_count</code> do SMAX) é marca d'água interna e nunca
+    aparece na tabela: ele pode diferir em 1 da contagem exibida, porque a enumeração desconta a
+    autorreferência do global e o <code>total_count</code> não. Dois números diferentes na tela
+    para a mesma coisa seria pior do que um só.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Notificação do sistema.</strong> O selo e o aviso na tela funcionam sempre; a
+    notificação do SO é opt-in em <em>Config</em>. Aqui ela é um stub que escreve no log — ligar o
+    botão tem de produzir uma linha de teste imediata. Em ambiente sem
+    <code>GM_notification</code> o botão recusa em vez de ligar em falso.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Nota sobre a verificação.</strong> Em 2026-10-09 tudo acima foi conferido neste harness,
+    inclusive a rodada automática (agenda forçada para o passado) e as duas abas — o log do mock
+    mostrou <em>uma</em> leitura em lote e <em>quatro</em> sondagens, não oito. Dois números que
+    valem guardar: o global 82140011 fecha com <code>filhos=1</code> e
+    <code>filhosSonda=2</code> (a autorreferência, descontada só na enumeração), o que é exatamente
+    a divergência de 1 que justifica a marca d'água não aparecer na tela; e a primeira rodada com
+    605 filhos no acervo produziu <strong>zero</strong> novidades. O que <em>não</em> dá para
+    conferir aqui é a notificação do SO de verdade — o stub prova a chamada, não a entrega pelo
+    Windows.
+  </div>
+</div>
+
+<div class="card">
   <strong>3.</strong> Use o candidato como molde, volte em <em>Abrir chamado</em>, preencha e clique em <em>Ver payload</em>.
   Confira se <code>DisplayLabel</code>, <code>Description</code>, <code>Urgency</code> e <code>ImpactScope</code> foram sobrescritos
   e se <code>Id</code>/<code>CreateTime</code>/<code>Comments</code> sumiram.
@@ -310,6 +386,89 @@
     log(`GM_addStyle → ${css.length} chars`, 'ok');
   };
   window.unsafeWindow = window;
+
+  /* GM_notification stub. Existe de proposito: o script checa
+     `typeof GM_notification === 'function'` para decidir se OFERECE a opcao, e
+     sem o stub o caminho da notificacao do SO ficaria sem teste nenhum. O
+     `onclick` e exercitado por um link no log, que e o que a notificacao real
+     faz — abrir o painel na aba Novidades. */
+  window.GM_notification = (opts) => {
+    log(`GM_notification → "${opts.title}": ${opts.text}`, 'ok');
+    if (typeof opts.onclick === 'function') window.__ultimoClickNotificacao = opts.onclick;
+  };
+
+  /* Envelhece o estado gravado para plantar uma mudanca sem ter de mexer no
+     mock. Recarrega no fim porque o PgStore le o storage UMA vez, no
+     carregamento da pagina: sem o reload, a proxima gravacao sobrescreveria
+     esta alteracao com a copia em memoria e o teste daria falso negativo. */
+  function lerEstadoGravado() {
+    const obj = JSON.parse(localStorage.getItem('gm:smax_pg_estado') || 'null');
+    const ids = obj && obj.porId ? Object.keys(obj.porId).sort() : [];
+    if (!ids.length) {
+      log('Sem estado gravado — clique em "Atualizar do SMAX" uma vez antes de envelhecer.', 'err');
+      return null;
+    }
+    const dados = JSON.parse(localStorage.getItem('gm:smax_pg_dados') || 'null');
+    const arquivados = new Set(((dados && dados.globais) || []).filter(g => g.arquivado).map(g => String(g.id)));
+    return { obj, ids, arquivados };
+  }
+
+  function gravarEstadoEnvelhecido(obj, msg) {
+    localStorage.setItem('gm:smax_pg_estado', JSON.stringify(obj));
+    log(msg + '; recarregando…', 'warn');
+    setTimeout(() => location.reload(), 400);
+  }
+
+  function envelhecerEstado() {
+    const ctx = lerEstadoGravado();
+    if (!ctx) return;
+    const { obj, ids, arquivados } = ctx;
+    // Um papel por global, para cada tipo de novidade sair em separado: misturar
+    // dois gatilhos no mesmo global esconderia um dos dois (o generico so sai
+    // quando nenhum especifico saiu).
+    const papeis = ['status', 'grupo', 'filhos'];
+    let i = 0;
+    const plantados = [];
+    ids.forEach((id) => {
+      const e = obj.porId[id];
+      e.atualizadoEm = Math.max(0, (Number(e.atualizadoEm) || Date.now()) - 3600000);
+      // Arquivado leva o contador mexido de proposito: e isso que prova que o
+      // filtro de arquivados funciona — ele TERIA novidade e nao aparece.
+      if (arquivados.has(id)) {
+        if (typeof e.filhosSonda === 'number') e.filhosSonda = Math.max(0, e.filhosSonda - 2);
+        plantados.push(`${id}: filhos (arquivado — NAO deve aparecer)`);
+        return;
+      }
+      const papel = papeis[i++ % papeis.length];
+      if (papel === 'status') { e.status = 'RequestStatusNew'; e.statusOp = 'Triagem_c'; }
+      if (papel === 'grupo') e.grupo = 'GRUPO ANTIGO (plantado pelo harness)';
+      if (papel === 'filhos' && typeof e.filhosSonda === 'number') e.filhosSonda = Math.max(0, e.filhosSonda - 2);
+      plantados.push(`${id}: ${papel}`);
+    });
+    plantados.forEach(p => log('plantado — ' + p, 'warn'));
+    gravarEstadoEnvelhecido(obj, `${ids.length} global(is) envelhecido(s)`);
+  }
+
+  /* Só o carimbo de hora. Exercita o gatilho generico, que por definicao nao
+     pode ser testado junto com os outros: ele sai apenas quando nenhum item
+     especifico saiu. */
+  function envelhecerSoHora() {
+    const ctx = lerEstadoGravado();
+    if (!ctx) return;
+    const { obj, ids, arquivados } = ctx;
+    ids.filter(id => !arquivados.has(id)).forEach((id) => {
+      const e = obj.porId[id];
+      e.atualizadoEm = Math.max(0, (Number(e.atualizadoEm) || Date.now()) - 3600000);
+    });
+    gravarEstadoEnvelhecido(obj, 'só o LastUpdateTime recuado');
+  }
+
+  function zerarMonitor() {
+    localStorage.removeItem('gm:smax_pg_novidades');
+    localStorage.removeItem('gm:smax_pg_monitor');
+    log('novidades e agenda zeradas; recarregando…', 'warn');
+    setTimeout(() => location.reload(), 400);
+  }
 
   /* GM_xmlhttpRequest redirecionado para o GitHub falso do servidor local.
      O script so deve falar com api.github.com e raw.githubusercontent.com;

@@ -68,6 +68,33 @@
 </div>
 
 <div class="card">
+  <strong>Fase 3 — Painel.</strong><br>
+  Inclua <code>82133910 82140011 82210088 82200077</code> e, na aba <em>Painel</em>, clique em
+  <em>Atualizar do SMAX</em>. O que tem de aparecer:
+  <table style="margin-top:10px; font-size:12.5px; border-collapse:collapse;">
+    <tr><td style="padding:2px 10px 2px 0;"><code>82133910</code></td><td><strong>3</strong> filhos</td></tr>
+    <tr><td style="padding:2px 10px 2px 0;"><code>82140011</code></td><td><strong>1</strong> filho — o <code>GlobalId_c</code> dele aponta para si mesmo e <strong>não</strong> pode entrar na conta</td></tr>
+    <tr><td style="padding:2px 10px 2px 0;"><code>82210088</code></td><td><strong>600</strong> filhos — passa da página de 250 e exercita a paginação; se vier 250, a paginação está quebrada</td></tr>
+    <tr><td style="padding:2px 10px 2px 0;"><code>82200077</code></td><td><strong>não entra</strong> — a conferência recusa por não estar marcado como “É global”. Só os outros três chegam ao painel</td></tr>
+  </table>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    Antes de atualizar, repare que as três colunas de estado e a de filhos dizem
+    <strong>não lido</strong>, nunca zero. Repita a inclusão com <code>82133910</code> no meio: tem
+    de ser recusado como <strong>repetido</strong>, sem ir à rede.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Falha de leitura isolada.</strong> Inclua também <code>82190066</code>, para o qual o
+    servidor responde o teto de 10.000, e atualize de novo. Ele tem de ficar <em>não lido</em> em
+    todas as colunas — um global que estoura o teto tem <em>muitos</em> filhos, não nenhum. E os
+    outros três têm de continuar atualizando, com horário novo na coluna LIDO: a consulta falha
+    para o bloco inteiro, então o script parte o bloco ao meio até isolar o culpado. Se os quatro
+    congelarem no horário antigo, a quebra em partes regrediu. O rodapé tem de dizer
+    <strong>1</strong> não relido, batendo com o cartão — se disser 4, a contagem voltou a ser por
+    bloco. Com <code>82170044</code> (sempre 500) vale o mesmo roteiro.
+  </div>
+</div>
+
+<div class="card">
   <strong>3.</strong> Use o candidato como molde, volte em <em>Abrir chamado</em>, preencha e clique em <em>Ver payload</em>.
   Confira se <code>DisplayLabel</code>, <code>Description</code>, <code>Urgency</code> e <code>ImpactScope</code> foram sobrescritos
   e se <code>Id</code>/<code>CreateTime</code>/<code>Comments</code> sumiram.

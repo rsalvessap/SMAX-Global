@@ -22,6 +22,59 @@ const PEOPLE = [
   { Id: '22222',    Name: 'BELTRANO DA SILVA',                      Upn: 'beltrano@tjsp.jus.br' },
 ];
 
+// Chamados fake. Os dois primeiros sao globais de verdade; o resto existe para
+// forcar cada desfecho possivel da conferencia e da leitura em lote.
+//   pai = valor de GlobalId_c. `relOnly` manda o campo so em related_properties,
+//   que e como o SMAX devolve em parte dos casos.
+const ID_ERRO_LEITURA = '82170044';   // responde 500 sempre
+const ID_TETO = '82190066';           // faz a consulta em lote ser recusada pelo teto
+
+const REQUESTS = [
+  { Id: '82133910', IsGlobal_c: 'true', DisplayLabel: 'GLOBAL — eproc 1o grau fora do ar', Status: 'InProgress', StatusSCCDSMAX_c: 'EmAtendimento_c', grupo: 'SUPORTE EPROC', CreateTime: 1757000000000, LastUpdateTime: 1758900000000 },
+  // GlobalId_c apontando para si mesmo, e so em related_properties: o SMAX faz
+  // isso em global de verdade, e nem a conferencia nem a contagem podem ler como filho.
+  { Id: '82140011', IsGlobal_c: true, DisplayLabel: 'GLOBAL — custas indevidas', Status: 'Ready', StatusSCCDSMAX_c: 'Aguardando_c', grupo: 'SUPORTE CUSTAS', CreateTime: 1757100000000, LastUpdateTime: 1758910000000, pai: '82140011', relOnly: true },
+  { Id: '82150022', IsGlobal_c: 'false', DisplayLabel: 'Chamado comum de usuario', Status: 'Ready', grupo: 'ATENDIMENTO', CreateTime: 1757200000000, LastUpdateTime: 1758920000000 },
+  { Id: '82160033', IsGlobal_c: 'false', DisplayLabel: 'Filho do global', Status: 'Ready', grupo: 'ATENDIMENTO', CreateTime: 1757300000000, LastUpdateTime: 1758930000000, pai: '82133910', relOnly: true },
+  // Mais filhos, para a contagem dar numero diferente por pai (3 e 1).
+  { Id: '82160034', IsGlobal_c: 'false', DisplayLabel: 'Filho 2', Status: 'Ready', grupo: 'ATENDIMENTO', pai: '82133910' },
+  { Id: '82160035', IsGlobal_c: 'false', DisplayLabel: 'Filho 3', Status: 'Ready', grupo: 'ATENDIMENTO', pai: '82133910', relOnly: true },
+  { Id: '82160036', IsGlobal_c: 'false', DisplayLabel: 'Filho de outro global', Status: 'Ready', grupo: 'ATENDIMENTO', pai: '82140011' },
+  // Marcado no painel mas desmarcado no SMAX: o painel tem de avisar.
+  { Id: '82200077', IsGlobal_c: 'false', DisplayLabel: 'Era global e alguem desmarcou', Status: 'Complete', StatusSCCDSMAX_c: 'Concluido_c', grupo: 'SUPORTE EPROC', CreateTime: 1757400000000, LastUpdateTime: 1758940000000 },
+  // Global valido na leitura individual (da para incluir), mas qualquer consulta
+  // em lote que o cite e recusada pelo teto de 10.000 — e assim que se testa o
+  // bloco que fica sem leitura no painel.
+  { Id: ID_TETO, IsGlobal_c: 'true', DisplayLabel: 'GLOBAL — consulta estoura o teto', Status: 'InProgress', grupo: 'SUPORTE EPROC', CreateTime: 1757600000000, LastUpdateTime: 1758960000000 }
+];
+
+// Um global com 600 filhos: passa da pagina de 250 do script e por isso exercita
+// o laco de paginacao. Sem ele, um lote truncado passaria batido no teste.
+const ID_MUITOS = '82210088';
+REQUESTS.push({ Id: ID_MUITOS, IsGlobal_c: 'true', DisplayLabel: 'GLOBAL — migracao de base (muitos filhos)', Status: 'InProgress', StatusSCCDSMAX_c: 'EmAtendimento_c', grupo: 'SUPORTE MIGRACAO', CreateTime: 1757500000000, LastUpdateTime: 1758950000000 });
+for (let i = 0; i < 600; i++) {
+  REQUESTS.push({
+    Id: String(83000000 + i), IsGlobal_c: 'false', DisplayLabel: `Filho em massa ${i + 1}`,
+    Status: 'Ready', grupo: 'ATENDIMENTO', pai: ID_MUITOS, relOnly: i % 2 === 0
+  });
+}
+
+const entidadeDe = (r) => {
+  const props = {
+    Id: r.Id, DisplayLabel: r.DisplayLabel, IsGlobal_c: r.IsGlobal_c,
+    Status: r.Status || '', StatusSCCDSMAX_c: r.StatusSCCDSMAX_c || '',
+    PhaseId: r.PhaseId || '', AssignedToGroup: r.grupo ? '44444' : '',
+    CreateTime: r.CreateTime || 0, LastUpdateTime: r.LastUpdateTime || 0
+  };
+  const rel = {};
+  if (r.grupo) rel.AssignedToGroup = { Id: '44444', Name: r.grupo };
+  if (r.pai) {
+    if (r.relOnly) rel.GlobalId_c = { Id: r.pai };
+    else props.GlobalId_c = { Id: r.pai };
+  }
+  return { entity_type: 'Request', properties: props, related_properties: rel };
+};
+
 // Reproduz o range de prefixo que o script usa (o SMAX nao aceita LIKE em Person).
 const queryPeople = (filter) => {
   const byId = /Id\s*=\s*'([^']*)'/.exec(filter || '');
@@ -107,22 +160,64 @@ http.createServer(async (req, res) => {
   if (umRequest && req.method === 'GET') {
     const id = umRequest[1];
     console.log(`[mock] GET ems/Request/${id}`);
-    const resp = (props, rel) => {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        meta: { completion_status: 'OK' },
-        entities: [{ entity_type: 'Request', properties: props, related_properties: rel || {} }]
-      }));
+    if (id === ID_ERRO_LEITURA) { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end('{"meta":{"completion_status":"FAILED"}}'); return; }
+    const reg = REQUESTS.find(r => r.Id === id);
+    if (!reg) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end('{"meta":{"completion_status":"FAILED"},"error":{"message":"not found"}}');
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ meta: { completion_status: 'OK' }, entities: [entidadeDe(reg)] }));
+    return;
+  }
+
+  // Consulta em lote: estado dos globais (filter por Id) e contagem de filhos
+  // (filter por GlobalId_c). Honra skip/size para exercitar a paginacao — sem
+  // ela um lote truncado viraria um numero menor exibido como se fosse fato.
+  if (/^\/rest\/\d+\/ems\/Request$/i.test(url) && req.method === 'GET') {
+    const qs = new URL(req.url, 'http://x').searchParams;
+    const filter = qs.get('filter') || '';
+    const size = Math.max(1, Number(qs.get('size')) || 100);
+    const skip = Math.max(0, Number(qs.get('skip')) || 0);
+
+    // Atalho do harness: se a cadeia contem o id de teto, responde como o SMAX
+    // responde ao passar de 10.000 entidades.
+    if (filter.includes(ID_TETO)) {
+      console.log('[mock] GET ems/Request → recusado por teto de 10.000');
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ meta: { completion_status: 'FAILED' }, error: { messageKey: 'query.num.of.entities.exceeded', message: 'too many' } }));
+      return;
+    }
+    if (filter.includes(ID_ERRO_LEITURA)) {
+      console.log('[mock] GET ems/Request → 500 proposital');
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end('{"meta":{"completion_status":"FAILED"}}');
+      return;
+    }
+
+    const valores = (campo) => {
+      const re = new RegExp(`${campo}\\s*=\\s*'([^']*)'`, 'g');
+      const out = [];
+      let m;
+      while ((m = re.exec(filter))) out.push(m[1]);
+      return out;
     };
-    if (id === '82133910') return resp({ Id: id, IsGlobal_c: 'true', GlobalId_c: null, DisplayLabel: 'GLOBAL — eproc 1o grau fora do ar' });
-    // GlobalId_c apontando para si mesmo, e so em related_properties: o SMAX faz
-    // isso em global de verdade, e o script nao pode ler como "e filho".
-    if (id === '82140011') return resp({ Id: id, IsGlobal_c: true, DisplayLabel: 'GLOBAL — custas indevidas' }, { GlobalId_c: { Id: id } });
-    if (id === '82150022') return resp({ Id: id, IsGlobal_c: 'false', DisplayLabel: 'Chamado comum de usuario' });
-    if (id === '82160033') return resp({ Id: id, IsGlobal_c: 'false', DisplayLabel: 'Filho do global' }, { GlobalId_c: { Id: '82133910' } });
-    if (id === '82170044') { res.writeHead(500, { 'Content-Type': 'application/json' }); res.end('{"meta":{"completion_status":"FAILED"}}'); return; }
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end('{"meta":{"completion_status":"FAILED"},"error":{"message":"not found"}}');
+    // "GlobalId_c" nao casa com o padrao de "Id" porque depois de Id vem "_c".
+    const porId = valores('Id');
+    const porPai = valores('GlobalId_c');
+
+    let hits = [];
+    if (porPai.length) hits = REQUESTS.filter(r => r.pai && porPai.includes(r.pai));
+    else if (porId.length) hits = REQUESTS.filter(r => porId.includes(r.Id));
+
+    const pagina = hits.slice(skip, skip + size);
+    console.log(`[mock] GET ems/Request ids=${porId.length} pais=${porPai.length} skip=${skip} size=${size} → ${pagina.length}/${hits.length}`);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      meta: { completion_status: 'OK', total_count: hits.length },
+      entities: pagina.map(entidadeDe)
+    }));
     return;
   }
 

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SMAX Painel de Globais - TJSP
 // @namespace    https://github.com/rsalvessap/SMAX-Global
-// @version      1.7
+// @version      1.8
 // @description  Painel de gestao de chamados globais do SMAX TJSP — lista curada, classificacao por assunto/base/competencia, sincronizacao por arquivo no GitHub e abertura automatizada de global por molde
 // @author       rsalvessap
 // @match        https://suporte.tjsp.jus.br/saw/*
@@ -26,7 +26,7 @@
   if (window.top && window.top !== window.self) return;
   if (window.location.hostname !== 'suporte.tjsp.jus.br') return;
 
-  const SMAX_GLOBAL_VERSION = '1.7';
+  const SMAX_GLOBAL_VERSION = '1.8';
 
   // O userscript roda em sandbox; quem dispara as requisicoes e a pagina.
   const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
@@ -113,6 +113,7 @@
   const PgStore = (() => {
     const K_DADOS = 'smax_pg_dados';
     const K_PREFS = 'smax_pg_prefs';
+    const K_ESTADO = 'smax_pg_estado';
     const SCHEMA = 1;
 
     const dadosVazio = () => ({
@@ -125,7 +126,11 @@
 
     const prefsDefaults = {
       arquivoUrl: 'https://raw.githubusercontent.com/rsalvessap/SMAX-TOOLS/master/painel-globais.json',
-      githubToken: ''
+      githubToken: '',
+      // Ultimos filtros do painel. Ficam aqui, e nao em smax_pg_dados, porque sao
+      // escolha desta maquina — nao entram no arquivo publicado.
+      filtros: { assunto: [], base: [], competencia: [], status: '', termo: '', verArquivados: false },
+      ordem: 'filhos'
     };
 
     const saneaValores = (arr) => Array.isArray(arr)
@@ -180,6 +185,12 @@
     } catch (err) {
       console.warn('[SMAX Painel] smax_pg_prefs ilegivel:', err);
     }
+    // Prefs gravada por versao anterior nao tem `filtros`, e o Object.assign
+    // acima substitui o objeto inteiro em vez de completar os campos faltantes.
+    pgPrefs.filtros = { ...prefsDefaults.filtros, ...(pgPrefs.filtros || {}) };
+    ['assunto', 'base', 'competencia'].forEach((k) => {
+      if (!Array.isArray(pgPrefs.filtros[k])) pgPrefs.filtros[k] = [];
+    });
 
     const salvarDados = () => {
       try { GM_setValue(K_DADOS, JSON.stringify(dados)); }
@@ -193,11 +204,42 @@
 
     const substituirDados = (novo) => { dados = sanear(novo); salvarDados(); };
 
+    /* ----- Cache do que foi lido do SMAX -----
+       Descartavel: nada aqui entra no arquivo publicado. Mas tem de ser
+       PERSISTIDO, nao ficar em memoria: o SMAX recarrega a pagina ao navegar
+       entre telas, e cache em memoria seria perdido a cada clique do usuario na
+       interface do SMAX. Foi essa armadilha que custou a v1.1 do abridor.
+       Forma: { porId: { "82133910": { lidoEm, Status, ..., filhos } }, lidoEm } */
+    let estado = { porId: {}, lidoEm: 0 };
+    try {
+      const raw = GM_getValue(K_ESTADO);
+      const obj = raw ? JSON.parse(raw) : null;
+      if (obj && obj.porId && typeof obj.porId === 'object') {
+        estado = { porId: obj.porId, lidoEm: Number(obj.lidoEm) || 0 };
+      }
+    } catch (err) {
+      console.warn('[SMAX Painel] smax_pg_estado ilegivel, comecando sem cache:', err);
+    }
+
+    const salvarEstado = () => {
+      try { GM_setValue(K_ESTADO, JSON.stringify(estado)); }
+      catch (err) { console.warn('[SMAX Painel] falha ao gravar smax_pg_estado:', err); }
+    };
+
+    // Grava apenas os ids que a leitura cobriu. Id ausente do lote continua com o
+    // que tinha — apagar aqui transformaria "nao relido agora" em "sem dado".
+    const mesclarEstado = (porId) => {
+      Object.assign(estado.porId, porId);
+      estado.lidoEm = Date.now();
+      salvarEstado();
+    };
+
     return {
       SCHEMA,
       dados: () => dados,
       prefs: pgPrefs,
-      sanear, salvarDados, salvarPrefs, substituirDados
+      estado: () => estado,
+      sanear, salvarDados, salvarPrefs, substituirDados, mesclarEstado
     };
   })();
 
@@ -310,10 +352,110 @@
       return { ok: true, msg: `#${sid} incluído.` };
     };
 
+    const arquivar = (id, valor) => {
+      const g = acharGlobal(id);
+      if (!g) return { ok: false, msg: 'Global não está no painel.' };
+      g.arquivado = valor === true;
+      PgStore.salvarDados();
+      return { ok: true, msg: g.arquivado ? `#${g.id} arquivado.` : `#${g.id} reaberto no painel.` };
+    };
+
+    // Remover apaga o historico do global; arquivar e o caminho normal.
+    const removerGlobal = (id) => {
+      const d = PgStore.dados();
+      const antes = d.globais.length;
+      d.globais = d.globais.filter(g => g.id !== String(id));
+      if (d.globais.length === antes) return { ok: false, msg: 'Global não está no painel.' };
+      PgStore.salvarDados();
+      return { ok: true, msg: `#${id} removido do painel.` };
+    };
+
     return {
       EIXOS, chaveComparacao, lista, nomeDe, criarValor, renomearValor, removerValor, contarUsos,
-      acharGlobal, incluir
+      acharGlobal, incluir, arquivar, removerGlobal
     };
+  })();
+
+  /* =========================================================
+   * Metrica — lista curada + estado lido  ->  numeros
+   *
+   * A regra de contagem vive aqui, num lugar so. O ponto nao negociavel:
+   * chamado que nao foi lido NAO e zero. `filhos: null` significa "nao lido" e a
+   * tela tem de mostrar isso como tal — um painel que exibe numero e o pior
+   * lugar possivel para confundir falha de leitura com ausencia de dado.
+   * =======================================================*/
+  const Metrica = (() => {
+    const linhaDe = (g) => {
+      const e = PgStore.estado().porId[g.id] || null;
+      return {
+        id: g.id,
+        incluidoEm: g.incluidoEm,
+        nota: g.nota,
+        arquivado: g.arquivado === true,
+        marcas: { assunto: g.assunto || [], base: g.base || [], competencia: g.competencia || [] },
+        lido: !!e,
+        titulo: e ? e.titulo : '',
+        status: e ? e.status : '',
+        statusOp: e ? e.statusOp : '',
+        grupo: e ? e.grupo : '',
+        criadoEm: e ? e.criadoEm : 0,
+        atualizadoEm: e ? e.atualizadoEm : 0,
+        lidoEm: e ? e.lidoEm : 0,
+        ehGlobal: e ? e.ehGlobal !== false : null,
+        filhos: e && typeof e.filhos === 'number' ? e.filhos : null
+      };
+    };
+
+    const todas = () => PgStore.dados().globais.map(linhaDe);
+
+    const passaFiltro = (l, f) => {
+      if (!f.verArquivados && l.arquivado) return false;
+      if (f.soArquivados && !l.arquivado) return false;
+      for (const eixo of ['assunto', 'base', 'competencia']) {
+        const sel = (f[eixo] || []);
+        // Multisselecao dentro do eixo e "ou"; entre eixos e "e".
+        if (sel.length && !sel.some(id => l.marcas[eixo].includes(id))) return false;
+      }
+      if (f.status && l.status !== f.status) return false;
+      if (f.termo) {
+        const t = Dados.chaveComparacao(f.termo);
+        const alvo = Dados.chaveComparacao(`${l.id} ${l.titulo} ${l.nota} ${l.grupo}`);
+        if (!alvo.includes(t)) return false;
+      }
+      return true;
+    };
+
+    const ORDENS = {
+      filhos: (a, b) => (b.filhos === null ? -1 : b.filhos) - (a.filhos === null ? -1 : a.filhos),
+      numero: (a, b) => Number(b.id) - Number(a.id),
+      incluido: (a, b) => String(b.incluidoEm).localeCompare(String(a.incluidoEm)),
+      atualizado: (a, b) => (b.atualizadoEm || 0) - (a.atualizadoEm || 0)
+    };
+
+    const listar = (filtros, ordem) =>
+      todas().filter(l => passaFiltro(l, filtros || {})).sort(ORDENS[ordem] || ORDENS.filhos);
+
+    const resumo = (linhas) => {
+      const comFilhos = linhas.filter(l => l.filhos !== null);
+      return {
+        total: linhas.length,
+        naoLidos: linhas.filter(l => !l.lido).length,
+        semContagem: linhas.length - comFilhos.length,
+        // Soma apenas o que foi lido. O "semContagem" ao lado diz quanto falta.
+        filhos: comFilhos.reduce((s, l) => s + l.filhos, 0),
+        // Conta sobre TODOS os curados, nao sobre as linhas filtradas: arquivado
+        // fica oculto por padrao, entao contar o visivel daria sempre 0 — e "0
+        // arquivados" se le como "nao arquivei nada", que e o oposto do fato.
+        arquivados: todas().filter(l => l.arquivado).length,
+        // Marcado no painel mas sem IsGlobal_c no SMAX: alguem desmarcou lá.
+        deixaramDeSerGlobal: linhas.filter(l => l.lido && l.ehGlobal === false).length
+      };
+    };
+
+    const statusConhecidos = () =>
+      [...new Set(todas().map(l => l.status).filter(Boolean))].sort();
+
+    return { todas, listar, resumo, statusConhecidos, ORDENS };
   })();
 
   /* =========================================================
@@ -712,9 +854,8 @@
   /* =========================================================
    * PgApi — as leituras do painel no SMAX
    *
-   * Nesta fase, so a conferencia de um chamado na hora de incluir. As duas
-   * consultas em lote (estado dos globais e contagem de filhos) entram com a
-   * tela do painel.
+   * Tres leituras, e so tres: a conferencia de um chamado na hora de incluir, o
+   * estado dos globais marcados e a contagem de filhos. Nenhuma escrita.
    * =======================================================*/
   const PgApi = (() => {
     // GlobalId_c volta como OBJETO { Id: "82133910" } e pode estar em
@@ -777,7 +918,164 @@
       return saida;
     };
 
-    return { conferir, emLote, extrairGlobalId };
+    /* ---------- As duas leituras em lote do painel ---------- */
+
+    const BLOCO_IDS = 50;   // ids por requisicao — limite pratico e o tamanho da URL
+    const PAGINA = 250;     // registros por pagina
+
+    const LAYOUT_ESTADO = [
+      'Id', 'DisplayLabel', 'Status', 'StatusSCCDSMAX_c', 'PhaseId',
+      'AssignedToGroup', 'AssignedToGroup.Name', 'CreateTime', 'LastUpdateTime', 'IsGlobal_c'
+    ].join(',');
+
+    const emBlocos = (arr, n) => {
+      const out = [];
+      for (let i = 0; i < arr.length; i += n) out.push(arr.slice(i, i + n));
+      return out;
+    };
+
+    // A cadeia de "or" vai entre parenteses PROPRIOS. A precedencia de and/or nos
+    // filtros do SMAX nao esta documentada, e a falha e silenciosa: registros
+    // com campo nulo simplesmente nao voltam. Mesmo cuidado do
+    // Monitor-de-solicitacoes.user.js:129.
+    const clausulaOu = (campo, ids) => ids.length === 1
+      ? `${campo} = '${ids[0]}'`
+      : `(${ids.map(i => `${campo} = '${i}'`).join(' or ')})`;
+
+    // O SMAX recusa a consulta ao passar de 10.000 entidades MESMO pedindo 1
+    // registro (Extração:1232). Sem dizer isso, parece que nao ha resultado.
+    const motivoDeErro = (err) => {
+      if (/query\.num\.of\.entities\.exceeded/.test((err && err.body) || '')) {
+        return 'a consulta passou do teto de 10.000 registros do SMAX';
+      }
+      if (err && err.name === 'AbortError') return 'tempo esgotado';
+      return (err && err.message) || 'erro desconhecido';
+    };
+
+    // Le pagina por pagina ate cobrir o total_count. Sem isso um lote grande
+    // volta truncado e o painel mostraria um numero menor como se fosse fato.
+    const lerPaginas = async (filtro, layout) => {
+      const entidades = [];
+      let skip = 0;
+      for (let volta = 0; volta < 200; volta++) {
+        const resp = await ApiClient.request('ems/Request', {
+          timeout: 45000,
+          searchParams: {
+            filter: filtro, layout, size: String(PAGINA),
+            skip: String(skip), meta: 'totalCount'
+          }
+        });
+        if (resp && resp.meta && resp.meta.completion_status
+            && String(resp.meta.completion_status).toUpperCase() !== 'OK') {
+          const err = new Error('consulta recusada pelo SMAX');
+          err.body = JSON.stringify(resp);
+          throw err;
+        }
+        const lote = (resp && resp.entities) || [];
+        entidades.push(...lote);
+        const total = Number(resp && resp.meta && resp.meta.total_count);
+        skip += lote.length;
+        if (!lote.length || !Number.isFinite(total) || entidades.length >= total) break;
+      }
+      return entidades;
+    };
+
+    const ehVerdadeiro = (v) => v === true || v === 'true' || v === 1 || v === '1';
+
+    // Um unico global problematico — p.ex. um com filhos acima do teto de 10.000
+    // — faz o SMAX recusar a consulta do BLOCO inteiro. Sem isto, um global ruim
+    // deixaria os outros 49 do bloco sem atualizar para sempre, e justo os globais
+    // gigantes sao os que a equipe mais acompanha. Ao falhar, parte o bloco ao
+    // meio e tenta de novo, ate chegar no culpado: so ele fica marcado como falha.
+    const porPartes = async (bloco, tentar) => {
+      try {
+        await tentar(bloco);
+        return [];
+      } catch (err) {
+        if (bloco.length === 1) return [{ ids: bloco, motivo: motivoDeErro(err) }];
+        const meio = Math.ceil(bloco.length / 2);
+        const esq = await porPartes(bloco.slice(0, meio), tentar);
+        const dir = await porPartes(bloco.slice(meio), tentar);
+        return esq.concat(dir);
+      }
+    };
+
+    // (1) Estado dos globais marcados.
+    const lerEstado = async (ids, onProgresso) => {
+      const blocos = emBlocos(ids, BLOCO_IDS);
+      const porId = {};
+      const falhas = [];
+      let feitos = 0;
+      await emLote(blocos, async (bloco) => {
+        const falhou = await porPartes(bloco, async (parte) => {
+          const ents = await lerPaginas(clausulaOu('Id', parte), LAYOUT_ESTADO);
+          const agora = Date.now();
+          ents.forEach((e) => {
+            const p = (e && e.properties) || {};
+            const rel = (e && e.related_properties) || {};
+            if (!p.Id) return;
+            porId[String(p.Id)] = {
+              lidoEm: agora,
+              titulo: String(p.DisplayLabel || ''),
+              status: String(p.Status || ''),
+              statusOp: String(p.StatusSCCDSMAX_c || ''),
+              fase: String(p.PhaseId || ''),
+              grupo: String(
+                (rel.AssignedToGroup && rel.AssignedToGroup.Name)
+                || (p.AssignedToGroup && p.AssignedToGroup.Name)
+                || p['AssignedToGroup.Name']
+                || p.AssignedToGroup || ''
+              ),
+              criadoEm: Number(p.CreateTime) || 0,
+              atualizadoEm: Number(p.LastUpdateTime) || 0,
+              ehGlobal: ehVerdadeiro(p.IsGlobal_c)
+            };
+          });
+        });
+        // Quem sobrou aqui nao foi relido. Guardar quais, para a tela poder dizer
+        // "nao lido" nesses — e nao zero.
+        falhas.push(...falhou);
+        feitos++;
+        if (onProgresso) onProgresso(feitos, blocos.length);
+      });
+      return { porId, falhas };
+    };
+
+    // (2) Quantos filhos cada global absorveu. Uma consulta por bloco de pais,
+    // nao uma por global. RequestCausesRequest devolve 403 em consulta direta;
+    // o caminho que funciona e filtrar por GlobalId_c (seção 19.6).
+    const contarFilhos = async (ids, onProgresso) => {
+      const blocos = emBlocos(ids, BLOCO_IDS);
+      const porPai = {};
+      const falhas = [];
+      ids.forEach((id) => { porPai[id] = 0; });
+      let feitos = 0;
+      await emLote(blocos, async (bloco) => {
+        const falhou = await porPartes(bloco, async (parte) => {
+          const ents = await lerPaginas(clausulaOu('GlobalId_c', parte), 'Id,GlobalId_c');
+          ents.forEach((e) => {
+            const p = (e && e.properties) || {};
+            const rel = (e && e.related_properties) || {};
+            const bruto = (p.GlobalId_c !== undefined && p.GlobalId_c !== null)
+              ? p.GlobalId_c : rel.GlobalId_c;
+            const pai = extrairGlobalId(bruto);
+            // Auto-referencia nao conta como filho.
+            if (!pai || pai === String(p.Id)) return;
+            if (porPai[pai] === undefined) return;
+            porPai[pai]++;
+          });
+        });
+        // Sem contagem confiavel: tirar a chave para a tela mostrar "nao lido",
+        // nunca 0 — um global com teto estourado tem MUITOS filhos, nao nenhum.
+        falhou.forEach((f) => f.ids.forEach((id) => { delete porPai[id]; }));
+        falhas.push(...falhou);
+        feitos++;
+        if (onProgresso) onProgresso(feitos, blocos.length);
+      });
+      return { porPai, falhas };
+    };
+
+    return { conferir, emLote, extrairGlobalId, lerEstado, contarFilhos, motivoDeErro };
   })();
 
   /* =========================================================
@@ -1391,6 +1689,7 @@
 .smax-gl-modal { z-index:1000000; }
 .smax-gl-panel {
   width:min(860px, 96vw); max-height:92vh; display:flex; flex-direction:column;
+  transition:width .12s ease;
   background:var(--sp-bg); color:var(--sp-text);
   border:1px solid var(--sp-border); border-radius:var(--sp-r-lg);
   box-shadow:var(--sp-shadow); overflow:hidden;
@@ -1495,6 +1794,45 @@
 .smax-gl-details { border:1px solid var(--sp-border); border-radius:var(--sp-r-md); padding:10px 12px; background:var(--sp-card-bg); }
 .smax-gl-details > summary { cursor:pointer; font-size:12.5px; font-weight:600; color:var(--sp-text); }
 .smax-gl-badge-best { color:var(--sp-success); }
+.smax-gl-badge-warn { color:var(--sp-pending); }
+.smax-gl-badge-err { color:var(--sp-danger-text); }
+
+/* A lista do painel. Precisa de mais largura que as outras telas. */
+.smax-gl-panel[data-wide="true"] { width:min(1240px, 97vw); }
+.smax-gl-filtros { display:flex; flex-wrap:wrap; gap:14px; align-items:flex-end; margin-bottom:12px; }
+.smax-gl-filtros > div { min-width:0; }
+.smax-gl-tbl { width:100%; border-collapse:collapse; font-size:11.5px; }
+.smax-gl-tbl th {
+  text-align:left; padding:6px 8px; font-size:10px; text-transform:uppercase;
+  letter-spacing:.4px; color:var(--sp-text-muted); border-bottom:1px solid var(--sp-border);
+  white-space:nowrap; background:var(--sp-surface-2); position:sticky; top:0; z-index:1;
+}
+.smax-gl-tbl th[data-ordem] { cursor:pointer; }
+.smax-gl-tbl th[data-ordem]:hover { color:var(--sp-accent); }
+.smax-gl-tbl th[data-ativa="true"] { color:var(--sp-accent); }
+.smax-gl-tbl td { padding:6px 8px; border-bottom:1px solid var(--sp-border); vertical-align:top; }
+.smax-gl-tbl tr[data-arquivado="true"] td { opacity:.5; }
+.smax-gl-tbl tr:hover td { background:var(--sp-primary-bg); }
+.smax-gl-tbl .smax-gl-num { font-family:Consolas, monospace; white-space:nowrap; }
+.smax-gl-tbl .smax-gl-tit { min-width:200px; }
+.smax-gl-filhos { font-family:Consolas, monospace; font-weight:600; text-align:right; white-space:nowrap; }
+/* "Nao lido" nunca pode ser lido como zero: cor e texto diferentes. */
+.smax-gl-naolido { color:var(--sp-text-dim); font-style:italic; font-family:inherit; font-weight:400; }
+.smax-gl-marcas { display:flex; flex-wrap:wrap; gap:3px; }
+.smax-gl-marca {
+  font-size:10px; padding:1px 6px; border-radius:9px;
+  background:var(--sp-surface-2); border:1px solid var(--sp-border); color:var(--sp-text-muted);
+  white-space:nowrap;
+}
+.smax-gl-acoes { white-space:nowrap; text-align:right; }
+.smax-gl-acoes button { padding:3px 7px; font-size:10.5px; }
+.smax-gl-resumo { display:flex; flex-wrap:wrap; gap:10px; margin-bottom:12px; }
+.smax-gl-card {
+  border:1px solid var(--sp-border); border-radius:var(--sp-r-md); padding:8px 12px;
+  background:var(--sp-card-bg); min-width:92px;
+}
+.smax-gl-card b { display:block; font-size:18px; font-weight:600; color:var(--sp-text); line-height:1.2; }
+.smax-gl-card span { font-size:10px; text-transform:uppercase; letter-spacing:.4px; color:var(--sp-text-muted); }
 
 .smax-gl-person {
   border:1px solid var(--sp-border); border-radius:var(--sp-r-md);
@@ -1524,7 +1862,7 @@
   const GlobalHUD = (() => {
     let overlay = null;
     let launcher = null;
-    let activeTab = 'abrir';
+    let activeTab = 'painel';
     let unsubscribe = null;
     let busy = false;
     // Criar ou remover um valor redesenha a tela inteira; a URL digitada e ainda
@@ -1547,6 +1885,7 @@
 
     const personUI = { open: false, term: '', loading: false, error: '', results: [], searchSeq: 0 };
     let personDebounce = null;
+    let filtroDebounce = null;
 
     // Estado da tela "Incluir global". De proposito nao persiste: a conferencia e
     // pontual, e resultado guardado estaria velho na proxima abertura do painel.
@@ -1898,6 +2237,140 @@
         ${sniffBlock}`;
     };
 
+    /* ---------- Tela: painel ---------- */
+    const COLUNAS = [
+      { rot: 'Nº', ordem: 'numero' },
+      { rot: 'Título' },
+      { rot: 'Status' },
+      { rot: 'Operacional' },
+      { rot: 'Grupo' },
+      { rot: 'Filhos', ordem: 'filhos' },
+      { rot: 'Marcações' },
+      { rot: 'Incluído', ordem: 'incluido' },
+      { rot: 'Lido' },
+      { rot: '' }
+    ];
+
+    const rotulosDe = (linha) => Dados.EIXOS.flatMap(e =>
+      linha.marcas[e.chave].map(id => Dados.nomeDe(e.chave, id)).filter(Boolean)
+    );
+
+    const renderPainel = () => {
+      const f = PgStore.prefs.filtros;
+      const linhas = Metrica.listar(f, PgStore.prefs.ordem);
+      const r = Metrica.resumo(linhas);
+      const totalCurado = PgStore.dados().globais.length;
+      const lidoEm = PgStore.estado().lidoEm;
+
+      if (!totalCurado) {
+        return `<div class="smax-gl-note">
+          O painel está vazio. Vá em <strong>Incluir global</strong> para colocar o primeiro chamado,
+          e em <strong>Configuração</strong> para criar os valores de assunto, base e competência.
+        </div>`;
+      }
+
+      const chipsFiltro = Dados.EIXOS.map(e => {
+        const vals = Dados.lista(e.chave);
+        if (!vals.length) return '';
+        return `<div>
+          <div class="smax-gl-label">${e.rotulo}</div>
+          <div class="smax-gl-chips">
+            ${vals.map(v => `<button class="smax-gl-chip" data-act="filtro-eixo"
+                data-eixo="${e.chave}" data-id="${Utils.escapeHtml(v.id)}"
+                data-active="${(f[e.chave] || []).includes(v.id)}">${Utils.escapeHtml(v.nome)}</button>`).join('')}
+          </div>
+        </div>`;
+      }).join('');
+
+      const statuses = Metrica.statusConhecidos();
+
+      const corpo = linhas.length ? linhas.map(l => {
+        const marcas = rotulosDe(l);
+        // Tres celulas que NAO podem mostrar vazio como se fosse fato conhecido.
+        const semLeitura = '<span class="smax-gl-naolido">não lido</span>';
+        return `<tr data-arquivado="${l.arquivado}">
+          <td class="smax-gl-num">
+            <a href="/saw/Request/${Utils.escapeHtml(l.id)}/general" target="_blank"
+               style="color:var(--sp-accent);text-decoration:none;">#${Utils.escapeHtml(l.id)}</a>
+            ${l.lido && l.ehGlobal === false
+              ? '<br><span class="smax-gl-badge smax-gl-badge-err">não é global</span>' : ''}
+            ${l.arquivado ? '<br><span class="smax-gl-badge">arquivado</span>' : ''}
+          </td>
+          <td class="smax-gl-tit">${l.lido ? Utils.escapeHtml(l.titulo || '(sem título)') : semLeitura}
+            ${l.nota ? `<div class="smax-gl-cand-meta">${Utils.escapeHtml(l.nota)}</div>` : ''}</td>
+          <td>${l.lido ? Utils.escapeHtml(l.status || '—') : semLeitura}</td>
+          <td>${l.lido ? Utils.escapeHtml(l.statusOp || '—') : semLeitura}</td>
+          <td>${l.lido ? Utils.escapeHtml(l.grupo || '—') : semLeitura}</td>
+          <td class="smax-gl-filhos">${l.filhos === null ? semLeitura : l.filhos}</td>
+          <td><div class="smax-gl-marcas">${marcas.length
+            ? marcas.map(n => `<span class="smax-gl-marca">${Utils.escapeHtml(n)}</span>`).join('')
+            : '<span class="smax-gl-naolido">sem marcação</span>'}</div></td>
+          <td class="smax-gl-num">${Utils.escapeHtml(l.incluidoEm || '—')}</td>
+          <td class="smax-gl-num">${l.lidoEm ? Utils.escapeHtml(Utils.formatBrDateTime(l.lidoEm)) : semLeitura}</td>
+          <td class="smax-gl-acoes">
+            <button class="smax-gl-btn" data-act="${l.arquivado ? 'desarquivar' : 'arquivar'}"
+                    data-id="${Utils.escapeHtml(l.id)}">${l.arquivado ? 'Reabrir' : 'Arquivar'}</button>
+            <button class="smax-gl-btn smax-gl-btn-danger" data-act="remover-global"
+                    data-id="${Utils.escapeHtml(l.id)}">Remover</button>
+          </td>
+        </tr>`;
+      }).join('') : `<tr><td colspan="${COLUNAS.length}">
+          <div class="smax-gl-note">Nenhum global atende aos filtros.</div></td></tr>`;
+
+      return `
+        <div class="smax-gl-resumo">
+          <div class="smax-gl-card"><b>${r.total}</b><span>na tela</span></div>
+          <div class="smax-gl-card"><b>${r.filhos}</b><span>filhos somados</span></div>
+          <div class="smax-gl-card"><b>${r.arquivados}</b><span>arquivados</span></div>
+          ${r.naoLidos ? `<div class="smax-gl-card"><b style="color:var(--sp-danger-text);">${r.naoLidos}</b><span>sem leitura</span></div>` : ''}
+        </div>
+
+        ${lidoEm
+          ? `<div class="smax-gl-note ${r.naoLidos || r.semContagem ? 'smax-gl-note-warn' : ''}">
+               Estado lido do SMAX em <strong>${Utils.escapeHtml(Utils.formatBrDateTime(lidoEm))}</strong>.
+               ${r.semContagem
+                 ? `<strong>${r.semContagem}</strong> global(is) sem contagem de filhos — a soma acima é só do que foi lido.`
+                 : ''}
+               ${r.deixaramDeSerGlobal
+                 ? ` <strong>${r.deixaramDeSerGlobal}</strong> já não está marcado como “É global” no SMAX.`
+                 : ''}
+             </div>`
+          : `<div class="smax-gl-note smax-gl-note-warn">
+               Nada foi lido do SMAX ainda. Clique em <strong>Atualizar do SMAX</strong>: até então,
+               status, grupo e contagem de filhos aparecem como <em>não lido</em> — e não como zero.
+             </div>`}
+
+        <div class="smax-gl-filtros">
+          ${chipsFiltro}
+          <div>
+            <div class="smax-gl-label">Status</div>
+            <select class="smax-gl-select" id="smax-gl-f-status" style="min-width:150px;">
+              <option value="">todos</option>
+              ${statuses.map(s => `<option value="${Utils.escapeHtml(s)}" ${f.status === s ? 'selected' : ''}>${Utils.escapeHtml(s)}</option>`).join('')}
+            </select>
+          </div>
+          <div>
+            <div class="smax-gl-label">Buscar</div>
+            <input class="smax-gl-input" id="smax-gl-f-termo" type="text" style="min-width:180px;"
+                   value="${Utils.escapeHtml(f.termo || '')}" placeholder="número, título, nota, grupo">
+          </div>
+          <div>
+            <div class="smax-gl-label">Arquivados</div>
+            <button class="smax-gl-chip" data-act="filtro-arquivados" data-active="${!!f.verArquivados}">
+              ${f.verArquivados ? 'mostrando' : 'ocultos'}
+            </button>
+          </div>
+          <div><button class="smax-gl-btn" data-act="limpar-filtros">Limpar filtros</button></div>
+        </div>
+
+        <table class="smax-gl-tbl">
+          <thead><tr>${COLUNAS.map(c => c.ordem
+            ? `<th data-ordem="${c.ordem}" data-ativa="${PgStore.prefs.ordem === c.ordem}">${c.rot} ▾</th>`
+            : `<th>${c.rot}</th>`).join('')}</tr></thead>
+          <tbody>${corpo}</tbody>
+        </table>`;
+    };
+
     /* ---------- Tela: incluir global ---------- */
     const MOTIVOS = {
       inexistente: 'Não existe no SMAX.',
@@ -1919,12 +2392,10 @@
         }
         return `
           <div class="smax-gl-label" style="margin-top:12px;">${e.rotulo}</div>
-          <div style="display:flex; flex-wrap:wrap; gap:6px;">
-            ${vals.map(v => `
-              <button class="smax-gl-btn ${r.marcas[e.chave].has(v.id) ? 'smax-gl-btn-primary' : ''}"
-                      data-act="chip-marca" data-eixo="${e.chave}" data-id="${Utils.escapeHtml(v.id)}">
-                ${r.marcas[e.chave].has(v.id) ? '✓ ' : ''}${Utils.escapeHtml(v.nome)}
-              </button>`).join('')}
+          <div class="smax-gl-chips">
+            ${vals.map(v => `<button class="smax-gl-chip" data-act="chip-marca"
+                data-eixo="${e.chave}" data-id="${Utils.escapeHtml(v.id)}"
+                data-active="${r.marcas[e.chave].has(v.id)}">${Utils.escapeHtml(v.nome)}</button>`).join('')}
           </div>`;
       }).join('');
 
@@ -2052,7 +2523,12 @@
         t.dataset.active = String(t.dataset.tab === activeTab);
       });
 
-      body.innerHTML = activeTab === 'abrir' ? renderAbrir()
+      // A lista precisa de mais largura; as outras telas ficam estreitas de proposito.
+      const painel = overlay.querySelector('.smax-gl-panel');
+      if (painel) painel.dataset.wide = String(activeTab === 'painel');
+
+      body.innerHTML = activeTab === 'painel' ? renderPainel()
+        : activeTab === 'abrir' ? renderAbrir()
         : activeTab === 'incluir' ? renderIncluir()
         : activeTab === 'config' ? renderConfig()
         : renderAprender();
@@ -2063,7 +2539,10 @@
       const contorno = body.querySelector('#smax-gl-contorno');
       if (contorno) contorno.innerHTML = form.contornoHtml;
 
-      if (activeTab === 'abrir' && prefs.molde) {
+      if (activeTab === 'painel') {
+        footer.innerHTML = `<button class="smax-gl-btn smax-gl-btn-primary" data-act="atualizar-smax"
+             ${busy ? 'disabled' : ''}>${busy ? 'Lendo…' : '↻ Atualizar do SMAX'}</button>`;
+      } else if (activeTab === 'abrir' && prefs.molde) {
         footer.innerHTML = `<button class="smax-gl-btn" data-act="preview">Ver payload</button>
            <button class="smax-gl-btn smax-gl-btn-primary" data-act="criar" ${busy ? 'disabled' : ''}>
              ${busy ? 'Criando…' : '🌐 Abrir chamado global'}
@@ -2213,6 +2692,61 @@
       document.body.appendChild(wrap);
     });
 
+    /* ---------- Atualizar o estado a partir do SMAX ---------- */
+    const atualizarDoSmax = async () => {
+      if (busy) return;
+      const ids = PgStore.dados().globais.map(g => g.id);
+      if (!ids.length) { setStatus('Nada para atualizar: o painel está vazio.', 'err'); return; }
+      busy = true;
+      render();
+      try {
+        setStatus(`Lendo o estado de ${ids.length} global(is)…`);
+        const est = await PgApi.lerEstado(ids, (f, t) => setStatus(`Estado: bloco ${f} de ${t}…`));
+        setStatus('Contando os filhos…');
+        const fil = await PgApi.contarFilhos(ids, (f, t) => setStatus(`Filhos: bloco ${f} de ${t}…`));
+
+        // A contagem entra no mesmo registro do estado. Pai sem contagem nesta
+        // passada fica SEM a chave `filhos` — a tela mostra "nao lido", nunca 0.
+        Object.entries(est.porId).forEach(([id, e]) => {
+          if (fil.porPai[id] !== undefined) e.filhos = fil.porPai[id];
+        });
+        PgStore.mesclarEstado(est.porId);
+
+        // Id que o bloco cobriu mas o SMAX nao devolveu: existe no painel e nao
+        // volta na consulta. E leitura bem-sucedida com resposta vazia, o que
+        // normalmente significa chamado apagado ou sem permissao.
+        const cobertos = new Set(est.falhas.flatMap(x => x.ids));
+        const ausentes = ids.filter(id => !cobertos.has(id) && !est.porId[id]);
+
+        const avisos = [];
+        if (est.falhas.length) {
+          const quantos = est.falhas.reduce((s, x) => s + x.ids.length, 0);
+          // "nao relido" e nao "sem leitura": quem ja tinha sido lido antes segue
+          // na tela com o horario antigo na coluna LIDO. Dizer "sem leitura" aqui
+          // contradizia o cartao de resumo, que conta so quem nunca foi lido.
+          avisos.push(`${quantos} não puderam ser relidos agora (${est.falhas[0].motivo})`);
+        }
+        if (fil.falhas.length) {
+          const quantos = fil.falhas.reduce((s, x) => s + x.ids.length, 0);
+          avisos.push(`${quantos} sem contagem de filhos (${fil.falhas[0].motivo})`);
+        }
+        if (ausentes.length) avisos.push(`${ausentes.length} não voltaram do SMAX (apagados ou sem permissão): ${ausentes.slice(0, 5).join(', ')}`);
+
+        setStatus(
+          avisos.length
+            ? `Atualizado com ressalva — ${avisos.join('; ')}.`
+            : `Atualizado: ${Object.keys(est.porId).length} global(is) lido(s).`,
+          avisos.length ? 'err' : 'ok'
+        );
+      } catch (err) {
+        setStatus(`Falha ao atualizar: ${PgApi.motivoDeErro(err)}`, 'err');
+      } finally {
+        // Antes do render: senao o botao continuaria desabilitado.
+        busy = false;
+        render();
+      }
+    };
+
     /* ---------- Incluir global ---------- */
     const lerIdsDigitados = () => {
       const el = overlay.querySelector('#smax-gl-ids');
@@ -2279,6 +2813,9 @@
       incluirUI.resultados = [];
       incluirUI.texto = '';
       incluirUI.nota = '';
+      // Vai para o painel: incluir e nao ver o resultado em lugar nenhum da a
+      // impressao de que nada aconteceu.
+      if (ok) activeTab = 'painel';
       render();
       setStatus(
         falhas.length ? `${ok} incluído(s). ${falhas.join(' ')}` : `${ok} global(is) incluído(s) no painel.`,
@@ -2523,6 +3060,14 @@
         const tab = ev.target.closest('.smax-gl-tab');
         if (tab) { readForm(); activeTab = tab.dataset.tab; render(); return; }
 
+        const col = ev.target.closest('th[data-ordem]');
+        if (col) {
+          PgStore.prefs.ordem = col.dataset.ordem;
+          PgStore.salvarPrefs();
+          render();
+          return;
+        }
+
         const chip = ev.target.closest('[data-urgency]');
         if (chip) {
           form.urgency = chip.dataset.urgency;
@@ -2625,6 +3170,38 @@
           render();
           setStatus(r.msg, r.ok ? 'ok' : 'err');
         }
+        else if (act === 'atualizar-smax') { atualizarDoSmax(); }
+        else if (act === 'filtro-eixo') {
+          const btn = ev.target.closest('[data-eixo]');
+          const lista = PgStore.prefs.filtros[btn.dataset.eixo];
+          const i = lista.indexOf(btn.dataset.id);
+          i >= 0 ? lista.splice(i, 1) : lista.push(btn.dataset.id);
+          PgStore.salvarPrefs();
+          render();
+        }
+        else if (act === 'filtro-arquivados') {
+          PgStore.prefs.filtros.verArquivados = !PgStore.prefs.filtros.verArquivados;
+          PgStore.salvarPrefs();
+          render();
+        }
+        else if (act === 'limpar-filtros') {
+          PgStore.prefs.filtros = { assunto: [], base: [], competencia: [], status: '', termo: '', verArquivados: false };
+          PgStore.salvarPrefs();
+          render();
+        }
+        else if (act === 'arquivar' || act === 'desarquivar') {
+          const id = ev.target.closest('[data-id]').dataset.id;
+          const r = Dados.arquivar(id, act === 'arquivar');
+          render();
+          setStatus(r.msg, r.ok ? 'ok' : 'err');
+        }
+        else if (act === 'remover-global') {
+          const id = ev.target.closest('[data-id]').dataset.id;
+          if (!confirm(`Remover #${id} do painel? Isso apaga o histórico dele. Para só tirar da tela do dia a dia, use Arquivar.`)) return;
+          const r = Dados.removerGlobal(id);
+          render();
+          setStatus(r.msg, r.ok ? 'ok' : 'err');
+        }
         else if (act === 'conferir-ids') { conferirIds(); }
         else if (act === 'limpar-conferencia') {
           incluirUI.resultados = [];
@@ -2721,6 +3298,11 @@
       overlay.addEventListener('change', (ev) => {
         if (ev.target.id === 'smax-gl-disc-to') form.contornoTo = ev.target.value;
         if (ev.target.id === 'smax-gl-disc-purpose') form.contornoPurpose = ev.target.value;
+        if (ev.target.id === 'smax-gl-f-status') {
+          PgStore.prefs.filtros.status = ev.target.value;
+          PgStore.salvarPrefs();
+          render();
+        }
       });
 
       overlay.addEventListener('input', (ev) => {
@@ -2731,6 +3313,18 @@
         // Marcar um chip redesenha a tela; sem isto o que foi digitado morreria.
         if (ev.target.id === 'smax-gl-ids') incluirUI.texto = ev.target.value;
         if (ev.target.id === 'smax-gl-nota') incluirUI.nota = ev.target.value;
+        if (ev.target.id === 'smax-gl-f-termo') {
+          PgStore.prefs.filtros.termo = ev.target.value;
+          clearTimeout(filtroDebounce);
+          // Redesenhar a cada tecla tiraria o foco do campo; por isso o atraso e
+          // a devolucao do cursor logo depois.
+          filtroDebounce = setTimeout(() => {
+            PgStore.salvarPrefs();
+            render();
+            const el = overlay && overlay.querySelector('#smax-gl-f-termo');
+            if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); }
+          }, 280);
+        }
         if (ev.target.id === 'smax-gl-person-q') {
           personUI.term = ev.target.value;
           clearTimeout(personDebounce);
@@ -2781,6 +3375,7 @@
             </div>
           </div>
           <div class="smax-gl-tabs">
+            <button class="smax-gl-tab" data-tab="painel">Painel</button>
             <button class="smax-gl-tab" data-tab="abrir">Abrir chamado</button>
             <button class="smax-gl-tab" data-tab="incluir">Incluir global</button>
             <button class="smax-gl-tab" data-tab="aprender">Aprender molde</button>
@@ -2806,7 +3401,9 @@
       form.contornoPurpose = prefs.contornoPurpose || 'SolucaoContorno_c';
       Object.assign(personUI, { open: false, term: '', loading: false, error: '', results: [] });
 
-      activeTab = prefs.molde ? 'abrir' : 'aprender';
+      // Depois do pivo a casa e o painel: toda abertura cai na lista de globais.
+      // Antes caia em 'abrir'/'aprender' e o painel so aparecia se clicassem na aba.
+      activeTab = 'painel';
       ThemeManager.apply(ThemeManager.current());
       render();
     };

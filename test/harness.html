@@ -32,6 +32,24 @@
 </div>
 
 <div class="card">
+  <strong>Fase 1 — Configuração / arquivo compartilhado.</strong><br>
+  Na aba <em>Configuração</em> deixe a URL como
+  <code>https://raw.githubusercontent.com/teste/teste/master/painel-globais.json</code>,
+  ponha qualquer texto como token e salve. Os botões abaixo mexem no GitHub falso do servidor.
+  <div style="margin-top:12px;">
+    <button onclick="fetch('/gh/zerar').then(()=>log('arquivo do GitHub falso apagado','warn'))">Apagar arquivo do GitHub</button>
+    <button onclick="fetch('/gh/bumpversion').then(r=>r.text()).then(v=>log('_version do GitHub forçada para '+v,'warn'))">Forçar _version maior</button>
+    <button onclick="localStorage.removeItem('gm:smax_pg_dados');log('smax_pg_dados apagado — recarregue','warn')">Apagar dados locais</button>
+    <button onclick="fetch('/gh/raw').then(r=>r.text()).then(t=>log('arquivo no GitHub:\n'+t))">Ver arquivo do GitHub</button>
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    Roteiro: criar valores nos três eixos → <em>Publicar</em> → <em>Apagar dados locais</em> + recarregar →
+    <em>Importar</em> e conferir que voltou igual. Depois <em>Forçar _version maior</em> e confirmar que
+    <em>Publicar</em> é <strong>recusado</strong>.
+  </div>
+</div>
+
+<div class="card">
   <strong>3.</strong> Use o candidato como molde, volte em <em>Abrir chamado</em>, preencha e clique em <em>Ver payload</em>.
   Confira se <code>DisplayLabel</code>, <code>Description</code>, <code>Urgency</code> e <code>ImpactScope</code> foram sobrescritos
   e se <code>Id</code>/<code>CreateTime</code>/<code>Comments</code> sumiram.
@@ -59,6 +77,21 @@
     log(`GM_addStyle → ${css.length} chars`, 'ok');
   };
   window.unsafeWindow = window;
+
+  /* GM_xmlhttpRequest redirecionado para o GitHub falso do servidor local.
+     O script so deve falar com api.github.com e raw.githubusercontent.com;
+     qualquer outro destino aqui e erro de codigo, nao de ambiente — por isso
+     aparece como erro em vez de passar batido. */
+  window.GM_xmlhttpRequest = (opts) => {
+    let alvo = null;
+    if (opts.url.startsWith('https://api.github.com/')) alvo = '/gh/contents';
+    else if (opts.url.startsWith('https://raw.githubusercontent.com/')) alvo = '/gh/raw';
+    if (!alvo) { log('GM_xmlhttpRequest para destino inesperado: ' + opts.url, 'err'); if (opts.onerror) opts.onerror(); return; }
+    log(`GM_xmlhttpRequest ${opts.method || 'GET'} → ${alvo}`, 'warn');
+    fetch(alvo, { method: opts.method || 'GET', body: opts.data })
+      .then(async (r) => { if (opts.onload) opts.onload({ status: r.status, responseText: await r.text() }); })
+      .catch(() => { if (opts.onerror) opts.onerror(); });
+  };
 
   /* O script resolve o tenant a partir da pagina; aqui nao ha nada de onde
      tirar, e sem ele o replay iria para /rest/ems/... em vez de /rest/{id}/ems/... */

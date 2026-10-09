@@ -1,15 +1,18 @@
 // ==UserScript==
-// @name         SMAX Global - TJSP
+// @name         SMAX Painel de Globais - TJSP
 // @namespace    https://github.com/rsalvessap/SMAX-Global
-// @version      1.5
-// @description  Abertura automatizada de chamado global no SMAX TJSP — aprende o molde a partir de uma abertura manual e replica trocando titulo, descricao, urgencia e solicitante
+// @version      1.6
+// @description  Painel de gestao de chamados globais do SMAX TJSP — lista curada, classificacao por assunto/base/competencia, sincronizacao por arquivo no GitHub e abertura automatizada de global por molde
 // @author       rsalvessap
 // @match        https://suporte.tjsp.jus.br/saw/*
 // @run-at       document-start
 // @grant        GM_addStyle
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        GM_xmlhttpRequest
 // @grant        unsafeWindow
+// @connect      raw.githubusercontent.com
+// @connect      api.github.com
 // @noframes
 // @downloadURL  https://github.com/rsalvessap/SMAX-Global/raw/refs/heads/master/SMAX/SMAX%20Global%20-%20TJSP.user.js
 // @updateURL    https://github.com/rsalvessap/SMAX-Global/raw/refs/heads/master/SMAX/SMAX%20Global%20-%20TJSP.user.js
@@ -23,7 +26,7 @@
   if (window.top && window.top !== window.self) return;
   if (window.location.hostname !== 'suporte.tjsp.jus.br') return;
 
-  const SMAX_GLOBAL_VERSION = '1.5';
+  const SMAX_GLOBAL_VERSION = '1.6';
 
   // O userscript roda em sandbox; quem dispara as requisicoes e a pagina.
   const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
@@ -91,6 +94,375 @@
   })();
 
   const prefs = Store.state;
+
+  /* =========================================================
+   * PgStore — armazenamento do Painel de Globais
+   *
+   * Duas chaves separadas DE PROPOSITO:
+   *   smax_pg_dados = a lista curada de globais e as listas de valores. E isto,
+   *                   e so isto, que vai para o arquivo do GitHub.
+   *   smax_pg_prefs = token do GitHub, URL do arquivo. O token NUNCA entra no
+   *                   arquivo publicado. Mesma separacao que o SMAX Respostas
+   *                   faz entre smax_prefs e smax_personal_prefs.
+   *
+   * O cache do que for lido do SMAX (smax_pg_estado) entra na fase em que
+   * existir leitura para guardar — e tera de ser persistido, nao de memoria: o
+   * SMAX recarrega a pagina ao navegar, e foi essa a armadilha que custou a
+   * v1.1 deste script.
+   * =======================================================*/
+  const PgStore = (() => {
+    const K_DADOS = 'smax_pg_dados';
+    const K_PREFS = 'smax_pg_prefs';
+    const SCHEMA = 1;
+
+    const dadosVazio = () => ({
+      _schema: SCHEMA,
+      _version: 0,
+      _updatedAt: '',
+      eixos: { assunto: [], base: [], competencia: [] },
+      globais: []
+    });
+
+    const prefsDefaults = {
+      arquivoUrl: 'https://raw.githubusercontent.com/rsalvessap/SMAX-TOOLS/master/painel-globais.json',
+      githubToken: ''
+    };
+
+    const saneaValores = (arr) => Array.isArray(arr)
+      ? arr.filter(v => v && v.id && v.nome).map(v => ({ id: String(v.id), nome: String(v.nome) }))
+      : [];
+
+    const saneaMarcas = (arr) => Array.isArray(arr) ? arr.filter(Boolean).map(String) : [];
+
+    // Normaliza o que vier de fora (storage local ou GitHub) para a forma
+    // esperada. Nao inventa dado: garante que os campos existem, para o resto
+    // do codigo nao ter de checar tipo a cada acesso. Preserva o _schema lido
+    // como veio — quem decide o que fazer com schema desconhecido e o GitSync.
+    const sanear = (raw) => {
+      if (!raw || typeof raw !== 'object') return dadosVazio();
+      const eixos = raw.eixos && typeof raw.eixos === 'object' ? raw.eixos : {};
+      return {
+        _schema: Number(raw._schema) || 1,
+        _version: Number(raw._version) || 0,
+        _updatedAt: typeof raw._updatedAt === 'string' ? raw._updatedAt : '',
+        eixos: {
+          assunto: saneaValores(eixos.assunto),
+          base: saneaValores(eixos.base),
+          competencia: saneaValores(eixos.competencia)
+        },
+        globais: (Array.isArray(raw.globais) ? raw.globais : [])
+          .filter(g => g && g.id)
+          .map(g => ({
+            id: String(g.id),
+            incluidoEm: typeof g.incluidoEm === 'string' ? g.incluidoEm : '',
+            assunto: saneaMarcas(g.assunto),
+            base: saneaMarcas(g.base),
+            competencia: saneaMarcas(g.competencia),
+            nota: typeof g.nota === 'string' ? g.nota : '',
+            arquivado: g.arquivado === true
+          }))
+      };
+    };
+
+    let dados = dadosVazio();
+    const pgPrefs = { ...prefsDefaults };
+
+    try {
+      const raw = GM_getValue(K_DADOS);
+      if (raw) dados = sanear(JSON.parse(raw));
+    } catch (err) {
+      console.warn('[SMAX Painel] smax_pg_dados ilegivel, comecando vazio:', err);
+    }
+
+    try {
+      const raw = GM_getValue(K_PREFS);
+      if (raw) Object.assign(pgPrefs, prefsDefaults, JSON.parse(raw) || {});
+    } catch (err) {
+      console.warn('[SMAX Painel] smax_pg_prefs ilegivel:', err);
+    }
+
+    const salvarDados = () => {
+      try { GM_setValue(K_DADOS, JSON.stringify(dados)); }
+      catch (err) { console.warn('[SMAX Painel] falha ao gravar smax_pg_dados:', err); }
+    };
+
+    const salvarPrefs = () => {
+      try { GM_setValue(K_PREFS, JSON.stringify(pgPrefs)); }
+      catch (err) { console.warn('[SMAX Painel] falha ao gravar smax_pg_prefs:', err); }
+    };
+
+    const substituirDados = (novo) => { dados = sanear(novo); salvarDados(); };
+
+    return {
+      SCHEMA,
+      dados: () => dados,
+      prefs: pgPrefs,
+      sanear, salvarDados, salvarPrefs, substituirDados
+    };
+  })();
+
+  /* =========================================================
+   * Dados — operacoes sobre a lista curada
+   *
+   * Nesta fase: as tres listas de valores. Incluir/marcar/arquivar global
+   * entram na fase seguinte, junto com a tela que os usa.
+   * =======================================================*/
+  const Dados = (() => {
+    const EIXOS = [
+      { chave: 'assunto', rotulo: 'Assunto', exemplo: 'Mandados' },
+      { chave: 'base', rotulo: 'Base', exemplo: 'SP' },
+      { chave: 'competencia', rotulo: 'Competência', exemplo: '' }
+    ];
+
+    // Caixa e acento fora da comparacao: "Mandados", "mandados" e "MANDADOS"
+    // sao o MESMO valor. Sem isso a criacao livre fragmenta o eixo e o grafico
+    // mostra tres barras para um tema. O nome exibido fica como foi digitado na
+    // primeira vez.
+    const chaveComparacao = (nome) => (nome || '')
+      .normalize('NFD').replace(/[\u0300-\u036f]/g, '')
+      .replace(/\s+/g, ' ').trim().toLowerCase();
+
+    const limpaNome = (nome) => (nome || '').replace(/\s+/g, ' ').trim();
+
+    const lista = (eixo) => PgStore.dados().eixos[eixo] || [];
+
+    const nomeDe = (eixo, id) => {
+      const v = lista(eixo).find(x => x.id === id);
+      return v ? v.nome : '';
+    };
+
+    const acharPorNome = (eixo, nome) => {
+      const k = chaveComparacao(nome);
+      return k ? (lista(eixo).find(v => chaveComparacao(v.nome) === k) || null) : null;
+    };
+
+    const novoId = (eixo) => {
+      const usados = new Set(lista(eixo).map(v => v.id));
+      let id;
+      do { id = Math.random().toString(16).slice(2, 8); } while (!id || usados.has(id));
+      return id;
+    };
+
+    const criarValor = (eixo, nome) => {
+      const limpo = limpaNome(nome);
+      if (!limpo) return { ok: false, msg: 'Digite um nome.' };
+      const existente = acharPorNome(eixo, limpo);
+      if (existente) return { ok: false, valor: existente, msg: `Já existe como “${existente.nome}” — nada foi criado.` };
+      const valor = { id: novoId(eixo), nome: limpo };
+      lista(eixo).push(valor);
+      PgStore.salvarDados();
+      return { ok: true, valor, msg: `“${limpo}” criado.` };
+    };
+
+    const renomearValor = (eixo, id, nome) => {
+      const limpo = limpaNome(nome);
+      if (!limpo) return { ok: false, msg: 'Digite um nome.' };
+      const alvo = lista(eixo).find(v => v.id === id);
+      if (!alvo) return { ok: false, msg: 'Valor não encontrado.' };
+      const colide = acharPorNome(eixo, limpo);
+      if (colide && colide.id !== id) return { ok: false, msg: `Já existe como “${colide.nome}”.` };
+      // O id nao muda: por isso renomear nao desgarra as marcacoes ja feitas.
+      alvo.nome = limpo;
+      PgStore.salvarDados();
+      return { ok: true, msg: `Renomeado para “${limpo}”.` };
+    };
+
+    const contarUsos = (eixo, id) =>
+      PgStore.dados().globais.filter(g => (g[eixo] || []).includes(id)).length;
+
+    const removerValor = (eixo, id) => {
+      const d = PgStore.dados();
+      const antes = d.eixos[eixo].length;
+      d.eixos[eixo] = d.eixos[eixo].filter(v => v.id !== id);
+      if (d.eixos[eixo].length === antes) return { ok: false, msg: 'Valor não encontrado.' };
+      // Tira a marcacao dos globais tambem: id orfao viraria marca sem rotulo.
+      let limpos = 0;
+      d.globais.forEach(g => {
+        if ((g[eixo] || []).includes(id)) {
+          g[eixo] = g[eixo].filter(x => x !== id);
+          limpos++;
+        }
+      });
+      PgStore.salvarDados();
+      return { ok: true, limpos, msg: limpos ? `Removido — e desmarcado de ${limpos} global(is).` : 'Removido.' };
+    };
+
+    return { EIXOS, chaveComparacao, lista, nomeDe, criarValor, renomearValor, removerValor, contarUsos };
+  })();
+
+  /* =========================================================
+   * GitSync — publicar e importar o arquivo do painel
+   *
+   * Escreve quem tem token; le quem tem a URL. Arquivo PROPRIO, nunca o
+   * shared-config.json do Respostas: o publicador de lá faz o merge sobre um
+   * cache de uma hora (Respostas ADM:4295) e, com o cache vencido ou vazio,
+   * apaga chave gravada por outro script. Aqui a base do merge e o conteudo do
+   * mesmo GET que traz o SHA.
+   * =======================================================*/
+  const GitSync = (() => {
+    const parseRawUrl = (url) => {
+      const m = (url || '').trim()
+        .match(/^https:\/\/raw\.githubusercontent\.com\/([^/]+)\/([^/]+)\/([^/]+)\/(.+)$/);
+      return m ? { owner: m[1], repo: m[2], branch: m[3], path: m[4] } : null;
+    };
+
+    const ghHeaders = (token) => ({
+      Authorization: `Bearer ${token}`,
+      Accept: 'application/vnd.github+json',
+      'X-GitHub-Api-Version': '2022-11-28',
+      'Content-Type': 'application/json'
+    });
+
+    const req = (opts) => new Promise((resolve, reject) => {
+      GM_xmlhttpRequest({
+        timeout: 20000,
+        ...opts,
+        onload: resolve,
+        onerror: () => reject(new Error('erro de rede')),
+        ontimeout: () => reject(new Error('tempo esgotado'))
+      });
+    });
+
+    const deB64 = (s) => decodeURIComponent(escape(atob((s || '').replace(/\s/g, ''))));
+    const paraB64 = (s) => btoa(unescape(encodeURIComponent(s)));
+
+    // Leitura publica, sem token: e por aqui que as outras pessoas importam.
+    // ?_t= fura cache de CDN, igual ao SharedConfig do Respostas (:10287+).
+    const lerPeloRaw = async (url) => {
+      const res = await req({ method: 'GET', url: `${url}${url.includes('?') ? '&' : '?'}_t=${Date.now()}` });
+      if (res.status === 404) return null;
+      if (res.status !== 200) throw new Error(`HTTP ${res.status} ao baixar o arquivo.`);
+      try { return JSON.parse(res.responseText); }
+      catch { throw new Error('O arquivo baixado não é um JSON válido.'); }
+    };
+
+    // Leitura pela API: devolve o SHA (obrigatorio para gravar) e o conteudo do
+    // MESMO instante. E este conteudo que serve de base do merge.
+    const lerPelaApi = async (loc, token) => {
+      const url = `https://api.github.com/repos/${loc.owner}/${loc.repo}/contents/${loc.path}?ref=${encodeURIComponent(loc.branch)}`;
+      const res = await req({ method: 'GET', url, headers: ghHeaders(token) });
+      if (res.status === 404) return { sha: '', remoto: null };   // arquivo ainda nao existe
+      if (res.status !== 200) {
+        let detalhe = '';
+        try { detalhe = JSON.parse(res.responseText).message || ''; } catch { }
+        throw new Error(`HTTP ${res.status} ao ler o arquivo${detalhe ? ': ' + detalhe : ''}.`);
+      }
+      const meta = JSON.parse(res.responseText);
+      let remoto;
+      try { remoto = JSON.parse(deB64(meta.content)); }
+      catch { throw new Error('O arquivo no GitHub não é um JSON válido — corrija lá antes de publicar.'); }
+      return { sha: meta.sha || '', remoto };
+    };
+
+    const checaSchema = (obj) => {
+      const s = Number(obj && obj._schema) || 1;
+      if (s > PgStore.SCHEMA) {
+        throw new Error(`O arquivo foi gravado por uma versão mais nova do script (formato ${s}; este entende ${PgStore.SCHEMA}). Atualize o script antes.`);
+      }
+      return s;
+    };
+
+    // Assinatura do que uma pessoa decidiu sobre um global. Serve para contar
+    // quantos mudaram na previa da importacao.
+    const assinatura = (g) =>
+      Dados.EIXOS.map(e => (g[e.chave] || []).slice().sort().join(',')).join('|')
+      + `|${g.nota || ''}|${g.arquivado === true}`;
+
+    const diff = (local, remotoSan) => {
+      const lg = new Map(local.globais.map(g => [g.id, g]));
+      const rg = new Map(remotoSan.globais.map(g => [g.id, g]));
+      const eixos = Dados.EIXOS.map(e => {
+        const lv = new Map(local.eixos[e.chave].map(v => [v.id, v.nome]));
+        const rv = new Map(remotoSan.eixos[e.chave].map(v => [v.id, v.nome]));
+        return {
+          rotulo: e.rotulo,
+          entram: [...rv.keys()].filter(id => !lv.has(id)).length,
+          saem: [...lv.keys()].filter(id => !rv.has(id)).length,
+          renomeados: [...rv.keys()].filter(id => lv.has(id) && lv.get(id) !== rv.get(id)).length
+        };
+      });
+      return {
+        versaoLocal: local._version,
+        versaoRemota: remotoSan._version,
+        entram: [...rg.keys()].filter(id => !lg.has(id)),
+        saem: [...lg.keys()].filter(id => !rg.has(id)),
+        mudam: [...rg.keys()].filter(id => lg.has(id) && assinatura(lg.get(id)) !== assinatura(rg.get(id))),
+        eixos
+      };
+    };
+
+    // Devolve a previa. NAO aplica — aplicar e um segundo passo explicito,
+    // porque substituir o dado curado sem mostrar o que muda e a forma mais
+    // facil de perder trabalho.
+    const prepararImportacao = async () => {
+      const url = (PgStore.prefs.arquivoUrl || '').trim();
+      if (!parseRawUrl(url)) throw new Error('A URL deve ser https://raw.githubusercontent.com/{dono}/{repo}/{branch}/{caminho}.');
+      const remoto = await lerPeloRaw(url);
+      if (!remoto) throw new Error('Não existe arquivo nesse caminho ainda. Publique uma vez primeiro.');
+      checaSchema(remoto);
+      const remotoSan = PgStore.sanear(remoto);
+      return { remotoSan, previa: diff(PgStore.dados(), remotoSan) };
+    };
+
+    const aplicarImportacao = (remotoSan) => { PgStore.substituirDados(remotoSan); };
+
+    const publicar = async (onStatus) => {
+      const token = (PgStore.prefs.githubToken || '').trim();
+      const loc = parseRawUrl(PgStore.prefs.arquivoUrl);
+      if (!loc) throw new Error('A URL deve ser https://raw.githubusercontent.com/{dono}/{repo}/{branch}/{caminho}.');
+      if (!token) throw new Error('Informe o token do GitHub para publicar.');
+
+      onStatus('Lendo o arquivo atual no GitHub…');
+      const { sha, remoto } = await lerPelaApi(loc, token);
+      if (remoto) checaSchema(remoto);
+
+      const local = PgStore.dados();
+      const versaoRemota = remoto ? (Number(remoto._version) || 0) : 0;
+
+      // Trava otimista. O usuario trabalha em mais de um computador: publicar
+      // sobre uma versao mais nova apagaria o que a outra maquina gravou. Mesmo
+      // papel do LastUpdateTime nas escritas do SMAX.
+      if (versaoRemota > local._version) {
+        const err = new Error(`O GitHub está na versão ${versaoRemota} e esta máquina na ${local._version}: outra máquina publicou depois. Importe primeiro para não apagar o que foi feito lá.`);
+        err.desatualizado = true;
+        throw err;
+      }
+
+      const corpo = {
+        ...(remoto || {}),              // preserva chave que este script nao conhece
+        ...local,                       // o que esta maquina decidiu vence
+        _schema: PgStore.SCHEMA,
+        _version: versaoRemota + 1,
+        _updatedAt: new Date().toISOString().slice(0, 10)
+      };
+
+      onStatus('Publicando…');
+      const res = await req({
+        method: 'PUT',
+        url: `https://api.github.com/repos/${loc.owner}/${loc.repo}/contents/${loc.path}`,
+        headers: ghHeaders(token),
+        data: JSON.stringify({
+          message: `chore: atualiza painel-globais v${corpo._version}`,
+          content: paraB64(JSON.stringify(corpo, null, 2)),
+          branch: loc.branch,
+          ...(sha ? { sha } : {})
+        })
+      });
+      if (res.status !== 200 && res.status !== 201) {
+        let detalhe = '';
+        try { detalhe = JSON.parse(res.responseText).message || ''; } catch { }
+        throw new Error(`HTTP ${res.status}${detalhe ? ': ' + detalhe : ''}`);
+      }
+
+      // So depois do PUT aceito a copia local passa a valer como publicada.
+      local._version = corpo._version;
+      local._updatedAt = corpo._updatedAt;
+      PgStore.salvarDados();
+      return corpo._version;
+    };
+
+    return { parseRawUrl, prepararImportacao, aplicarImportacao, publicar };
+  })();
 
   /* =========================================================
    * Utils
@@ -1058,6 +1430,10 @@
     let activeTab = 'abrir';
     let unsubscribe = null;
     let busy = false;
+    // Criar ou remover um valor redesenha a tela inteira; a URL digitada e ainda
+    // nao salva nao pode morrer nesse redesenho. O token, de proposito, nao
+    // sobrevive: campo de senha nunca e repreenchido.
+    let urlDigitada = null;
 
     const form = {
       title: prefs.lastTitle || '',
@@ -1418,6 +1794,71 @@
         ${sniffBlock}`;
     };
 
+    const renderConfig = () => {
+      const d = PgStore.dados();
+      const pp = PgStore.prefs;
+      const temToken = !!(pp.githubToken || '').trim();
+
+      const eixosBlock = Dados.EIXOS.map(e => {
+        const vals = Dados.lista(e.chave);
+        const itens = vals.length
+          ? vals.map(v => `
+              <div class="smax-gl-cand">
+                <div class="smax-gl-cand-info">
+                  <div class="smax-gl-cand-title">${Utils.escapeHtml(v.nome)}</div>
+                  <div class="smax-gl-cand-meta">usado em ${Dados.contarUsos(e.chave, v.id)} global(is)</div>
+                </div>
+                <button class="smax-gl-btn" data-act="renomear-valor"
+                        data-eixo="${e.chave}" data-id="${Utils.escapeHtml(v.id)}">Renomear</button>
+                <button class="smax-gl-btn smax-gl-btn-danger" data-act="remover-valor"
+                        data-eixo="${e.chave}" data-id="${Utils.escapeHtml(v.id)}">Remover</button>
+              </div>`).join('')
+          : '<div class="smax-gl-note">Nenhum valor cadastrado ainda.</div>';
+
+        return `
+          <div class="smax-gl-label" style="margin-top:16px;">${e.rotulo} (${vals.length})</div>
+          ${itens}
+          <div style="display:flex; gap:8px; margin-top:8px;">
+            <input class="smax-gl-input" id="smax-gl-novo-${e.chave}" type="text" style="flex:1 1 auto;"
+                   placeholder="Novo valor${e.exemplo ? ` — ex.: ${Utils.escapeHtml(e.exemplo)}` : ''}">
+            <button class="smax-gl-btn smax-gl-btn-primary" data-act="criar-valor" data-eixo="${e.chave}">Criar</button>
+          </div>`;
+      }).join('');
+
+      return `
+        <div class="smax-gl-note">
+          <strong>Listas de classificação.</strong> São de criação livre e valem para os três eixos do
+          painel. Renomear é seguro: a marcação guarda o código do valor, não o nome.
+          Criar um valor que já existe só com outra caixa ou acento
+          (“mandados” depois de “Mandados”) <strong>não</strong> cria um valor novo.
+        </div>
+        ${eixosBlock}
+
+        <div class="smax-gl-label" style="margin-top:22px;">Arquivo compartilhado</div>
+        <div class="smax-gl-note">
+          Versão local: <strong>${d._version}</strong>${d._updatedAt ? ` · publicada em ${Utils.escapeHtml(d._updatedAt)}` : ' · nunca publicada daqui'}<br>
+          ${d.globais.length} global(is) na lista ·
+          ${Dados.EIXOS.map(e => `${Dados.lista(e.chave).length} ${e.rotulo.toLowerCase()}`).join(' · ')}
+        </div>
+        <input class="smax-gl-input" id="smax-gl-arquivo-url" type="text" style="width:100%;"
+               placeholder="https://raw.githubusercontent.com/dono/repo/branch/painel-globais.json"
+               value="${Utils.escapeHtml(urlDigitada !== null ? urlDigitada : (pp.arquivoUrl || ''))}">
+        <input class="smax-gl-input" id="smax-gl-gh-token" type="password" style="width:100%; margin-top:8px;"
+               placeholder="${temToken ? 'Token salvo — preencha só para trocar' : 'Token do GitHub (só para publicar)'}"
+               value="" autocomplete="off">
+        <div class="smax-gl-note" style="margin-top:8px;">
+          O token fica apenas neste navegador e <strong>nunca</strong> vai para o arquivo publicado.
+          Sem token o painel ainda importa — só não publica.
+        </div>
+        <div style="display:flex; gap:8px; margin-top:10px; flex-wrap:wrap;">
+          <button class="smax-gl-btn" data-act="salvar-git">Salvar URL e token</button>
+          <button class="smax-gl-btn" data-act="importar-git">⬇ Importar do GitHub</button>
+          <button class="smax-gl-btn smax-gl-btn-primary" data-act="publicar-git" ${temToken ? '' : 'disabled'}>
+            ⬆ Publicar no GitHub
+          </button>
+        </div>`;
+    };
+
     /* ---------- Render ---------- */
     const render = () => {
       if (!overlay) return;
@@ -1428,7 +1869,9 @@
         t.dataset.active = String(t.dataset.tab === activeTab);
       });
 
-      body.innerHTML = activeTab === 'abrir' ? renderAbrir() : renderAprender();
+      body.innerHTML = activeTab === 'abrir' ? renderAbrir()
+        : activeTab === 'config' ? renderConfig()
+        : renderAprender();
 
       // Restaura o conteudo dos editores (innerHTML nao sobrevive ao re-render)
       const desc = body.querySelector('#smax-gl-desc');
@@ -1551,6 +1994,114 @@
         if (ev.target === wrap || ev.target.closest('[data-act="fechar"]')) wrap.remove();
       });
       document.body.appendChild(wrap);
+    };
+
+    // Modal de confirmacao com conteudo livre. Existe porque a importacao tem
+    // de mostrar o que vai mudar ANTES de substituir o dado curado.
+    const askModal = (title, contentHtml, okLabel) => new Promise((resolve) => {
+      const wrap = document.createElement('div');
+      wrap.className = 'smax-gl-overlay smax-gl-modal smax-gl-root';
+      wrap.dataset.theme = ThemeManager.current();
+      wrap.innerHTML = `
+        <div class="smax-gl-panel" style="width:min(640px,94vw);">
+          <div class="smax-gl-header"><h2>${Utils.escapeHtml(title)}</h2></div>
+          <div class="smax-gl-body">${contentHtml}</div>
+          <div class="smax-gl-footer">
+            <div class="smax-gl-status"></div>
+            <button class="smax-gl-btn" data-act="cancelar">Cancelar</button>
+            <button class="smax-gl-btn smax-gl-btn-primary" data-act="ok">${Utils.escapeHtml(okLabel)}</button>
+          </div>
+        </div>`;
+      const fim = (r) => { wrap.remove(); resolve(r); };
+      wrap.addEventListener('click', (ev) => {
+        const act = ev.target.closest('[data-act]')?.dataset.act;
+        if (!act) { if (ev.target === wrap) fim(false); return; }
+        fim(act === 'ok');
+      });
+      document.body.appendChild(wrap);
+    });
+
+    /* ---------- Sincronizacao com o GitHub ---------- */
+    const salvarGit = () => {
+      const urlEl = overlay.querySelector('#smax-gl-arquivo-url');
+      const tokenEl = overlay.querySelector('#smax-gl-gh-token');
+      const url = (urlEl ? urlEl.value : '').trim();
+      if (url && !GitSync.parseRawUrl(url)) {
+        setStatus('A URL deve ser https://raw.githubusercontent.com/{dono}/{repo}/{branch}/{caminho}.', 'err');
+        return;
+      }
+      PgStore.prefs.arquivoUrl = url;
+      // Campo vazio nao apaga o token salvo — senao todo render o perderia.
+      const token = (tokenEl ? tokenEl.value : '').trim();
+      if (token) PgStore.prefs.githubToken = token;
+      PgStore.salvarPrefs();
+      urlDigitada = null;
+      render();
+      setStatus(token ? 'URL e token salvos.' : 'URL salva.', 'ok');
+    };
+
+    const publicarGit = async () => {
+      if (busy) return;
+      busy = true;
+      try {
+        const v = await GitSync.publicar((m) => setStatus(m));
+        render();
+        setStatus(`Publicado — versão ${v}.`, 'ok');
+      } catch (err) {
+        setStatus(err.desatualizado ? err.message : `Falha ao publicar: ${err.message}`, 'err');
+      } finally {
+        busy = false;
+      }
+    };
+
+    const importarGit = async () => {
+      if (busy) return;
+      busy = true;
+      try {
+        setStatus('Baixando o arquivo…');
+        const { remotoSan, previa } = await GitSync.prepararImportacao();
+        const nada = !previa.entram.length && !previa.saem.length && !previa.mudam.length
+          && previa.eixos.every(e => !e.entram && !e.saem && !e.renomeados);
+
+        const linha = (rotulo, n, extra = '') =>
+          `<tr><td>${rotulo}</td><td><strong>${n}</strong>${extra}</td></tr>`;
+
+        const corpo = `
+          <div class="smax-gl-note ${nada ? 'smax-gl-note-ok' : 'smax-gl-note-warn'}">
+            Arquivo na versão <strong>${previa.versaoRemota}</strong>; esta máquina na
+            <strong>${previa.versaoLocal}</strong>.<br>
+            ${nada
+              ? 'Nada muda — o conteúdo é igual ao que já está aqui.'
+              : 'Importar <strong>substitui</strong> a lista desta máquina pela do arquivo. O que está abaixo é o efeito.'}
+          </div>
+          <table class="smax-gl-kv">
+            ${linha('Globais que entram', previa.entram.length, previa.entram.length ? ` — ${Utils.escapeHtml(previa.entram.slice(0, 8).join(', '))}${previa.entram.length > 8 ? '…' : ''}` : '')}
+            ${linha('Globais que saem', previa.saem.length, previa.saem.length ? ` — ${Utils.escapeHtml(previa.saem.slice(0, 8).join(', '))}${previa.saem.length > 8 ? '…' : ''}` : '')}
+            ${linha('Globais com marcação/nota diferente', previa.mudam.length)}
+            ${previa.eixos.map(e => linha(
+              `${e.rotulo} — valores`,
+              `${e.entram} entram, ${e.saem} saem, ${e.renomeados} renomeados`
+            )).join('')}
+          </table>
+          ${previa.saem.length ? `
+            <div class="smax-gl-note smax-gl-note-warn">
+              Os ${previa.saem.length} global(is) que saem existem só aqui. Se foram incluídos nesta
+              máquina e ainda não publicados, importar os perde — publique antes se quiser mantê-los.
+            </div>` : ''}`;
+
+        setStatus('');
+        if (!(await askModal('Importar do GitHub', corpo, nada ? 'Importar mesmo assim' : 'Importar e substituir'))) {
+          setStatus('Importação cancelada.');
+          return;
+        }
+        GitSync.aplicarImportacao(remotoSan);
+        render();
+        setStatus(`Importado — versão ${PgStore.dados()._version}.`, 'ok');
+      } catch (err) {
+        setStatus(`Falha ao importar: ${err.message}`, 'err');
+      } finally {
+        busy = false;
+      }
     };
 
     /* ---------- Criacao ---------- */
@@ -1778,6 +2329,40 @@
           Store.save();
           setStatus('Padrão da solução de contorno salvo.', 'ok');
         }
+        else if (act === 'criar-valor') {
+          const eixo = ev.target.closest('[data-eixo]').dataset.eixo;
+          const input = overlay.querySelector(`#smax-gl-novo-${eixo}`);
+          const r = Dados.criarValor(eixo, input ? input.value : '');
+          render();
+          setStatus(r.msg, r.ok ? 'ok' : 'err');
+        }
+        else if (act === 'renomear-valor') {
+          const btn = ev.target.closest('[data-eixo]');
+          const eixo = btn.dataset.eixo;
+          const id = btn.dataset.id;
+          const atual = Dados.nomeDe(eixo, id);
+          const novo = prompt('Novo nome:', atual);
+          if (novo === null) return;
+          const r = Dados.renomearValor(eixo, id, novo);
+          render();
+          setStatus(r.msg, r.ok ? 'ok' : 'err');
+        }
+        else if (act === 'remover-valor') {
+          const btn = ev.target.closest('[data-eixo]');
+          const eixo = btn.dataset.eixo;
+          const id = btn.dataset.id;
+          const usos = Dados.contarUsos(eixo, id);
+          const aviso = usos
+            ? `Remover “${Dados.nomeDe(eixo, id)}”? Ele está marcado em ${usos} global(is) e a marcação será desfeita.`
+            : `Remover “${Dados.nomeDe(eixo, id)}”?`;
+          if (!confirm(aviso)) return;
+          const r = Dados.removerValor(eixo, id);
+          render();
+          setStatus(r.msg, r.ok ? 'ok' : 'err');
+        }
+        else if (act === 'salvar-git') { salvarGit(); }
+        else if (act === 'publicar-git') { publicarGit(); }
+        else if (act === 'importar-git') { importarGit(); }
         else if (act === 'toggle-aprender') {
           Capture.isArmed() ? Capture.disarm() : Capture.arm();
           render();
@@ -1841,6 +2426,19 @@
         }
       });
 
+      // Cadastrar uma lista de valores a tapa de botao e penoso; Enter cria.
+      overlay.addEventListener('keydown', (ev) => {
+        if (ev.key !== 'Enter') return;
+        const m = (ev.target.id || '').match(/^smax-gl-novo-(assunto|base|competencia)$/);
+        if (!m) return;
+        ev.preventDefault();
+        const r = Dados.criarValor(m[1], ev.target.value);
+        render();
+        setStatus(r.msg, r.ok ? 'ok' : 'err');
+        const campo = overlay.querySelector(`#smax-gl-novo-${m[1]}`);
+        if (campo) { campo.value = r.ok ? '' : ev.target.value; campo.focus(); }
+      });
+
       overlay.addEventListener('change', (ev) => {
         if (ev.target.id === 'smax-gl-disc-to') form.contornoTo = ev.target.value;
         if (ev.target.id === 'smax-gl-disc-purpose') form.contornoPurpose = ev.target.value;
@@ -1850,6 +2448,7 @@
         if (ev.target.id === 'smax-gl-title') form.title = ev.target.value;
         if (ev.target.id === 'smax-gl-desc') form.descriptionHtml = ev.target.innerHTML;
         if (ev.target.id === 'smax-gl-contorno') form.contornoHtml = ev.target.innerHTML;
+        if (ev.target.id === 'smax-gl-arquivo-url') urlDigitada = ev.target.value;
         if (ev.target.id === 'smax-gl-person-q') {
           personUI.term = ev.target.value;
           clearTimeout(personDebounce);
@@ -1891,8 +2490,8 @@
         <div class="smax-gl-panel">
           <div class="smax-gl-header">
             <div>
-              <h2>🌐 SMAX Global</h2>
-              <div class="smax-gl-sub">Abertura automatizada de chamado global · v${SMAX_GLOBAL_VERSION}</div>
+              <h2>🌐 SMAX Painel de Globais</h2>
+              <div class="smax-gl-sub">v${SMAX_GLOBAL_VERSION}</div>
             </div>
             <div class="smax-gl-header-actions">
               <button class="smax-gl-theme-btn" data-act="tema">🌓</button>
@@ -1902,6 +2501,7 @@
           <div class="smax-gl-tabs">
             <button class="smax-gl-tab" data-tab="abrir">Abrir chamado</button>
             <button class="smax-gl-tab" data-tab="aprender">Aprender molde</button>
+            <button class="smax-gl-tab" data-tab="config">Configuração</button>
           </div>
           <div class="smax-gl-body"></div>
           <div class="smax-gl-footer">

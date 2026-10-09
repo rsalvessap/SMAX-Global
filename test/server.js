@@ -37,8 +37,68 @@ const readBody = (req) => new Promise((resolve) => {
   req.on('end', () => { try { resolve(JSON.parse(raw)); } catch { resolve(null); } });
 });
 
+// GitHub falso. Guarda UM arquivo em memoria e responde como a Contents API:
+// GET devolve { sha, content } em base64, PUT exige o sha quando o arquivo ja
+// existe. E o suficiente para exercitar a trava otimista por _version sem tocar
+// num repositorio de verdade.
+let ghFile = null;   // { sha, content }  content = texto, nao base64
+
 http.createServer(async (req, res) => {
   const url = req.url.split('?')[0];
+
+  // Lido pela importacao (equivale ao raw.githubusercontent.com)
+  if (url === '/gh/raw') {
+    if (!ghFile) { res.writeHead(404); res.end('not found'); return; }
+    console.log('[gh] GET raw');
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(ghFile.content);
+    return;
+  }
+
+  // Lido e gravado pela publicacao (equivale a api.github.com/.../contents/...)
+  if (url === '/gh/contents') {
+    if (req.method === 'GET') {
+      if (!ghFile) { res.writeHead(404, { 'Content-Type': 'application/json' }); res.end('{"message":"Not Found"}'); return; }
+      console.log('[gh] GET contents');
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ sha: ghFile.sha, content: Buffer.from(ghFile.content, 'utf8').toString('base64') }));
+      return;
+    }
+    if (req.method === 'PUT') {
+      const body = await readBody(req);
+      const content = Buffer.from(String(body?.content || ''), 'base64').toString('utf8');
+      if (ghFile && body?.sha !== ghFile.sha) {
+        console.log('[gh] PUT recusado — sha divergente');
+        res.writeHead(409, { 'Content-Type': 'application/json' });
+        res.end('{"message":"sha does not match"}');
+        return;
+      }
+      ghFile = { sha: 'sha' + Date.now(), content };
+      let v = '?';
+      try { v = JSON.parse(content)._version; } catch { }
+      console.log(`[gh] PUT aceito — _version=${v}, ${content.length} chars`);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ content: { sha: ghFile.sha } }));
+      return;
+    }
+  }
+
+  // Atalhos do harness para forcar os cenarios de borda da fase 1.
+  if (url === '/gh/zerar') {
+    ghFile = null;
+    console.log('[gh] arquivo apagado');
+    res.writeHead(200); res.end('ok');
+    return;
+  }
+  if (url === '/gh/bumpversion') {
+    if (!ghFile) { res.writeHead(404); res.end('sem arquivo'); return; }
+    const obj = JSON.parse(ghFile.content);
+    obj._version = (Number(obj._version) || 0) + 5;
+    ghFile = { sha: 'sha' + Date.now(), content: JSON.stringify(obj, null, 2) };
+    console.log(`[gh] _version forcada para ${obj._version}`);
+    res.writeHead(200); res.end(String(obj._version));
+    return;
+  }
 
   if (/^\/rest\/\d+\/ems\/Person$/i.test(url)) {
     const filter = new URL(req.url, 'http://x').searchParams.get('filter') || '';

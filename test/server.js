@@ -66,6 +66,49 @@ for (let i = 0; i < 600; i++) {
   });
 }
 
+/* Acervo sintetico de globais para a aba "Consultar" (v1.16).
+ *
+ * 320 globais espalhados por ~400 dias, contados a partir de AGORA — o filtro de
+ * periodo compara com `Date.now()`, e fixture de data fixa deixaria de responder
+ * ao recorte depois de alguns meses.
+ *
+ * Tres coisas estao plantadas aqui de proposito:
+ *  - 320 passa dos 250 de uma pagina: a janela de 12 meses pega ~290 e por isso
+ *    exercita o "carregar mais". Com 30 fixtures a paginacao nunca apareceria.
+ *  - um a cada 10 e marcado "E Global" E tem GlobalId_c de outro global. Existe
+ *    em producao e o filtro do servidor nao consegue tirar: e o caso que prova o
+ *    descarte no cliente. O pai deles e um global proprio (`ID_PAI_SINT`), e nao
+ *    o 82133910: pendurar 32 filhos no 82133910 mudaria a contagem de 3 que os
+ *    testes do painel e do monitor usam como referencia.
+ *  - o status cicla entre vivos e encerrados, para o chip de situacao mudar
+ *    numero de forma visivel em vez de mudar nada.
+ */
+const AGORA = Date.now();
+const DIA = 86400000;
+const ID_PAI_SINT = '84999999';
+const STATUS_CICLO = ['New', 'Ready', 'InProgress', 'Pending', 'Suspended',
+  'RequestStatusComplete', 'Rejected', 'Cancelled'];
+REQUESTS.push({
+  Id: ID_PAI_SINT, IsGlobal_c: 'true', DisplayLabel: 'GLOBAL — pai dos sinteticos vinculados',
+  Status: 'InProgress', StatusSCCDSMAX_c: 'EmAtendimento_c', grupo: 'SUPORTE EPROC',
+  CreateTime: AGORA - 2 * DIA, LastUpdateTime: AGORA - DIA
+});
+for (let i = 0; i < 320; i++) {
+  const filho = i % 10 === 9;
+  REQUESTS.push({
+    Id: String(84000000 + i),
+    IsGlobal_c: i % 3 === 0 ? true : 'true',   // booleano e string, as duas formas
+    DisplayLabel: `GLOBAL sintetico ${i + 1} — ${filho ? 'vinculado a outro global' : 'indisponibilidade de sistema'}`,
+    Status: STATUS_CICLO[i % STATUS_CICLO.length],
+    StatusSCCDSMAX_c: i % 2 ? 'EmAtendimento_c' : 'Aguardando3Nivel_c',
+    grupo: ['SUPORTE EPROC', 'SUPORTE CUSTAS', 'SUPORTE MIGRACAO'][i % 3],
+    CreateTime: AGORA - Math.round(i * 1.25 * DIA),
+    LastUpdateTime: AGORA - Math.round(i * 1.25 * DIA) + 3600000,
+    pai: filho ? ID_PAI_SINT : undefined,
+    relOnly: i % 2 === 0
+  });
+}
+
 const entidadeDe = (r) => {
   const props = {
     Id: r.Id, DisplayLabel: r.DisplayLabel, IsGlobal_c: r.IsGlobal_c,
@@ -294,6 +337,41 @@ http.createServer(async (req, res) => {
     // "GlobalId_c" nao casa com o padrao de "Id" porque depois de Id vem "_c".
     const porId = valores('Id');
     const porPai = valores('GlobalId_c');
+
+    /* A consulta da aba "Consultar" (v1.16): filtro por IsGlobal_c, janela de
+     * CreateTime e lista de Status. O periodo "sem recorte" responde com a
+     * recusa por teto de 10.000 — e o que o SMAX faz com consulta aberta demais,
+     * e e o unico jeito de exercitar esse caminho na tela. */
+    if (/IsGlobal_c\s*=\s*'/.test(filter)) {
+      if (!/CreateTime\s*>=/.test(filter)) {
+        console.log('[mock] GET ems/Request (busca) sem recorte de data → recusado por teto de 10.000');
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ meta: { completion_status: 'FAILED' }, error: { messageKey: 'query.num.of.entities.exceeded', message: 'too many' } }));
+        return;
+      }
+      const desde = Number(/CreateTime\s*>=\s*(\d+)/.exec(filter)[1]);
+      // Os dois lados normalizados: o filtro manda sempre com o prefixo do enum,
+      // e as fixtures guardam das duas formas de proposito.
+      const semPref = (s) => String(s || '').replace(/^RequestStatus/, '');
+      const sts = valores('Status').map(semPref);
+      const ehTrue = (v) => v === true || v === 'true';
+      let achados = REQUESTS.filter(r => ehTrue(r.IsGlobal_c)
+        && (r.CreateTime || 0) >= desde
+        && (!sts.length || sts.includes(semPref(r.Status))));
+      // `order` e servidor, nao cliente: se o mock nao ordenar, "mais recentes
+      // primeiro" na tela seria so a ordem em que as fixtures foram declaradas.
+      if (/CreateTime\s+desc/i.test(qs.get('order') || '')) {
+        achados = achados.slice().sort((a, b) => (b.CreateTime || 0) - (a.CreateTime || 0));
+      }
+      const pag = achados.slice(skip, skip + size);
+      console.log(`[mock] GET ems/Request (busca) desde=${new Date(desde).toISOString().slice(0, 10)} status=${sts.length || 'todos'} order=${qs.get('order') || '—'} skip=${skip} size=${size} → ${pag.length}/${achados.length}`);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        meta: { completion_status: 'OK', total_count: achados.length },
+        entities: pag.map(entidadeDe)
+      }));
+      return;
+    }
 
     let hits = [];
     if (porPai.length) hits = REQUESTS.filter(r => r.pai && porPai.includes(r.pai));

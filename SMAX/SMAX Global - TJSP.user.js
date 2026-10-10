@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SMAX Painel de Globais - TJSP
 // @namespace    https://github.com/rsalvessap/SMAX-Global
-// @version      1.15
+// @version      1.16
 // @description  Painel de gestao de chamados globais do SMAX TJSP — lista curada, classificacao por assunto/base/competencia, sincronizacao por arquivo no GitHub e abertura automatizada de global por molde
 // @author       rsalvessap
 // @match        https://suporte.tjsp.jus.br/saw/*
@@ -27,7 +27,7 @@
   if (window.top && window.top !== window.self) return;
   if (window.location.hostname !== 'suporte.tjsp.jus.br') return;
 
-  const SMAX_GLOBAL_VERSION = '1.15';
+  const SMAX_GLOBAL_VERSION = '1.16';
 
   // O userscript roda em sandbox; quem dispara as requisicoes e a pagina.
   const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
@@ -1648,9 +1648,140 @@
       };
     };
 
+    /* ---------- (5) A consulta: achar globais que ja estao abertos ----------
+     *
+     * As outras leituras partem de uma lista de ids que o usuario ja tem. Esta
+     * nao: ela PROCURA. E a peca que faltava para incluir um global sem saber o
+     * numero dele de cabeca.
+     *
+     * Funcao separada do `lerPaginas` de proposito. O `lerPaginas` pagina ate
+     * cobrir o `total_count` inteiro porque o painel precisa do numero exato de
+     * filhos; aqui isso seria hostil — 10.000 globais dariam 40 requisicoes para
+     * o usuario ler as 20 primeiras linhas. Aqui pagina sob demanda, e o
+     * `lerPaginas` (caminho do monitor, verificado) fica intocado.
+     */
+
+    // Os 8 enums de Status, partidos em vivos e encerrados. Mesma divisao do
+    // `Metrica.ENCERRADOS` (:564) — Suspenso conta como vivo.
+    const STATUS_VIVOS = ['New', 'Ready', 'InProgress', 'Pending', 'Suspended'];
+    const STATUS_FIM = ['Complete', 'Rejected', 'Cancelled'];
+
+    const LAYOUT_BUSCA = [
+      'Id', 'DisplayLabel', 'Status', 'StatusSCCDSMAX_c',
+      'AssignedToGroup', 'AssignedToGroup.Name', 'CreateTime', 'LastUpdateTime',
+      // GlobalId_c entra no layout para o descarte de filho acontecer aqui, no
+      // cliente: "nao ser filho de outro global" nao e expressavel no filtro.
+      'GlobalId_c', 'IsGlobal_c'
+    ].join(',');
+
+    // Monta o filtro. Booleano vai ENTRE ASPAS e epoch vai SEM — as duas formas
+    // foram lidas em codigo de producao de terceiro (pesquisa-avancada-smax
+    // .user.js:3596 e :1330), nao supostas. O campo `IsGlobal_c` e filtravel no
+    // servidor: a propria tela de filtro do SMAX o oferece como campo
+    // (`data-aid="filter_field_IsGlobal_c"`, "é Global").
+    const filtroBusca = ({ desde = 0, situacao = 'abertos' } = {}) => {
+      const partes = [`IsGlobal_c = 'true'`];
+      if (desde) partes.push(`CreateTime >= ${Math.floor(desde)}`);
+      // Lista OR positiva, nunca `!=`: a negacao nao foi vista em nenhum filtro
+      // de producao, e filtro recusado pelo SMAX falha em silencio (volta vazio,
+      // que a tela leria como "nao existe nenhum").
+      const enums = situacao === 'abertos' ? STATUS_VIVOS
+        : situacao === 'encerrados' ? STATUS_FIM : [];
+      if (enums.length) partes.push(clausulaOu('Status', enums.map(s => `RequestStatus${s}`)));
+      return partes.join(' and ');
+    };
+
+    const PAGINA_BUSCA = 250;
+
+    // Conta antes de buscar. Uma requisicao de 1 registro responde "quantos
+    // existem", e e isso que deixa a tela dizer o tamanho do resultado antes de
+    // gastar 250 linhas de payload.
+    // Quem falha tem de dizer COM QUE filtro falhou. Sem isto a tela so sabe o
+    // filtro quando a consulta deu certo — e e justamente na recusa que a string
+    // exata precisa aparecer, porque e ela que diz se a forma do literal esta
+    // errada.
+    const comFiltro = async (filtro, fn) => {
+      try { return await fn(); }
+      catch (err) { err.filtro = filtro; throw err; }
+    };
+
+    const contarBusca = async (opcoes) => {
+      const filtro = filtroBusca(opcoes);
+      const resp = await comFiltro(filtro, () => ApiClient.request('ems/Request', {
+        timeout: 45000,
+        searchParams: { filter: filtro, layout: 'Id', size: '1', skip: '0', meta: 'totalCount' }
+      }));
+      const total = Number(resp && resp.meta && resp.meta.total_count);
+      return { filtro, total: Number.isFinite(total) ? total : 0 };
+    };
+
+    // Uma pagina. `order` no servidor (pesquisa-avancada-smax.user.js:1587) —
+    // sem isso o SMAX devolve na ordem dele e "mais recentes primeiro" teria de
+    // ser mentira ou ordenacao de um pedaco arbitrario.
+    const buscarPagina = async (opcoes = {}) => {
+      const { skip = 0 } = opcoes;
+      const filtro = filtroBusca(opcoes);
+      const resp = await comFiltro(filtro, () => ApiClient.request('ems/Request', {
+        timeout: 45000,
+        searchParams: {
+          filter: filtro, layout: LAYOUT_BUSCA, order: 'CreateTime desc',
+          size: String(PAGINA_BUSCA), skip: String(skip), meta: 'totalCount'
+        }
+      }));
+      if (resp && resp.meta && resp.meta.completion_status
+          && String(resp.meta.completion_status).toUpperCase() !== 'OK') {
+        const err = new Error('consulta recusada pelo SMAX');
+        err.body = JSON.stringify(resp);
+        err.filtro = filtro;
+        throw err;
+      }
+      const total = Number(resp && resp.meta && resp.meta.total_count);
+      const brutos = (resp && resp.entities) || [];
+      const itens = brutos.map((e) => {
+        const p = (e && e.properties) || {};
+        const rel = (e && e.related_properties) || {};
+        const id = String(p.Id || '');
+        const bruto = (p.GlobalId_c !== undefined && p.GlobalId_c !== null)
+          ? p.GlobalId_c : rel.GlobalId_c;
+        const pai = extrairGlobalId(bruto);
+        return {
+          id,
+          titulo: String(p.DisplayLabel || ''),
+          status: String(p.Status || ''),
+          statusOp: String(p.StatusSCCDSMAX_c || ''),
+          grupo: String(
+            (rel.AssignedToGroup && rel.AssignedToGroup.Name)
+            || (p.AssignedToGroup && p.AssignedToGroup.Name)
+            || p['AssignedToGroup.Name'] || p.AssignedToGroup || ''
+          ),
+          criadoEm: Number(p.CreateTime) || 0,
+          atualizadoEm: Number(p.LastUpdateTime) || 0,
+          ehGlobal: ehVerdadeiro(p.IsGlobal_c),
+          // Auto-referencia nao e vinculo de pai (mesma regra do `conferir`).
+          paiId: pai && pai !== id ? pai : ''
+        };
+      }).filter(x => x.id);
+
+      // Filho de outro global nao e candidato, e o filtro do servidor nao
+      // conseguiu tirar. Sai aqui, e o quanto saiu e devolvido para a tela
+      // poder explicar a diferenca entre o total e o que ela mostra.
+      const semFilhos = itens.filter(x => !x.paiId);
+      return {
+        filtro,
+        total: Number.isFinite(total) ? total : itens.length,
+        itens: semFilhos,
+        descartados: itens.length - semFilhos.length,
+        // `lidos` conta as linhas que o SERVIDOR devolveu, nao as que sobraram:
+        // e esse numero que faz o `skip` da proxima pagina cair no lugar certo.
+        lidos: brutos.length,
+        proximoSkip: skip + brutos.length
+      };
+    };
+
     return {
       conferir, emLote, extrairGlobalId, lerEstado, contarFilhos, sondarFilhos,
-      motivoDeErro, lerChamado, parseComentarios
+      motivoDeErro, lerChamado, parseComentarios,
+      contarBusca, buscarPagina, PAGINA_BUSCA
     };
   })();
 
@@ -3008,12 +3139,34 @@
     const personUI = { open: false, term: '', loading: false, error: '', results: [], searchSeq: 0 };
     let personDebounce = null;
     let filtroDebounce = null;
+    let consultaDebounce = null;
 
     // Estado da tela "Incluir global". De proposito nao persiste: a conferencia e
     // pontual, e resultado guardado estaria velho na proxima abertura do painel.
     const incluirUI = {
       texto: '', verificando: false, resultados: [], nota: '',
       marcas: { assunto: new Set(), base: new Set(), competencia: new Set() }
+    };
+
+    // Estado da tela "Consultar". Tambem nao persiste, pelo mesmo motivo: um
+    // resultado de busca guardado estaria velho na proxima abertura.
+    // `buscou` existe separado de `itens.length` porque "ainda nao procurei" e
+    // "procurei e nao achou nada" sao duas telas diferentes, e confundi-las e
+    // justamente a falha de mostrar ausencia de leitura como zero.
+    const consultaUI = {
+      dias: 90,            // 0 = sem recorte de data
+      situacao: 'abertos', // abertos | encerrados | todos
+      termo: '',
+      buscando: false,
+      buscou: false,
+      total: 0,            // quantos o SMAX diz que existem
+      itens: [],
+      descartados: 0,      // filhos de outro global, tirados no cliente
+      lidos: 0,            // linhas que o servidor devolveu, somadas as paginas
+      proximoSkip: 0,
+      filtro: '',          // o filtro exato que foi enviado — aparece no erro
+      erro: '',
+      marcados: new Set()
     };
 
     const setStatus = (msg, kind = '') => {
@@ -3517,8 +3670,9 @@
 
     // O painel vazio tem a mesma resposta nas duas telas que leem a lista.
     const vazio = () => (PgStore.dados().globais.length ? '' : `<div class="smax-gl-note">
-      O painel está vazio. Vá em <strong>Incluir global</strong> para colocar o primeiro chamado,
-      e em <strong>Configuração</strong> para criar os valores de assunto, base e competência.
+      O painel está vazio. Use <strong>Consultar</strong> para achar os globais que já estão abertos
+      no SMAX, ou <strong>Incluir global</strong> se você já tem os números em mãos. Em
+      <strong>Configuração</strong> ficam os valores de assunto, base e competência.
     </div>`);
 
     // Um bloco de filtros só, usado pelo Painel e pelos Gráficos: dois
@@ -3869,6 +4023,145 @@
         </div>`;
     }).join('');
 
+    /* ---------- Consultar (achar global que ja esta aberto) ---------- */
+
+    const PERIODOS = [
+      { dias: 7, rot: '7 dias' }, { dias: 30, rot: '30 dias' },
+      { dias: 90, rot: '90 dias' }, { dias: 365, rot: '12 meses' },
+      { dias: 0, rot: 'sem recorte' }
+    ];
+    const SITUACOES = [
+      { id: 'abertos', rot: 'Abertos' },
+      { id: 'encerrados', rot: 'Encerrados' },
+      { id: 'todos', rot: 'Todos' }
+    ];
+
+    // O termo filtra NO CLIENTE, sobre o que a busca trouxe. O operador de texto
+    // do SMAX (`wordstartswith`) so foi visto funcionando em Person, Location e
+    // Group — nunca em Request —, e filtro que o servidor recusa volta vazio sem
+    // erro, o que a tela leria como "nao existe nenhum".
+    const consultaVisiveis = () => {
+      const t = consultaUI.termo.trim().toLowerCase();
+      if (!t) return consultaUI.itens;
+      return consultaUI.itens.filter(x =>
+        x.titulo.toLowerCase().includes(t) || x.id.includes(t));
+    };
+
+    // Marcado QUE AINDA NAO ESTA NO PAINEL. A diferenca importa: depois de uma
+    // inclusao o id continua no conjunto de marcados, e contar esses faria o
+    // botao do rodape prometer um numero que ja entrou.
+    const consultaMarcadosNovos = () => [...consultaUI.marcados].filter(id => !Dados.acharGlobal(id));
+
+    const renderConsultar = () => {
+      const c = consultaUI;
+      const visiveis = consultaVisiveis();
+      const faltaCarregar = c.buscou && c.lidos < c.total;
+
+      const chipsPeriodo = PERIODOS.map(p => `
+        <button class="smax-gl-chip" data-act="cons-dias" data-dias="${p.dias}"
+                data-active="${c.dias === p.dias}">${p.rot}</button>`).join('');
+      const chipsSituacao = SITUACOES.map(s => `
+        <button class="smax-gl-chip" data-act="cons-situacao" data-sit="${s.id}"
+                data-active="${c.situacao === s.id}">${s.rot}</button>`).join('');
+
+      // O filtro enviado aparece junto com o erro de proposito: se a forma do
+      // literal estiver errada, o que se precisa ver e a string exata.
+      const blocoErro = c.erro ? `
+        <div class="smax-gl-note" style="margin-top:14px; color:var(--sp-danger-text);">
+          <strong>A consulta falhou:</strong> ${Utils.escapeHtml(c.erro)}
+          ${c.filtro ? `<br><code style="font-size:11px;">filter=${Utils.escapeHtml(c.filtro)}</code>` : ''}
+        </div>` : '';
+
+      let resumo = '';
+      if (c.buscando) {
+        resumo = '<div class="smax-gl-note" style="margin-top:14px;">Consultando o SMAX…</div>';
+      } else if (c.buscou && !c.erro) {
+        const partes = [`O SMAX diz que existem <strong>${c.total}</strong> global(is) com esse filtro`];
+        partes.push(`trazidos <strong>${c.lidos}</strong>`);
+        if (c.descartados) partes.push(`<strong>${c.descartados}</strong> descartado(s) por serem filhos de outro global`);
+        if (c.termo.trim()) {
+          partes.push(`<strong>${visiveis.length}</strong> ${visiveis.length === 1 ? 'bate' : 'batem'} com o termo`);
+        }
+        resumo = `<div class="smax-gl-note" style="margin-top:14px;">${partes.join(' · ')}.</div>`;
+      }
+
+      const lista = (!c.buscando && c.buscou && !c.erro) ? (
+        visiveis.length ? visiveis.map((x) => {
+          const jaTem = !!Dados.acharGlobal(x.id);
+          const marcado = c.marcados.has(x.id);
+          const st = Metrica.rotuloStatus(x.status) || '—';
+          const stOp = Metrica.rotuloStatusOp(x.statusOp) || '';
+          return `
+            <div class="smax-gl-cand">
+              <div class="smax-gl-cand-info">
+                <div class="smax-gl-cand-title">
+                  #${Utils.escapeHtml(x.id)}
+                  ${jaTem ? '<span class="smax-gl-badge">já no painel</span>' : ''}
+                </div>
+                <div class="smax-gl-cand-meta">${Utils.escapeHtml(x.titulo || '(sem título)')}</div>
+                <div class="smax-gl-cand-meta">
+                  ${Utils.escapeHtml(st)}${stOp ? ` / ${Utils.escapeHtml(stOp)}` : ''}
+                  ${x.grupo ? ` · ${Utils.escapeHtml(x.grupo)}` : ''}
+                  ${x.criadoEm ? ` · aberto em ${Utils.escapeHtml(Utils.formatBrDateTime(x.criadoEm))}` : ''}
+                </div>
+              </div>
+              <div>
+                ${jaTem
+                  ? ''
+                  : `<button class="smax-gl-chip" data-act="cons-marcar" data-id="${Utils.escapeHtml(x.id)}"
+                             data-active="${marcado}">${marcado ? '✓ marcado' : 'marcar'}</button>`}
+              </div>
+            </div>`;
+        }).join('')
+          : `<div class="smax-gl-note" style="margin-top:14px;">
+               Nenhum global ${c.termo.trim() ? 'bate com o termo' : 'nesse filtro'}.
+               ${c.total && c.descartados === c.lidos ? 'Todos os que voltaram eram filhos de outro global.' : ''}
+             </div>`
+      ) : '';
+
+      // Marcar em massa so faz sentido sobre os que ainda podem entrar: os que
+      // ja estao no painel nao tem nem chip de marcar.
+      const marcaveis = visiveis.filter(x => !Dados.acharGlobal(x.id)).length;
+      const acoesLista = (!c.buscando && c.buscou && !c.erro && visiveis.length) ? `
+        <div style="display:flex; gap:8px; margin-top:12px; flex-wrap:wrap;">
+          ${marcaveis ? `<button class="smax-gl-btn" data-act="cons-marcar-visiveis">
+              ${marcaveis === 1 ? 'Marcar o visível' : `Marcar os ${marcaveis} visíveis`}</button>` : ''}
+          ${consultaMarcadosNovos().length ? '<button class="smax-gl-btn" data-act="cons-desmarcar">Desmarcar tudo</button>' : ''}
+          ${faltaCarregar ? `<button class="smax-gl-btn" data-act="cons-mais">
+              Carregar mais (faltam ${c.total - c.lidos})</button>` : ''}
+        </div>` : '';
+
+      return `
+        <div class="smax-gl-note">
+          Procura no SMAX os chamados marcados como <strong>“É global”</strong> que você ainda não
+          tem no painel. O filtro do período e da situação vai para o servidor; o termo filtra
+          o que já voltou. Quem é filho de outro global sai da lista — não dá para filtrar isso
+          no servidor, então o descarte acontece aqui e o número aparece no resumo.
+        </div>
+
+        <div class="smax-gl-label" style="margin-top:14px;">Aberto nos últimos</div>
+        <div class="smax-gl-chips">${chipsPeriodo}</div>
+
+        <div class="smax-gl-label" style="margin-top:12px;">Situação</div>
+        <div class="smax-gl-chips">${chipsSituacao}</div>
+
+        <div class="smax-gl-label" style="margin-top:12px;">Termo no título ou no número (opcional)</div>
+        <input class="smax-gl-input" id="smax-gl-cons-termo" type="text" style="width:100%;"
+               value="${Utils.escapeHtml(c.termo)}" placeholder="ex.: SAJ, indisponibilidade, 8213">
+
+        <div style="display:flex; gap:8px; margin-top:10px;">
+          <button class="smax-gl-btn smax-gl-btn-primary" data-act="cons-buscar" ${c.buscando ? 'disabled' : ''}>
+            ${c.buscando ? 'Consultando…' : '🔍 Consultar o SMAX'}
+          </button>
+          ${c.buscou ? '<button class="smax-gl-btn" data-act="cons-limpar">Limpar</button>' : ''}
+        </div>
+
+        ${blocoErro}
+        ${resumo}
+        ${acoesLista}
+        ${lista}`;
+    };
+
     const renderIncluir = () => {
       const r = incluirUI;
       const aprovados = r.resultados.filter(x => x.estado === 'ok');
@@ -3900,6 +4193,7 @@
           Cole um ou vários números de chamado. O script confere cada um no SMAX antes de incluir:
           tem de existir, estar marcado como <strong>“É global”</strong>, não ser filho de outro
           global e ainda não estar no painel.
+          <br>Não sabe o número? Procure na aba <strong>Consultar</strong> e mande os marcados para cá.
         </div>
 
         <div class="smax-gl-label">Números dos chamados</div>
@@ -4105,6 +4399,7 @@
         : activeTab === 'graficos' ? renderGraficos()
         : activeTab === 'novidades' ? renderNovidades()
         : activeTab === 'abrir' ? renderAbrir()
+        : activeTab === 'consultar' ? renderConsultar()
         : activeTab === 'incluir' ? renderIncluir()
         : activeTab === 'config' ? renderConfig()
         : renderAprender();
@@ -4122,6 +4417,12 @@
         footer.innerHTML = `<button class="smax-gl-btn" data-act="preview">Ver payload</button>
            <button class="smax-gl-btn smax-gl-btn-primary" data-act="criar" ${busy ? 'disabled' : ''}>
              ${busy ? 'Criando…' : '🌐 Abrir chamado global'}
+           </button>`;
+      } else if (activeTab === 'consultar') {
+        const n = consultaMarcadosNovos().length;
+        footer.innerHTML = `<button class="smax-gl-btn smax-gl-btn-primary" data-act="cons-para-incluir"
+             ${n && !busy ? '' : 'disabled'}>
+             Mandar para Incluir (${n})
            </button>`;
       } else if (activeTab === 'incluir') {
         const n = incluirUI.resultados.filter(x => x.estado === 'ok').length;
@@ -4518,6 +4819,117 @@
       // Aceita espaco, virgula, ponto-e-virgula, quebra de linha e "#" na frente.
       const achados = (txt.match(/\d{3,}/g) || []);
       return { txt, ids: [...new Set(achados)] };
+    };
+
+    /* ---------- Consultar ---------- */
+
+    // O termo mora num <input>, e `render()` reescreve o corpo inteiro: sem ler
+    // o campo antes de qualquer re-render, o que o usuario digitou desaparece.
+    const lerTermoConsulta = () => {
+      const el = overlay.querySelector('#smax-gl-cons-termo');
+      if (el) consultaUI.termo = el.value;
+    };
+
+    const DIA_MS = 86400000;
+
+    const consultar = async (continuando) => {
+      if (consultaUI.buscando) return;
+      lerTermoConsulta();
+      const c = consultaUI;
+      const desde = c.dias ? Date.now() - c.dias * DIA_MS : 0;
+
+      if (!continuando) {
+        c.itens = [];
+        c.marcados.clear();
+        c.descartados = 0;
+        c.lidos = 0;
+        c.proximoSkip = 0;
+        c.total = 0;
+        c.erro = '';
+        c.buscou = false;
+      }
+      c.buscando = true;
+      render();
+
+      try {
+        // Conta antes de buscar, e so na primeira pagina: e uma requisicao de 1
+        // registro que diz o tamanho do resultado, e com ela a tela nunca mostra
+        // "20 globais" quando existem 800.
+        if (!continuando) {
+          setStatus('Contando quantos globais batem com o filtro…');
+          const cont = await PgApi.contarBusca({ desde, situacao: c.situacao });
+          c.total = cont.total;
+          c.filtro = cont.filtro;
+          if (!c.total) {
+            c.buscou = true;
+            setStatus('O SMAX não encontrou nenhum global com esse filtro.', 'err');
+            return;
+          }
+        }
+
+        setStatus(`Trazendo ${Math.min(PgApi.PAGINA_BUSCA, c.total - c.lidos)} de ${c.total}…`);
+        const pag = await PgApi.buscarPagina({ desde, situacao: c.situacao, skip: c.proximoSkip });
+        c.filtro = pag.filtro;
+        // O total da pagina vale mais que o da contagem: foi medido agora.
+        c.total = pag.total;
+        c.itens = c.itens.concat(pag.itens);
+        c.descartados += pag.descartados;
+        c.lidos += pag.lidos;
+        c.proximoSkip = pag.proximoSkip;
+        c.buscou = true;
+
+        // Pagina que volta vazia com total maior e um laco infinito em potencial
+        // no botao "carregar mais". Trava aqui, dizendo o que aconteceu.
+        if (!pag.lidos && c.lidos < c.total) {
+          c.erro = `o SMAX diz haver ${c.total} mas parou de devolver linhas em ${c.lidos}`;
+          setStatus('A paginação parou antes do total informado.', 'err');
+          return;
+        }
+
+        const novos = c.itens.filter(x => !Dados.acharGlobal(x.id)).length;
+        setStatus(
+          `${c.lidos} de ${c.total} lido(s) — ${novos} ainda não está(ão) no painel.`,
+          novos ? 'ok' : ''
+        );
+      } catch (err) {
+        c.buscou = true;
+        c.erro = PgApi.motivoDeErro(err);
+        if (err && err.filtro) c.filtro = err.filtro;
+        setStatus(`A consulta falhou: ${c.erro}`, 'err');
+      } finally {
+        c.buscando = false;
+        render();
+      }
+    };
+
+    const limparConsulta = () => {
+      consultaUI.itens = [];
+      consultaUI.marcados.clear();
+      consultaUI.descartados = 0;
+      consultaUI.lidos = 0;
+      consultaUI.proximoSkip = 0;
+      consultaUI.total = 0;
+      consultaUI.erro = '';
+      consultaUI.buscou = false;
+      consultaUI.termo = '';
+      render();
+      setStatus('');
+    };
+
+    // Nao inclui direto: joga os marcados na aba Incluir e deixa a conferencia,
+    // a classificacao e o `Dados.incluir` serem os mesmos de sempre. Duplicar a
+    // regra de admissao aqui seria ter duas versoes dela para divergirem.
+    const consultaParaIncluir = () => {
+      const ids = consultaMarcadosNovos();
+      if (!ids.length) { setStatus('Nenhum global marcado.', 'err'); return; }
+      incluirUI.texto = ids.join(' ');
+      incluirUI.resultados = [];
+      // A marcacao cumpriu o papel dela: os numeros agora estao na aba Incluir.
+      // Mante-la viva faria o contador do rodape prometer um repasse ja feito.
+      consultaUI.marcados.clear();
+      activeTab = 'incluir';
+      render();
+      setStatus(`${ids.length} número(s) na aba Incluir — confira no SMAX e classifique.`, 'ok');
     };
 
     const conferirIds = async () => {
@@ -4933,6 +5345,9 @@
         const tab = ev.target.closest('.smax-gl-tab');
         if (tab) {
           readForm();
+          // O termo da consulta tambem e campo de formulario: sair da aba sem
+          // le-lo faria a lista voltar sem o recorte que estava na tela.
+          lerTermoConsulta();
           activeTab = tab.dataset.tab;
           render();
           /* Abrir a aba limpa o selo — DEPOIS do render, de proposito: assim a
@@ -5158,6 +5573,40 @@
           render();
           setStatus(r.msg, r.ok ? 'ok' : 'err');
         }
+        /* ---- Consultar ---- */
+        else if (act === 'cons-dias') {
+          lerTermoConsulta();
+          consultaUI.dias = Number(ev.target.closest('[data-dias]').dataset.dias);
+          render();
+        }
+        else if (act === 'cons-situacao') {
+          lerTermoConsulta();
+          consultaUI.situacao = ev.target.closest('[data-sit]').dataset.sit;
+          render();
+        }
+        else if (act === 'cons-buscar') { consultar(false); }
+        else if (act === 'cons-mais') { consultar(true); }
+        else if (act === 'cons-limpar') { limparConsulta(); }
+        else if (act === 'cons-marcar') {
+          lerTermoConsulta();
+          const id = ev.target.closest('[data-id]').dataset.id;
+          consultaUI.marcados.has(id) ? consultaUI.marcados.delete(id) : consultaUI.marcados.add(id);
+          render();
+        }
+        else if (act === 'cons-marcar-visiveis') {
+          lerTermoConsulta();
+          // So os que ainda nao estao no painel: marcar repetido nao leva a nada
+          // e inflaria a contagem do botao do rodape.
+          consultaVisiveis().forEach(x => { if (!Dados.acharGlobal(x.id)) consultaUI.marcados.add(x.id); });
+          render();
+          setStatus(`${consultaUI.marcados.size} marcado(s).`);
+        }
+        else if (act === 'cons-desmarcar') {
+          lerTermoConsulta();
+          consultaUI.marcados.clear();
+          render();
+        }
+        else if (act === 'cons-para-incluir') { consultaParaIncluir(); }
         else if (act === 'conferir-ids') { conferirIds(); }
         else if (act === 'limpar-conferencia') {
           incluirUI.resultados = [];
@@ -5285,6 +5734,17 @@
         // Marcar um chip redesenha a tela; sem isto o que foi digitado morreria.
         if (ev.target.id === 'smax-gl-ids') incluirUI.texto = ev.target.value;
         if (ev.target.id === 'smax-gl-nota') incluirUI.nota = ev.target.value;
+        // Mesmo tratamento do termo do painel: guarda a cada tecla, redesenha
+        // com atraso e devolve o cursor — o re-render recria o <input>.
+        if (ev.target.id === 'smax-gl-cons-termo') {
+          consultaUI.termo = ev.target.value;
+          clearTimeout(consultaDebounce);
+          consultaDebounce = setTimeout(() => {
+            render();
+            const el = overlay && overlay.querySelector('#smax-gl-cons-termo');
+            if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); }
+          }, 280);
+        }
         if (ev.target.id === 'smax-gl-f-termo') {
           PgStore.prefs.filtros.termo = ev.target.value;
           clearTimeout(filtroDebounce);
@@ -5351,6 +5811,7 @@
             <button class="smax-gl-tab" data-tab="graficos">Gráficos</button>
             <button class="smax-gl-tab" data-tab="novidades">Novidades</button>
             <button class="smax-gl-tab" data-tab="abrir">Abrir chamado</button>
+            <button class="smax-gl-tab" data-tab="consultar">Consultar</button>
             <button class="smax-gl-tab" data-tab="incluir">Incluir global</button>
             <button class="smax-gl-tab" data-tab="aprender">Aprender molde</button>
             <button class="smax-gl-tab" data-tab="config">Configuração</button>

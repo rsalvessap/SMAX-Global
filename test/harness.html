@@ -359,6 +359,77 @@
 </div>
 
 <div class="card">
+  <strong>v1.16 — Consultar (achar global já aberto).</strong><br>
+  A aba <em>Consultar</em> procura no SMAX os chamados marcados como “É global”. O período e a
+  situação vão no filtro do servidor (<code>IsGlobal_c&nbsp;=&nbsp;'true'</code>,
+  <code>CreateTime&nbsp;&gt;=&nbsp;epoch</code> e uma lista <code>or</code> de
+  <code>Status</code>); o termo filtra no cliente. O mock traz <strong>320 globais sintéticos</strong>
+  espalhados por ~400 dias, contados a partir de <em>agora</em> — data fixa deixaria de responder ao
+  recorte depois de alguns meses.
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Conta antes de buscar.</strong> Toda consulta nova faz primeiro um pedido de
+    <code>size=1&amp;meta=totalCount</code> e só depois pede as 250 linhas. No log do servidor tem de
+    aparecer nessa ordem, e a tela tem de dizer o total do SMAX — não o número de linhas que ela
+    conseguiu trazer. Mostrar “20 globais” quando existem 300 seria apresentar o pedaço como o todo.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Ordem e paginação.</strong> O log tem de mostrar <code>order=CreateTime desc</code> —
+    ordenar só o pedaço que voltou faria de “mais recentes primeiro” uma meia-verdade. Em
+    <em>12 meses</em> o resultado passa de 250: a primeira página traz 250, o botão
+    <em>Carregar mais</em> aparece dizendo quantos faltam, e a segunda página tem de vir com
+    <code>skip=250</code> e <em>continuar</em> a lista, sem repetir nem pular registro.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Filho de global não é candidato.</strong> Um a cada 10 sintéticos está marcado “É global”
+    <em>e</em> tem <code>GlobalId_c</code> de outro global — isso existe em produção e não é
+    expressável no filtro. Eles têm de sair da lista e o resumo tem de dizer quantos saíram: lista
+    menor que o total sem explicação pareceria resultado perdido. O pai deles é o
+    <code>84999999</code>, e não o <code>82133910</code>, de propósito — pendurar 32 filhos no
+    82133910 mudaria a contagem de 3 que os testes do painel e do monitor usam de referência.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Situação muda número.</strong> Os sintéticos ciclam pelos 8 enums de status, metade vivos
+    e metade encerrados. <em>Abertos</em> → <em>Encerrados</em> → <em>Todos</em> tem de mudar o total
+    de forma visível (grosso modo 5/8, 3/8 e 8/8). O filtro usa lista <code>or</code> positiva e
+    nunca <code>!=</code>: negação não foi vista em nenhum filtro de produção, e filtro recusado pelo
+    SMAX volta vazio <em>sem erro</em>, que a tela leria como “não existe nenhum”.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Teto de 10.000.</strong> Escolha <em>sem recorte</em>: o mock responde com
+    <code>query.num.of.entities.exceeded</code>, como o SMAX faz com consulta aberta demais. A tela
+    tem de mostrar a recusa <em>e o filtro exato que foi enviado</em> — se a forma do literal estiver
+    errada em produção, é essa string que se precisa ver; falha silenciosa viraria “nenhum
+    resultado”.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Quem já está no painel.</strong> Inclua o <code>82133910</code>, depois consulte
+    <em>12 meses</em>: ele tem de aparecer com o selo <em>já no painel</em> e <strong>sem</strong>
+    botão de marcar. <em>Marcar os N visíveis</em> também tem de pular esses — marcar repetido
+    inflaria a contagem do rodapé sem levar a nada.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>O repasse para Incluir.</strong> <em>Mandar para Incluir (N)</em> escreve os números na
+    aba <em>Incluir</em> e troca de aba; a conferência, a classificação e a gravação continuam sendo
+    as mesmas de sempre. Duplicar a regra de admissão aqui seria ter duas versões dela para
+    divergirem. Confira que <em>Conferir no SMAX</em> aprova os que vieram e que o termo digitado
+    sobrevive a marcar um chip — o re-render recria o <code>&lt;input&gt;</code>.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Nota sobre a verificação.</strong> Em 2026-10-09 tudo acima foi conferido neste harness.
+    Números medidos: <em>90 dias / abertos</em> → o SMAX diz 48, 4 descartados por vínculo, 44 na
+    tela; <em>12 meses / todos</em> → 298, primeira página 250 e <em>Carregar mais</em> fechando em
+    298/298 com <strong>zero</strong> ids repetidos e a ordem da primeira página preservada como
+    prefixo da segunda; abertos 189 + encerrados 109 = todos 298. O log do mock mostrou
+    <code>size=1</code> antes de <code>size=250</code> em toda consulta nova. A autorreferência do
+    <code>82140011</code> (<code>GlobalId_c</code> apontando para ele mesmo) <em>não</em> foi
+    descartada, que é o certo — ela não é vínculo de pai. Dois defeitos saíram daqui e foram
+    corrigidos antes da entrega: o contador do rodapé continuava contando quem já tinha entrado no
+    painel, e a recusa por teto aparecia <em>sem</em> o filtro, justamente no caso em que a string
+    exata é a única coisa útil na tela.
+  </div>
+</div>
+
+<div class="card">
   <strong>3.</strong> Use o candidato como molde, volte em <em>Abrir chamado</em>, preencha e clique em <em>Ver payload</em>.
   Confira se <code>DisplayLabel</code>, <code>Description</code>, <code>Urgency</code> e <code>ImpactScope</code> foram sobrescritos
   e se <code>Id</code>/<code>CreateTime</code>/<code>Comments</code> sumiram.

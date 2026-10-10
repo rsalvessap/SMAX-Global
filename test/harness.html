@@ -440,7 +440,7 @@
   <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
     <strong>A busca de GSE é em <code>PersonGroup</code>, não em <code>Group</code>.</strong>
     <code>Group</code> responde “operação não permitida” no SMAX de verdade. Digite
-    <em>supor</em> em <em>+ Adicionar GSE</em>: têm de vir 5 (CADASTRO, CUSTAS, EPROC, MIGRACAO,
+    <em>supor</em> em <em>+ Adicionar GSEs</em>: têm de vir 5 (CADASTRO, CUSTAS, EPROC, MIGRACAO,
     TELEFONIA). Digite <em>eproc</em>: têm de vir <strong>2</strong>, e uma delas é
     <em>GSE SGS EPROC 1 GRAU</em> — prova que <code>wordstartswith</code> casa com o início de
     <em>qualquer</em> palavra e não só da primeira. Digite <em>suporte c</em>: as duas palavras são
@@ -526,6 +526,57 @@
     e a linha virou <em>já no painel</em> com <em>Editar</em> no lugar do chip. A nota sobreviveu a
     marcar um chip, e as GSEs escolhidas sobreviveram à troca de aba. Um defeito saiu daqui e foi
     corrigido antes da entrega: o rodapé dizia “Incluir os <strong>1</strong> marcados”.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>O que mudou na v1.18.</strong> A caixa de GSE virou seleção múltipla e o corpo de
+    <em>todas</em> as abas passou a usar a largura da tela. Onde este cartão diz
+    <em>+ Adicionar GSE</em>, hoje é <em>+ Adicionar GSEs</em>. Ver o cartão da v1.18.
+  </div>
+</div>
+
+<div class="card">
+  <strong>v1.18 — GSE em lote e abas em tela cheia.</strong><br>
+  Escolher GSE era uma por vez: o clique gravava a GSE e <em>fechava</em> a busca limpando o termo,
+  então três GSEs custavam abrir → digitar → clicar, três vezes, redigitando o mesmo
+  <em>supor</em> a cada volta. Agora o clique <strong>alterna</strong> e a caixa fica aberta com o
+  termo e a lista de resultados intactos.
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Uma busca, várias GSEs.</strong> Digite <em>supor</em> e clique em três das 5 linhas sem
+    tocar em mais nada: o campo tem de continuar com <em>supor</em>, a lista tem de continuar com as
+    5 linhas, e os três chips têm de aparecer. Cada linha mostra <code>☑</code>/<code>☐</code>, e
+    clicar numa já marcada <strong>desmarca</strong> — o mesmo botão serve para pôr e tirar.
+    <em>Marcar as N que faltam</em> pega de uma vez todas as encontradas que ainda não entraram, e
+    fica desabilitado como <em>Todas já marcadas</em> quando não falta nenhuma.
+    <em>Limpar GSEs</em> só aparece com duas ou mais escolhidas: com uma só, o <code>✕</code> do
+    chip já resolve.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Por que <code>refreshGseBox</code> e não <code>render()</code>.</strong> Marcar uma GSE
+    agora redesenha <em>só</em> a caixa. Nada fora dela depende da escolha, e um
+    <code>render()</code> inteiro reescreve <code>.smax-gl-body</code> — o que tiraria o foco do
+    campo de busca e, em lote, devolveria exatamente o atrito que a mudança remove.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Todas as abas em tela cheia.</strong> O painel já ocupava <code>100vw/100vh</code>, mas
+    o <em>conteúdo</em> das abas de formulário era centrado numa coluna de 920px por padding
+    (<code>data-wide="false"</code>). Esse atributo e a regra de CSS saíram: as oito abas usam
+    <code>padding:16px</code> e a largura inteira. Em tela larga, confira que Abrir, Consultar,
+    Incluir, Aprender e Config esticam como o Painel.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Nota sobre a verificação.</strong> Em 2026-10-10, neste harness: quatro cliques
+    seguidos em <em>supor</em> (44001, 44003, 44006, depois 44002 para desmarcar) mantiveram a caixa
+    aberta, o termo <em>supor</em> e as 5 linhas nas quatro vezes, com chips e <code>☑</code>
+    sempre em sincronia. <em>Limpar GSEs</em> zerou e devolveu a frase “Nenhuma GSE escolhida”;
+    <em>Marcar as 5 que faltam</em> trouxe as 5 de volta. Os três rótulos do botão de lote foram
+    vistos: <em>Marcar as 2 que faltam</em>, <em>Marcar a que falta</em> e <em>Todas já marcadas</em>
+    (desabilitado) — o plural errado “Marcar as <strong>1</strong> que faltam” apareceu no teste e
+    foi corrigido antes da entrega, mesmo defeito do rodapé da v1.17. As 5 GSEs sobreviveram ao
+    recarregamento da página (<code>GM_setValue</code>). No servidor, a cadeia de 5 unidas por
+    <code>or</code> devolveu <strong>326</strong> chamados repartidos em EPROC 86 / CUSTAS 82 /
+    MIGRACAO 82, contra <strong>111</strong> só de EPROC com uma GSE única — isto é, união e não
+    interseção, e o <code>or</code> de fato chegou ao servidor. O padding do corpo foi medido em
+    <code>16px</code> nas oito abas.
   </div>
 </div>
 

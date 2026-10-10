@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SMAX Painel de Globais - TJSP
 // @namespace    https://github.com/rsalvessap/SMAX-Global
-// @version      1.17
+// @version      1.18
 // @description  Painel de gestao de chamados globais do SMAX TJSP — lista curada, classificacao por assunto/base/competencia, sincronizacao por arquivo no GitHub e abertura automatizada de global por molde
 // @author       rsalvessap
 // @match        https://suporte.tjsp.jus.br/saw/*
@@ -27,7 +27,7 @@
   if (window.top && window.top !== window.self) return;
   if (window.location.hostname !== 'suporte.tjsp.jus.br') return;
 
-  const SMAX_GLOBAL_VERSION = '1.17';
+  const SMAX_GLOBAL_VERSION = '1.18';
 
   // O userscript roda em sandbox; quem dispara as requisicoes e a pagina.
   const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
@@ -2903,13 +2903,9 @@
 .smax-gl-badge-warn { color:var(--sp-pending); }
 .smax-gl-badge-err { color:var(--sp-danger-text); }
 
-/* A lista e os graficos usam a largura toda. As telas de formulario nao: o
-   corpo continua do tamanho da tela (a barra de rolagem fica na borda, onde
-   se espera), mas o conteudo e centrado numa coluna legivel por padding. */
-.smax-gl-panel[data-wide="false"] > .smax-gl-body {
-  padding-left:max(16px, calc((100% - 920px) / 2));
-  padding-right:max(16px, calc((100% - 920px) / 2));
-}
+/* TODAS as abas usam a largura toda da tela. Antes as de formulario eram
+   centradas numa coluna de 920px por padding (data-wide="false"); o pedido
+   foi tela cheia em todas, entao a unica largura e a da tela. */
 .smax-gl-filtros { display:flex; flex-wrap:wrap; gap:14px; align-items:flex-end; margin-bottom:12px; }
 .smax-gl-filtros > div { min-width:0; }
 /* table-layout:fixed e o que torna a largura de coluna obedecida: em layout
@@ -3096,6 +3092,14 @@
 .smax-gl-person-hit > span, .smax-gl-person-hit small { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .smax-gl-person-hit small { flex:0 1 auto; max-width:45%; color:var(--sp-text-dim); font-family:Consolas, monospace; font-size:10.5px; }
 .smax-gl-person-msg { font-size:11.5px; color:var(--sp-text-muted); margin-top:8px; }
+/* Marcacao em lote: a caixa de GSE aceita varias por busca, entao precisa de
+   uma linha de acao coletiva e de um indicador de marcado por linha. */
+.smax-gl-person-bulk {
+  display:flex; align-items:center; gap:8px; margin-top:8px; flex-wrap:wrap;
+  font-size:11.5px; color:var(--sp-text-muted);
+}
+.smax-gl-person-bulk > span { flex:1 1 auto; min-width:0; }
+.smax-gl-person-tick { flex:0 0 auto; font-size:13px; color:var(--sp-accent); }
 `);
 
   /* =========================================================
@@ -4158,13 +4162,30 @@
         : gseUI.error
           ? `<div class="smax-gl-person-msg" style="color:var(--sp-danger-text);">${Utils.escapeHtml(gseUI.error)}</div>`
           : gseUI.results.length
-            ? `<div class="smax-gl-person-hits">${gseUI.results.map(g => `
-                <button class="smax-gl-person-hit" data-act="cons-gse-escolher"
-                        data-id="${Utils.escapeHtml(g.id)}" data-nome="${Utils.escapeHtml(g.nome)}"
-                        data-current="${escolhidas.some(x => x.id === g.id)}">
-                  <span style="flex:1 1 auto;min-width:0;">${Utils.escapeHtml(g.nome)}</span>
-                  <small>${Utils.escapeHtml(g.id)}</small>
-                </button>`).join('')}</div>`
+            ? (() => {
+                const faltam = gseUI.results.filter(g => !escolhidas.some(x => x.id === g.id));
+                return `
+                <div class="smax-gl-person-bulk">
+                  <span>${gseUI.results.length} encontrada${gseUI.results.length === 1 ? '' : 's'} — clique para marcar; a busca fica aberta.</span>
+                  <button class="smax-gl-btn" data-act="cons-gse-todas" ${faltam.length ? '' : 'disabled'}>
+                    ${!faltam.length ? 'Todas já marcadas'
+                      : faltam.length === 1 ? 'Marcar a que falta'
+                      : `Marcar as ${faltam.length} que faltam`}
+                  </button>
+                </div>
+                <div class="smax-gl-person-hits">${gseUI.results.map(g => {
+                  const marcada = escolhidas.some(x => x.id === g.id);
+                  return `
+                  <button class="smax-gl-person-hit" data-act="cons-gse-escolher"
+                          data-id="${Utils.escapeHtml(g.id)}" data-nome="${Utils.escapeHtml(g.nome)}"
+                          data-current="${marcada}"
+                          title="${marcada ? 'Clique para desmarcar' : 'Clique para marcar'}">
+                    <span class="smax-gl-person-tick">${marcada ? '☑' : '☐'}</span>
+                    <span style="flex:1 1 auto;min-width:0;">${Utils.escapeHtml(g.nome)}</span>
+                    <small>${Utils.escapeHtml(g.id)}</small>
+                  </button>`;
+                }).join('')}</div>`;
+              })()
             : `<div class="smax-gl-person-msg">${
                 gseUI.term.trim().length < Grupos.MIN_CHARS
                   ? `Digite ao menos ${Grupos.MIN_CHARS} letras do nome da GSE.`
@@ -4175,8 +4196,11 @@
         <div class="smax-gl-person">
           <div class="smax-gl-person-current">
             <div style="flex:1 1 auto; min-width:0; display:flex; gap:6px; flex-wrap:wrap;">${chips}</div>
+            ${escolhidas.length > 1
+              ? '<button class="smax-gl-btn" data-act="cons-gse-limpar" title="Tirar todas do filtro">Limpar GSEs</button>'
+              : ''}
             <button class="smax-gl-btn" data-act="cons-gse-abrir">
-              ${gseUI.open ? 'Fechar busca' : '+ Adicionar GSE'}
+              ${gseUI.open ? 'Fechar busca' : (escolhidas.length ? '+ Adicionar outras GSEs' : '+ Adicionar GSEs')}
             </button>
           </div>
           ${gseUI.open ? `
@@ -4611,16 +4635,6 @@
         t.dataset.active = String(t.dataset.tab === activeTab);
       });
 
-      // O painel ocupa a tela toda, mas nem toda tela quer a largura toda: a
-      // lista e os graficos sim (ali largura e informacao), o resto nao —
-      // formulario esticado de ponta a ponta vira linha de texto ilegivel.
-      // Quem estreita e o CSS, por data-wide, e so o conteudo do corpo.
-      const painel = overlay.querySelector('.smax-gl-panel');
-      // Novidades entra nas largas: cada linha tem titulo de chamado, o texto do
-      // que mudou e a hora, e em 860px isso quebra em tres linhas por item.
-      const largas = activeTab === 'painel' || activeTab === 'graficos' || activeTab === 'novidades';
-      if (painel) painel.dataset.wide = String(largas);
-
       body.innerHTML = activeTab === 'painel' ? renderPainel()
         : activeTab === 'graficos' ? renderGraficos()
         : activeTab === 'novidades' ? renderNovidades()
@@ -4636,7 +4650,10 @@
       const contorno = body.querySelector('#smax-gl-contorno');
       if (contorno) contorno.innerHTML = form.contornoHtml;
 
-      if (largas) {
+      // Abas que so leem o que ja esta no painel: o rodape delas e o botao de
+      // reler o SMAX. As outras tem acao propria (criar, incluir).
+      const abasDeLeitura = activeTab === 'painel' || activeTab === 'graficos' || activeTab === 'novidades';
+      if (abasDeLeitura) {
         footer.innerHTML = `<button class="smax-gl-btn smax-gl-btn-primary" data-act="atualizar-smax"
              ${busy ? 'disabled' : ''}>${busy ? 'Lendo…' : '↻ Atualizar do SMAX'}</button>`;
       } else if (activeTab === 'abrir' && prefs.molde) {
@@ -5912,27 +5929,44 @@
             if (q) q.focus();
           }
         }
+        // Alterna a GSE e MANTEM a busca aberta, com termo e resultados intactos:
+        // uma consulta quase sempre quer mais de um grupo, e fechar a cada clique
+        // obrigava a reabrir e redigitar o termo por GSE. `refreshGseBox` em vez
+        // de `render()` porque so a caixa muda — e um render inteiro tiraria o
+        // foco do campo de busca.
         else if (act === 'cons-gse-escolher') {
           lerNotaConsulta();
           const el = ev.target.closest('[data-id]');
           const id = String(el.dataset.id);
           const nome = String(el.dataset.nome || '');
           const atuais = PgStore.prefs.consultaGses;
-          if (!atuais.some(g => g.id === id)) {
-            atuais.push({ id, nome });
-            PgStore.salvarPrefs();
-          }
-          // Fecha a busca: escolher uma GSE e o fim da interacao com a caixa, e
-          // deixar aberta com o termo antigo convida a escolher duas vezes.
-          gseUI.open = false; gseUI.term = ''; gseUI.results = []; gseUI.error = '';
-          render();
+          PgStore.prefs.consultaGses = atuais.some(g => g.id === id)
+            ? atuais.filter(g => g.id !== id)
+            : atuais.concat([{ id, nome }]);
+          PgStore.salvarPrefs();
+          refreshGseBox();
+        }
+        else if (act === 'cons-gse-todas') {
+          lerNotaConsulta();
+          const atuais = PgStore.prefs.consultaGses;
+          gseUI.results.forEach((g) => {
+            if (!atuais.some(x => x.id === g.id)) atuais.push({ id: g.id, nome: g.nome });
+          });
+          PgStore.salvarPrefs();
+          refreshGseBox();
         }
         else if (act === 'cons-gse-tirar') {
           lerNotaConsulta();
           const id = String(ev.target.closest('[data-id]').dataset.id);
           PgStore.prefs.consultaGses = PgStore.prefs.consultaGses.filter(g => g.id !== id);
           PgStore.salvarPrefs();
-          render();
+          refreshGseBox();
+        }
+        else if (act === 'cons-gse-limpar') {
+          lerNotaConsulta();
+          PgStore.prefs.consultaGses = [];
+          PgStore.salvarPrefs();
+          refreshGseBox();
         }
         else if (act === 'conferir-ids') { conferirIds(); }
         else if (act === 'limpar-conferencia') {

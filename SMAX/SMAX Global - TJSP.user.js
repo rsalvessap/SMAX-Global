@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SMAX Painel de Globais - TJSP
 // @namespace    https://github.com/rsalvessap/SMAX-Global
-// @version      1.16
+// @version      1.17
 // @description  Painel de gestao de chamados globais do SMAX TJSP — lista curada, classificacao por assunto/base/competencia, sincronizacao por arquivo no GitHub e abertura automatizada de global por molde
 // @author       rsalvessap
 // @match        https://suporte.tjsp.jus.br/saw/*
@@ -27,7 +27,7 @@
   if (window.top && window.top !== window.self) return;
   if (window.location.hostname !== 'suporte.tjsp.jus.br') return;
 
-  const SMAX_GLOBAL_VERSION = '1.16';
+  const SMAX_GLOBAL_VERSION = '1.17';
 
   // O userscript roda em sandbox; quem dispara as requisicoes e a pagina.
   const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
@@ -153,7 +153,13 @@
        * proposito — o selo no botao flutuante e o aviso na tela funcionam sempre,
        * mas a notificacao do SO pode ser engolida pelo Assistente de Foco do
        * Windows, e aviso que pode nao chegar nao serve como unico canal. */
-      monitor: { ligado: true, minutos: 30, notificarSO: false }
+      monitor: { ligado: true, minutos: 30, notificarSO: false },
+      /* GSEs escolhidas na aba Consultar, [{id,nome}]. Persistem porque o SMAX
+       * RECARREGA a pagina a cada navegacao: escolha so em memoria obrigaria a
+       * redigitar as GSEs em toda consulta, que e o custo de usar a aba. Ficam
+       * aqui, e nao em smax_pg_dados, pelo mesmo motivo dos filtros — e escolha
+       * desta maquina e nao entra no arquivo publicado. */
+      consultaGses: []
     };
 
     const saneaValores = (arr) => Array.isArray(arr)
@@ -241,6 +247,13 @@
       m.minutos = permitidos.includes(Number(m.minutos)) ? Number(m.minutos) : 30;
       pgPrefs.monitor = m;
     })();
+    /* As GSEs gravadas viram cláusula de filtro, concatenada na query — o
+     * saneamento aqui nao e formalidade: id com aspas ou texto arbitrario iria
+     * direto para dentro do `filter=`. So passa par {id numerico, nome}. */
+    pgPrefs.consultaGses = (Array.isArray(pgPrefs.consultaGses) ? pgPrefs.consultaGses : [])
+      .filter(g => g && /^\d+$/.test(String(g.id)) && String(g.nome || '').trim())
+      .map(g => ({ id: String(g.id), nome: String(g.nome).trim() }))
+      .slice(0, 30);
 
     const salvarDados = () => {
       try { GM_setValue(K_DADOS, JSON.stringify(dados)); }
@@ -1669,6 +1682,12 @@
     const LAYOUT_BUSCA = [
       'Id', 'DisplayLabel', 'Status', 'StatusSCCDSMAX_c',
       'AssignedToGroup', 'AssignedToGroup.Name', 'CreateTime', 'LastUpdateTime',
+      // ExpertGroup entra so para DIAGNOSTICO: o filtro de GSE e por
+      // `AssignedToGroup` (e o que o script do Leonardo filtra em producao,
+      // :1346), mas quem troca de GSE no SMAX Respostas grava `ExpertGroup`.
+      // Se nesta instalacao a GSE do global morar no outro campo, a linha mostra
+      // a divergencia em vez de a consulta voltar vazia sem explicacao.
+      'ExpertGroup', 'ExpertGroup.Name',
       // GlobalId_c entra no layout para o descarte de filho acontecer aqui, no
       // cliente: "nao ser filho de outro global" nao e expressavel no filtro.
       'GlobalId_c', 'IsGlobal_c'
@@ -1679,9 +1698,15 @@
     // .user.js:3596 e :1330), nao supostas. O campo `IsGlobal_c` e filtravel no
     // servidor: a propria tela de filtro do SMAX o oferece como campo
     // (`data-aid="filter_field_IsGlobal_c"`, "é Global").
-    const filtroBusca = ({ desde = 0, situacao = 'abertos' } = {}) => {
+    const filtroBusca = ({ desde = 0, situacao = 'abertos', grupos = [] } = {}) => {
       const partes = [`IsGlobal_c = 'true'`];
       if (desde) partes.push(`CreateTime >= ${Math.floor(desde)}`);
+      // GSE por Id, entre aspas — forma lida em producao
+      // (pesquisa-avancada-smax.user.js:1346, que filtra exatamente isto). Nada
+      // de nome: nome muda e tem acento, Id nao. Recortar por GSE tambem afasta
+      // o teto de 10.000, que e o que torna "sem recorte" de data utilizavel.
+      const gses = [...new Set(grupos.map(String).filter(g => /^\d+$/.test(g)))];
+      if (gses.length) partes.push(clausulaOu('AssignedToGroup', gses));
       // Lista OR positiva, nunca `!=`: a negacao nao foi vista em nenhum filtro
       // de producao, e filtro recusado pelo SMAX falha em silencio (volta vazio,
       // que a tela leria como "nao existe nenhum").
@@ -1753,6 +1778,13 @@
             (rel.AssignedToGroup && rel.AssignedToGroup.Name)
             || (p.AssignedToGroup && p.AssignedToGroup.Name)
             || p['AssignedToGroup.Name'] || p.AssignedToGroup || ''
+          ),
+          // Nome do grupo especialista. So e exibido quando DIFERE do grupo
+          // designado — ver o comentario do LAYOUT_BUSCA.
+          grupoEsp: String(
+            (rel.ExpertGroup && rel.ExpertGroup.Name)
+            || (p.ExpertGroup && p.ExpertGroup.Name)
+            || p['ExpertGroup.Name'] || ''
           ),
           criadoEm: Number(p.CreateTime) || 0,
           atualizadoEm: Number(p.LastUpdateTime) || 0,
@@ -2107,6 +2139,55 @@
     };
 
     return { SEED_TERM, search, nameFor, resolveName };
+  })();
+
+  /* =========================================================
+   * Grupos — busca de GSE para o filtro da aba Consultar.
+   *
+   * A entidade e `PersonGroup`, NAO `Group`: o codigo de producao de terceiro
+   * registra que `Group` devolve "operação não permitida" e que o nome certo e
+   * PersonGroup, confirmado ao vivo pelo autor
+   * (_fontes-leonardo/.../pesquisa-avancada-smax.user.js:3560-3574).
+   *
+   * Aqui o operador de texto e `wordstartswith`, e nao o range de prefixo do
+   * `People`: ele esta provado em PersonGroup (mesma referencia). Em `Request`
+   * nunca foi visto funcionando — e por isso que procurar global por texto do
+   * titulo continua sendo peneira no cliente, nunca filtro de servidor.
+   * =======================================================*/
+  const Grupos = (() => {
+    const MIN_CHARS = 2;
+
+    const search = async (term) => {
+      const palavras = String(term || '').trim().split(/\s+/).filter(Boolean).slice(0, 4);
+      if (!palavras.length || String(term).trim().length < MIN_CHARS) return [];
+      // Aspas simples dobradas: e o escape do dialeto, e o termo vem do teclado.
+      const clausulas = palavras
+        .map(p => `(Name wordstartswith ('${p.replace(/'/g, "''")}'))`)
+        .join(' and ');
+      // `Status = null` entra junto de proposito: grupo sem status gravado
+      // existe, e filtrar so por 'Active' o esconderia sem dizer nada.
+      const payload = await ApiClient.request('ems/PersonGroup', {
+        method: 'GET',
+        searchParams: {
+          filter: `((Status = 'Active' or Status = null) and (${clausulas}))`,
+          layout: 'Name',
+          size: '30',
+          skip: '0',
+          order: 'Name asc'
+        },
+        includeTenantParam: true
+      });
+      const porId = new Map();
+      ((payload && payload.entities) || []).forEach((e) => {
+        const p = (e && e.properties) || {};
+        const id = p.Id != null ? String(p.Id) : '';
+        const nome = String(p.Name || '').trim();
+        if (id && nome && !porId.has(id)) porId.set(id, { id, nome });
+      });
+      return [...porId.values()].sort((a, b) => a.nome.localeCompare(b.nome, 'pt-BR'));
+    };
+
+    return { MIN_CHARS, search };
   })();
 
   /* =========================================================
@@ -3139,7 +3220,6 @@
     const personUI = { open: false, term: '', loading: false, error: '', results: [], searchSeq: 0 };
     let personDebounce = null;
     let filtroDebounce = null;
-    let consultaDebounce = null;
 
     // Estado da tela "Incluir global". De proposito nao persiste: a conferencia e
     // pontual, e resultado guardado estaria velho na proxima abertura do painel.
@@ -3156,7 +3236,6 @@
     const consultaUI = {
       dias: 90,            // 0 = sem recorte de data
       situacao: 'abertos', // abertos | encerrados | todos
-      termo: '',
       buscando: false,
       buscou: false,
       total: 0,            // quantos o SMAX diz que existem
@@ -3166,8 +3245,25 @@
       proximoSkip: 0,
       filtro: '',          // o filtro exato que foi enviado — aparece no erro
       erro: '',
-      marcados: new Set()
+      // Ids das GSEs da consulta EM CURSO, congelados na primeira pagina. As
+      // escolhidas moram em PgStore.prefs e podem mudar no meio da paginacao.
+      grupos: [],
+      marcados: new Set(),
+      // Classificacao e nota da leva que esta sendo marcada. Ficam aqui, na
+      // propria aba, porque a decisao de assunto/base/competencia e tomada
+      // LENDO o chamado — e e so aqui que da para ler.
+      marcas: { assunto: new Set(), base: new Set(), competencia: new Set() },
+      nota: '',
+      incluindo: false,
+      // Desfecho por id da ultima tentativa de inclusao: recusado nao pode
+      // simplesmente nao entrar, tem de aparecer com o motivo.
+      resultados: []
     };
+
+    // Estado da caixa de GSE. A lista escolhida mora em PgStore.prefs (persiste);
+    // isto aqui e so a busca, que e pontual.
+    const gseUI = { open: false, term: '', loading: false, error: '', results: [], searchSeq: 0 };
+    let gseDebounce = null;
 
     const setStatus = (msg, kind = '') => {
       const el = overlay && overlay.querySelector('.smax-gl-status');
@@ -4036,25 +4132,111 @@
       { id: 'todos', rot: 'Todos' }
     ];
 
-    // O termo filtra NO CLIENTE, sobre o que a busca trouxe. O operador de texto
-    // do SMAX (`wordstartswith`) so foi visto funcionando em Person, Location e
-    // Group — nunca em Request —, e filtro que o servidor recusa volta vazio sem
-    // erro, o que a tela leria como "nao existe nenhum".
-    const consultaVisiveis = () => {
-      const t = consultaUI.termo.trim().toLowerCase();
-      if (!t) return consultaUI.itens;
-      return consultaUI.itens.filter(x =>
-        x.titulo.toLowerCase().includes(t) || x.id.includes(t));
-    };
-
     // Marcado QUE AINDA NAO ESTA NO PAINEL. A diferenca importa: depois de uma
     // inclusao o id continua no conjunto de marcados, e contar esses faria o
     // botao do rodape prometer um numero que ja entrou.
     const consultaMarcadosNovos = () => [...consultaUI.marcados].filter(id => !Dados.acharGlobal(id));
 
+    /* A caixa de GSE. O recorte por GSE e o filtro que faz sentido para achar
+     * global: procurar por texto do titulo nao da, porque `wordstartswith` nunca
+     * foi visto funcionando em `Request` — so em Person, Location e PersonGroup —
+     * e filtro recusado pelo SMAX volta VAZIO SEM ERRO, que a tela leria como
+     * "nao existe nenhum". Por isso o recorte vai no campo que o servidor
+     * reconhece: `AssignedToGroup`, por Id. */
+    const renderGseBox = () => {
+      const escolhidas = PgStore.prefs.consultaGses;
+      const chips = escolhidas.length
+        ? escolhidas.map(g => `
+            <button class="smax-gl-chip" data-act="cons-gse-tirar" data-id="${Utils.escapeHtml(g.id)}"
+                    data-active="true" title="Tirar do filtro">${Utils.escapeHtml(g.nome)} ✕</button>`).join('')
+        : `<span class="smax-gl-person-msg" style="margin:0;">
+             Nenhuma GSE escolhida — a consulta traz global de <strong>qualquer</strong> grupo.
+           </span>`;
+
+      const achados = gseUI.loading
+        ? '<div class="smax-gl-person-msg">Buscando GSEs no SMAX…</div>'
+        : gseUI.error
+          ? `<div class="smax-gl-person-msg" style="color:var(--sp-danger-text);">${Utils.escapeHtml(gseUI.error)}</div>`
+          : gseUI.results.length
+            ? `<div class="smax-gl-person-hits">${gseUI.results.map(g => `
+                <button class="smax-gl-person-hit" data-act="cons-gse-escolher"
+                        data-id="${Utils.escapeHtml(g.id)}" data-nome="${Utils.escapeHtml(g.nome)}"
+                        data-current="${escolhidas.some(x => x.id === g.id)}">
+                  <span style="flex:1 1 auto;min-width:0;">${Utils.escapeHtml(g.nome)}</span>
+                  <small>${Utils.escapeHtml(g.id)}</small>
+                </button>`).join('')}</div>`
+            : `<div class="smax-gl-person-msg">${
+                gseUI.term.trim().length < Grupos.MIN_CHARS
+                  ? `Digite ao menos ${Grupos.MIN_CHARS} letras do nome da GSE.`
+                  : 'Nenhuma GSE ativa com esse início de nome.'
+              }</div>`;
+
+      return `
+        <div class="smax-gl-person">
+          <div class="smax-gl-person-current">
+            <div style="flex:1 1 auto; min-width:0; display:flex; gap:6px; flex-wrap:wrap;">${chips}</div>
+            <button class="smax-gl-btn" data-act="cons-gse-abrir">
+              ${gseUI.open ? 'Fechar busca' : '+ Adicionar GSE'}
+            </button>
+          </div>
+          ${gseUI.open ? `
+            <div class="smax-gl-person-search">
+              <input id="smax-gl-gse-q" class="smax-gl-input" type="text"
+                     placeholder="Início do nome — ex.: GSE SGS EPROC"
+                     value="${Utils.escapeHtml(gseUI.term)}">
+              ${achados}
+            </div>` : ''}
+        </div>`;
+    };
+
+    // Redesenha SO a caixa: um render() inteiro destruiria o foco e o caret do
+    // campo de busca a cada tecla. Mesmo padrao do `refreshPersonBox`.
+    const refreshGseBox = () => {
+      const box = overlay && overlay.querySelector('#smax-gl-gse-box');
+      if (!box) return;
+      const input = box.querySelector('#smax-gl-gse-q');
+      const tinhaFoco = input && document.activeElement === input;
+      const caret = input ? input.selectionStart : null;
+      box.innerHTML = renderGseBox();
+      const novo = box.querySelector('#smax-gl-gse-q');
+      if (novo && tinhaFoco) {
+        novo.focus();
+        if (caret != null) novo.setSelectionRange(caret, caret);
+      }
+    };
+
+    const runGseSearch = (term) => {
+      gseUI.term = term;
+      const seq = ++gseUI.searchSeq;
+      if (term.trim().length < Grupos.MIN_CHARS) {
+        gseUI.loading = false;
+        gseUI.error = '';
+        gseUI.results = [];
+        refreshGseBox();
+        return;
+      }
+      gseUI.loading = true;
+      gseUI.error = '';
+      refreshGseBox();
+      Grupos.search(term)
+        .then((grupos) => {
+          if (seq !== gseUI.searchSeq) return;   // resposta de uma busca ja superada
+          gseUI.loading = false;
+          gseUI.results = grupos;
+          refreshGseBox();
+        })
+        .catch((err) => {
+          if (seq !== gseUI.searchSeq) return;
+          gseUI.loading = false;
+          gseUI.results = [];
+          gseUI.error = `Falha ao buscar GSE: ${PgApi.motivoDeErro(err)}`;
+          refreshGseBox();
+        });
+    };
+
     const renderConsultar = () => {
       const c = consultaUI;
-      const visiveis = consultaVisiveis();
+      const visiveis = c.itens;
       const faltaCarregar = c.buscou && c.lidos < c.total;
 
       const chipsPeriodo = PERIODOS.map(p => `
@@ -4079,9 +4261,6 @@
         const partes = [`O SMAX diz que existem <strong>${c.total}</strong> global(is) com esse filtro`];
         partes.push(`trazidos <strong>${c.lidos}</strong>`);
         if (c.descartados) partes.push(`<strong>${c.descartados}</strong> descartado(s) por serem filhos de outro global`);
-        if (c.termo.trim()) {
-          partes.push(`<strong>${visiveis.length}</strong> ${visiveis.length === 1 ? 'bate' : 'batem'} com o termo`);
-        }
         resumo = `<div class="smax-gl-note" style="margin-top:14px;">${partes.join(' · ')}.</div>`;
       }
 
@@ -4104,17 +4283,22 @@
                   ${x.grupo ? ` · ${Utils.escapeHtml(x.grupo)}` : ''}
                   ${x.criadoEm ? ` · aberto em ${Utils.escapeHtml(Utils.formatBrDateTime(x.criadoEm))}` : ''}
                 </div>
+                ${x.grupoEsp && x.grupoEsp !== x.grupo ? `
+                  <div class="smax-gl-cand-meta" title="O filtro de GSE usa a designação atual (AssignedToGroup). Aqui os dois campos divergem.">
+                    grupo especialista: ${Utils.escapeHtml(x.grupoEsp)}
+                  </div>` : ''}
               </div>
-              <div>
+              <div style="display:flex; gap:6px; flex-wrap:wrap; justify-content:flex-end;">
+                <button class="smax-gl-btn" data-act="ver-global" data-id="${Utils.escapeHtml(x.id)}">Ver</button>
                 ${jaTem
-                  ? ''
+                  ? `<button class="smax-gl-btn" data-act="editar-global" data-id="${Utils.escapeHtml(x.id)}">Editar</button>`
                   : `<button class="smax-gl-chip" data-act="cons-marcar" data-id="${Utils.escapeHtml(x.id)}"
                              data-active="${marcado}">${marcado ? '✓ marcado' : 'marcar'}</button>`}
               </div>
             </div>`;
         }).join('')
           : `<div class="smax-gl-note" style="margin-top:14px;">
-               Nenhum global ${c.termo.trim() ? 'bate com o termo' : 'nesse filtro'}.
+               Nenhum global nesse filtro.
                ${c.total && c.descartados === c.lidos ? 'Todos os que voltaram eram filhos de outro global.' : ''}
              </div>`
       ) : '';
@@ -4125,19 +4309,63 @@
       const acoesLista = (!c.buscando && c.buscou && !c.erro && visiveis.length) ? `
         <div style="display:flex; gap:8px; margin-top:12px; flex-wrap:wrap;">
           ${marcaveis ? `<button class="smax-gl-btn" data-act="cons-marcar-visiveis">
-              ${marcaveis === 1 ? 'Marcar o visível' : `Marcar os ${marcaveis} visíveis`}</button>` : ''}
+              ${marcaveis === 1 ? 'Marcar o único que pode entrar' : `Marcar os ${marcaveis} da lista`}</button>` : ''}
           ${consultaMarcadosNovos().length ? '<button class="smax-gl-btn" data-act="cons-desmarcar">Desmarcar tudo</button>' : ''}
           ${faltaCarregar ? `<button class="smax-gl-btn" data-act="cons-mais">
               Carregar mais (faltam ${c.total - c.lidos})</button>` : ''}
         </div>` : '';
 
+      /* Desfecho da ultima inclusao. Fica na tela porque incluir em lote tem
+       * recusa individual — e recusa que nao aparece em lugar nenhum vira
+       * "marquei 5, entraram 3" sem explicacao. */
+      const blocoResultados = c.resultados.length ? `
+        <div class="smax-gl-label" style="margin-top:18px;">Última inclusão</div>
+        ${c.resultados.map(r => `
+          <div class="smax-gl-cand">
+            <div class="smax-gl-cand-info">
+              <div class="smax-gl-cand-title">
+                #${Utils.escapeHtml(r.id)}
+                ${r.estado === 'incluido'
+                  ? '<span class="smax-gl-badge smax-gl-badge-best">incluído</span>'
+                  : '<span class="smax-gl-badge">não entrou</span>'}
+              </div>
+              <div class="smax-gl-cand-meta">
+                ${r.estado === 'incluido'
+                  ? Utils.escapeHtml(r.titulo || '(sem título)')
+                  : Utils.escapeHtml(r.motivo || MOTIVOS[r.estado] || 'Recusado.')}
+              </div>
+            </div>
+          </div>`).join('')}` : '';
+
+      /* Classificar aqui, e nao numa segunda aba: a decisao de assunto/base/
+       * competencia e tomada LENDO o chamado, e e nesta tela que da para ler
+       * (botao Ver em cada linha). So aparece quando ha alguem marcado — bloco
+       * de classificacao sem ninguem para classificar e so ruido. */
+      const marcadosNovos = consultaMarcadosNovos();
+      const blocoClassificar = marcadosNovos.length ? `
+        <div class="smax-gl-label" style="margin-top:20px;">
+          Classificação — vale para ${marcadosNovos.length === 1 ? 'o global marcado' : `os ${marcadosNovos.length} globais marcados`}
+        </div>
+        <div class="smax-gl-note">
+          Dá para marcar mais de um valor por eixo. Para classificar de formas diferentes,
+          inclua em levas: marque uns, inclua, marque os outros.
+        </div>
+        ${chipsEixos(c.marcas, 'consulta')}
+        <div class="smax-gl-label" style="margin-top:14px;">Nota (opcional)</div>
+        <input class="smax-gl-input" id="smax-gl-cons-nota" type="text" style="width:100%;"
+               value="${Utils.escapeHtml(c.nota)}" placeholder="texto livre">` : '';
+
       return `
         <div class="smax-gl-note">
-          Procura no SMAX os chamados marcados como <strong>“É global”</strong> que você ainda não
-          tem no painel. O filtro do período e da situação vai para o servidor; o termo filtra
-          o que já voltou. Quem é filho de outro global sai da lista — não dá para filtrar isso
-          no servidor, então o descarte acontece aqui e o número aparece no resumo.
+          Procura no SMAX os chamados marcados como <strong>“É global”</strong>. O recorte por
+          <strong>GSE</strong>, período e situação vai para o servidor. Quem é filho de outro global
+          sai da lista — isso não dá para filtrar no servidor, então o descarte acontece aqui e o
+          número aparece no resumo. Use <strong>Ver</strong> para ler o chamado, marque os que
+          interessam, classifique e inclua sem sair daqui.
         </div>
+
+        <div class="smax-gl-label" style="margin-top:14px;">GSE (designação atual do chamado)</div>
+        <div id="smax-gl-gse-box">${renderGseBox()}</div>
 
         <div class="smax-gl-label" style="margin-top:14px;">Aberto nos últimos</div>
         <div class="smax-gl-chips">${chipsPeriodo}</div>
@@ -4145,11 +4373,7 @@
         <div class="smax-gl-label" style="margin-top:12px;">Situação</div>
         <div class="smax-gl-chips">${chipsSituacao}</div>
 
-        <div class="smax-gl-label" style="margin-top:12px;">Termo no título ou no número (opcional)</div>
-        <input class="smax-gl-input" id="smax-gl-cons-termo" type="text" style="width:100%;"
-               value="${Utils.escapeHtml(c.termo)}" placeholder="ex.: SAJ, indisponibilidade, 8213">
-
-        <div style="display:flex; gap:8px; margin-top:10px;">
+        <div style="display:flex; gap:8px; margin-top:14px;">
           <button class="smax-gl-btn smax-gl-btn-primary" data-act="cons-buscar" ${c.buscando ? 'disabled' : ''}>
             ${c.buscando ? 'Consultando…' : '🔍 Consultar o SMAX'}
           </button>
@@ -4159,7 +4383,9 @@
         ${blocoErro}
         ${resumo}
         ${acoesLista}
-        ${lista}`;
+        ${lista}
+        ${blocoResultados}
+        ${blocoClassificar}`;
     };
 
     const renderIncluir = () => {
@@ -4420,9 +4646,13 @@
            </button>`;
       } else if (activeTab === 'consultar') {
         const n = consultaMarcadosNovos().length;
-        footer.innerHTML = `<button class="smax-gl-btn smax-gl-btn-primary" data-act="cons-para-incluir"
-             ${n && !busy ? '' : 'disabled'}>
-             Mandar para Incluir (${n})
+        const incluindo = consultaUI.incluindo;
+        footer.innerHTML = `<button class="smax-gl-btn smax-gl-btn-primary" data-act="cons-incluir"
+             ${n && !busy && !incluindo ? '' : 'disabled'}>
+             ${incluindo ? 'Incluindo…'
+               : !n ? 'Incluir marcados'
+               : n === 1 ? 'Incluir o marcado'
+               : `Incluir os ${n} marcados`}
            </button>`;
       } else if (activeTab === 'incluir') {
         const n = incluirUI.resultados.filter(x => x.estado === 'ok').length;
@@ -4823,20 +5053,26 @@
 
     /* ---------- Consultar ---------- */
 
-    // O termo mora num <input>, e `render()` reescreve o corpo inteiro: sem ler
+    // A nota mora num <input>, e `render()` reescreve o corpo inteiro: sem ler
     // o campo antes de qualquer re-render, o que o usuario digitou desaparece.
-    const lerTermoConsulta = () => {
-      const el = overlay.querySelector('#smax-gl-cons-termo');
-      if (el) consultaUI.termo = el.value;
+    const lerNotaConsulta = () => {
+      const el = overlay.querySelector('#smax-gl-cons-nota');
+      if (el) consultaUI.nota = el.value;
     };
 
     const DIA_MS = 86400000;
 
+    const gsesEscolhidas = () => PgStore.prefs.consultaGses.map(g => g.id);
+
     const consultar = async (continuando) => {
       if (consultaUI.buscando) return;
-      lerTermoConsulta();
+      lerNotaConsulta();
       const c = consultaUI;
       const desde = c.dias ? Date.now() - c.dias * DIA_MS : 0;
+      // Lido UMA vez e usado na contagem e em todas as paginas: se o usuario
+      // mexesse nas GSEs no meio da paginacao, o `skip` cairia em outro
+      // resultado e a lista misturaria duas consultas.
+      const grupos = continuando ? c.grupos : gsesEscolhidas();
 
       if (!continuando) {
         c.itens = [];
@@ -4847,6 +5083,8 @@
         c.total = 0;
         c.erro = '';
         c.buscou = false;
+        c.resultados = [];
+        c.grupos = grupos;
       }
       c.buscando = true;
       render();
@@ -4857,7 +5095,7 @@
         // "20 globais" quando existem 800.
         if (!continuando) {
           setStatus('Contando quantos globais batem com o filtro…');
-          const cont = await PgApi.contarBusca({ desde, situacao: c.situacao });
+          const cont = await PgApi.contarBusca({ desde, situacao: c.situacao, grupos });
           c.total = cont.total;
           c.filtro = cont.filtro;
           if (!c.total) {
@@ -4868,7 +5106,7 @@
         }
 
         setStatus(`Trazendo ${Math.min(PgApi.PAGINA_BUSCA, c.total - c.lidos)} de ${c.total}…`);
-        const pag = await PgApi.buscarPagina({ desde, situacao: c.situacao, skip: c.proximoSkip });
+        const pag = await PgApi.buscarPagina({ desde, situacao: c.situacao, grupos, skip: c.proximoSkip });
         c.filtro = pag.filtro;
         // O total da pagina vale mais que o da contagem: foi medido agora.
         c.total = pag.total;
@@ -4903,33 +5141,102 @@
     };
 
     const limparConsulta = () => {
-      consultaUI.itens = [];
-      consultaUI.marcados.clear();
-      consultaUI.descartados = 0;
-      consultaUI.lidos = 0;
-      consultaUI.proximoSkip = 0;
-      consultaUI.total = 0;
-      consultaUI.erro = '';
-      consultaUI.buscou = false;
-      consultaUI.termo = '';
+      const c = consultaUI;
+      c.itens = [];
+      c.marcados.clear();
+      c.descartados = 0;
+      c.lidos = 0;
+      c.proximoSkip = 0;
+      c.total = 0;
+      c.erro = '';
+      c.buscou = false;
+      c.resultados = [];
+      c.nota = '';
+      Dados.EIXOS.forEach(e => c.marcas[e.chave].clear());
+      // As GSEs escolhidas NAO sao limpas: sao configuracao de quem usa, nao
+      // resultado de consulta. Limpar e para a tela, nao para o filtro.
       render();
       setStatus('');
     };
 
-    // Nao inclui direto: joga os marcados na aba Incluir e deixa a conferencia,
-    // a classificacao e o `Dados.incluir` serem os mesmos de sempre. Duplicar a
-    // regra de admissao aqui seria ter duas versoes dela para divergirem.
-    const consultaParaIncluir = () => {
+    /* Confere e inclui os marcados, aqui mesmo. A conferencia e a mesma regra da
+     * aba Incluir (`conferirUm`) e a escrita e o mesmo `Dados.incluir` — o que
+     * muda e so de onde vem a lista de ids. */
+    const consultaIncluir = async () => {
+      if (consultaUI.incluindo || busy) return;
+      lerNotaConsulta();
+      const c = consultaUI;
       const ids = consultaMarcadosNovos();
       if (!ids.length) { setStatus('Nenhum global marcado.', 'err'); return; }
-      incluirUI.texto = ids.join(' ');
-      incluirUI.resultados = [];
-      // A marcacao cumpriu o papel dela: os numeros agora estao na aba Incluir.
-      // Mante-la viva faria o contador do rodape prometer um repasse ja feito.
-      consultaUI.marcados.clear();
-      activeTab = 'incluir';
+
+      c.incluindo = true;
+      c.resultados = [];
       render();
-      setStatus(`${ids.length} número(s) na aba Incluir — confira no SMAX e classifique.`, 'ok');
+      setStatus(`Conferindo ${ids.length} chamado(s) no SMAX antes de incluir…`);
+
+      try {
+        const conferidos = await PgApi.emLote(ids, conferirUm);
+        const marcas = {
+          assunto: [...c.marcas.assunto],
+          base: [...c.marcas.base],
+          competencia: [...c.marcas.competencia]
+        };
+        // O desfecho de cada id vira linha na tela: aprovado que entrou, e
+        // recusado com o motivo. "Marquei 5 e entraram 3" sem dizer por que e o
+        // tipo de silencio que faz desconfiar do painel inteiro.
+        c.resultados = conferidos.map((x) => {
+          if (x.estado !== 'ok') return x;
+          const r = Dados.incluir(x.id, marcas, c.nota);
+          return r.ok
+            ? { id: x.id, estado: 'incluido', titulo: x.titulo }
+            : { id: x.id, estado: 'erro', motivo: r.msg };
+        });
+        const entraram = c.resultados.filter(x => x.estado === 'incluido');
+        entraram.forEach(x => c.marcados.delete(x.id));
+
+        if (entraram.length) {
+          // Zera a classificacao: herdada em silencio pela proxima leva, ela
+          // marcaria global com assunto que ninguem escolheu para ele. Mesmo
+          // cuidado da aba Abrir depois de criar.
+          Dados.EIXOS.forEach(e => c.marcas[e.chave].clear());
+          c.nota = '';
+        }
+        render();
+        const recusados = c.resultados.length - entraram.length;
+        setStatus(
+          recusados
+            ? `${entraram.length} incluído(s), ${recusados} não entrou(aram) — veja o motivo em “Última inclusão”.`
+            : `${entraram.length} global(is) incluído(s) no painel.`,
+          entraram.length ? 'ok' : 'err'
+        );
+      } catch (err) {
+        setStatus(`Falha ao incluir: ${PgApi.motivoDeErro(err)}`, 'err');
+      } finally {
+        c.incluindo = false;
+        render();
+      }
+    };
+
+    /* A REGRA DE ADMISSAO, num lugar so: existe, esta marcado como global, nao e
+     * filho de outro e ainda nao esta no painel. Duas telas incluem global (a
+     * aba Incluir, por lista colada, e a aba Consultar, por marcacao) e as duas
+     * chamam isto — uma segunda copia da regra seria uma copia para divergir.
+     * Vale mesmo quando a consulta "ja sabe" que o chamado e global: a lista na
+     * tela tem a idade da ultima consulta, e nesse intervalo o chamado pode ter
+     * sido vinculado a outro global. */
+    const conferirUm = async (id) => {
+      // Checa o painel antes de gastar requisicao: repetido nao precisa de rede.
+      if (Dados.acharGlobal(id)) return { id, estado: 'repetido' };
+      try {
+        const r = await PgApi.conferir(id);
+        if (r.estado === 'inexistente') return { id, estado: 'inexistente' };
+        if (r.paiId) return { id, estado: 'filho', motivo: `É filho do global #${r.paiId}.` };
+        if (!r.ehGlobal) return { id, estado: 'nao-global', titulo: r.titulo };
+        return { id, estado: 'ok', titulo: r.titulo };
+      } catch (err) {
+        // Leitura que falhou nao e "nao existe": estado proprio, visivel.
+        return { id, estado: 'erro', motivo: `Não foi possível conferir: ${err.message}` };
+      }
     };
 
     const conferirIds = async () => {
@@ -4945,20 +5252,7 @@
       render();
       setStatus(`Conferindo ${ids.length} chamado(s) no SMAX…`);
       try {
-        incluirUI.resultados = await PgApi.emLote(ids, async (id) => {
-          // Checa o painel antes de gastar requisicao: repetido nao precisa de rede.
-          if (Dados.acharGlobal(id)) return { id, estado: 'repetido' };
-          try {
-            const r = await PgApi.conferir(id);
-            if (r.estado === 'inexistente') return { id, estado: 'inexistente' };
-            if (r.paiId) return { id, estado: 'filho', motivo: `É filho do global #${r.paiId}.` };
-            if (!r.ehGlobal) return { id, estado: 'nao-global', titulo: r.titulo };
-            return { id, estado: 'ok', titulo: r.titulo };
-          } catch (err) {
-            // Leitura que falhou nao e "nao existe": estado proprio, visivel.
-            return { id, estado: 'erro', motivo: `Não foi possível conferir: ${err.message}` };
-          }
-        });
+        incluirUI.resultados = await PgApi.emLote(ids, conferirUm);
         const n = incluirUI.resultados.filter(x => x.estado === 'ok').length;
         setStatus(`${n} de ${ids.length} pode(m) entrar.`, n ? 'ok' : 'err');
       } catch (err) {
@@ -5345,9 +5639,9 @@
         const tab = ev.target.closest('.smax-gl-tab');
         if (tab) {
           readForm();
-          // O termo da consulta tambem e campo de formulario: sair da aba sem
-          // le-lo faria a lista voltar sem o recorte que estava na tela.
-          lerTermoConsulta();
+          // A nota da consulta tambem e campo de formulario: sair da aba sem
+          // le-la perderia o que foi digitado e nao entrou em global nenhum.
+          lerNotaConsulta();
           activeTab = tab.dataset.tab;
           render();
           /* Abrir a aba limpa o selo — DEPOIS do render, de proposito: assim a
@@ -5575,12 +5869,12 @@
         }
         /* ---- Consultar ---- */
         else if (act === 'cons-dias') {
-          lerTermoConsulta();
+          lerNotaConsulta();
           consultaUI.dias = Number(ev.target.closest('[data-dias]').dataset.dias);
           render();
         }
         else if (act === 'cons-situacao') {
-          lerTermoConsulta();
+          lerNotaConsulta();
           consultaUI.situacao = ev.target.closest('[data-sit]').dataset.sit;
           render();
         }
@@ -5588,25 +5882,58 @@
         else if (act === 'cons-mais') { consultar(true); }
         else if (act === 'cons-limpar') { limparConsulta(); }
         else if (act === 'cons-marcar') {
-          lerTermoConsulta();
+          lerNotaConsulta();
           const id = ev.target.closest('[data-id]').dataset.id;
           consultaUI.marcados.has(id) ? consultaUI.marcados.delete(id) : consultaUI.marcados.add(id);
           render();
         }
         else if (act === 'cons-marcar-visiveis') {
-          lerTermoConsulta();
+          lerNotaConsulta();
           // So os que ainda nao estao no painel: marcar repetido nao leva a nada
           // e inflaria a contagem do botao do rodape.
-          consultaVisiveis().forEach(x => { if (!Dados.acharGlobal(x.id)) consultaUI.marcados.add(x.id); });
+          consultaUI.itens.forEach(x => { if (!Dados.acharGlobal(x.id)) consultaUI.marcados.add(x.id); });
           render();
           setStatus(`${consultaUI.marcados.size} marcado(s).`);
         }
         else if (act === 'cons-desmarcar') {
-          lerTermoConsulta();
+          lerNotaConsulta();
           consultaUI.marcados.clear();
           render();
         }
-        else if (act === 'cons-para-incluir') { consultaParaIncluir(); }
+        else if (act === 'cons-incluir') { consultaIncluir(); }
+        /* ---- Consultar: escolha de GSE ---- */
+        else if (act === 'cons-gse-abrir') {
+          lerNotaConsulta();
+          gseUI.open = !gseUI.open;
+          if (!gseUI.open) { gseUI.term = ''; gseUI.results = []; gseUI.error = ''; }
+          render();
+          if (gseUI.open) {
+            const q = overlay.querySelector('#smax-gl-gse-q');
+            if (q) q.focus();
+          }
+        }
+        else if (act === 'cons-gse-escolher') {
+          lerNotaConsulta();
+          const el = ev.target.closest('[data-id]');
+          const id = String(el.dataset.id);
+          const nome = String(el.dataset.nome || '');
+          const atuais = PgStore.prefs.consultaGses;
+          if (!atuais.some(g => g.id === id)) {
+            atuais.push({ id, nome });
+            PgStore.salvarPrefs();
+          }
+          // Fecha a busca: escolher uma GSE e o fim da interacao com a caixa, e
+          // deixar aberta com o termo antigo convida a escolher duas vezes.
+          gseUI.open = false; gseUI.term = ''; gseUI.results = []; gseUI.error = '';
+          render();
+        }
+        else if (act === 'cons-gse-tirar') {
+          lerNotaConsulta();
+          const id = String(ev.target.closest('[data-id]').dataset.id);
+          PgStore.prefs.consultaGses = PgStore.prefs.consultaGses.filter(g => g.id !== id);
+          PgStore.salvarPrefs();
+          render();
+        }
         else if (act === 'conferir-ids') { conferirIds(); }
         else if (act === 'limpar-conferencia') {
           incluirUI.resultados = [];
@@ -5616,12 +5943,16 @@
         }
         else if (act === 'chip-marca') {
           const btn = ev.target.closest('[data-eixo]');
-          const dono = btn.dataset.alvo === 'abrir' ? form.marcas : incluirUI.marcas;
+          const dono = btn.dataset.alvo === 'abrir' ? form.marcas
+            : btn.dataset.alvo === 'consulta' ? consultaUI.marcas
+            : incluirUI.marcas;
           const conj = dono[btn.dataset.eixo];
           conj.has(btn.dataset.id) ? conj.delete(btn.dataset.id) : conj.add(btn.dataset.id);
           // O formulario de abrir e lido antes do redesenho, senao titulo e
-          // descricao ja digitados somem ao marcar um chip.
+          // descricao ja digitados somem ao marcar um chip. Mesma razao para a
+          // nota da consulta.
           if (btn.dataset.alvo === 'abrir') readForm();
+          if (btn.dataset.alvo === 'consulta') lerNotaConsulta();
           render();
         }
         else if (act === 'toggle-incluir-painel') {
@@ -5734,17 +6065,9 @@
         // Marcar um chip redesenha a tela; sem isto o que foi digitado morreria.
         if (ev.target.id === 'smax-gl-ids') incluirUI.texto = ev.target.value;
         if (ev.target.id === 'smax-gl-nota') incluirUI.nota = ev.target.value;
-        // Mesmo tratamento do termo do painel: guarda a cada tecla, redesenha
-        // com atraso e devolve o cursor — o re-render recria o <input>.
-        if (ev.target.id === 'smax-gl-cons-termo') {
-          consultaUI.termo = ev.target.value;
-          clearTimeout(consultaDebounce);
-          consultaDebounce = setTimeout(() => {
-            render();
-            const el = overlay && overlay.querySelector('#smax-gl-cons-termo');
-            if (el) { el.focus(); el.setSelectionRange(el.value.length, el.value.length); }
-          }, 280);
-        }
+        // Nota da consulta: guarda a cada tecla e NAO redesenha — nada na tela
+        // depende dela, e redesenhar tiraria o cursor do campo.
+        if (ev.target.id === 'smax-gl-cons-nota') consultaUI.nota = ev.target.value;
         if (ev.target.id === 'smax-gl-f-termo') {
           PgStore.prefs.filtros.termo = ev.target.value;
           clearTimeout(filtroDebounce);
@@ -5762,6 +6085,12 @@
           clearTimeout(personDebounce);
           const term = personUI.term;
           personDebounce = setTimeout(() => runPersonSearch(term), 300);
+        }
+        if (ev.target.id === 'smax-gl-gse-q') {
+          gseUI.term = ev.target.value;
+          clearTimeout(gseDebounce);
+          const term = gseUI.term;
+          gseDebounce = setTimeout(() => runGseSearch(term), 300);
         }
       });
 

@@ -363,7 +363,7 @@
   A aba <em>Consultar</em> procura no SMAX os chamados marcados como “É global”. O período e a
   situação vão no filtro do servidor (<code>IsGlobal_c&nbsp;=&nbsp;'true'</code>,
   <code>CreateTime&nbsp;&gt;=&nbsp;epoch</code> e uma lista <code>or</code> de
-  <code>Status</code>); o termo filtra no cliente. O mock traz <strong>320 globais sintéticos</strong>
+  <code>Status</code>). O mock traz <strong>320 globais sintéticos</strong>
   espalhados por ~400 dias, contados a partir de <em>agora</em> — data fixa deixaria de responder ao
   recorte depois de alguns meses.
   <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
@@ -408,11 +408,10 @@
     inflaria a contagem do rodapé sem levar a nada.
   </div>
   <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
-    <strong>O repasse para Incluir.</strong> <em>Mandar para Incluir (N)</em> escreve os números na
-    aba <em>Incluir</em> e troca de aba; a conferência, a classificação e a gravação continuam sendo
-    as mesmas de sempre. Duplicar a regra de admissão aqui seria ter duas versões dela para
-    divergirem. Confira que <em>Conferir no SMAX</em> aprova os que vieram e que o termo digitado
-    sobrevive a marcar um chip — o re-render recria o <code>&lt;input&gt;</code>.
+    <strong>O que mudou na v1.17.</strong> Dois itens desta lista foram substituídos e não valem
+    mais: o <em>campo de termo</em> (que só filtrava o que já tinha vindo) deu lugar ao recorte por
+    <strong>GSE</strong>, que vai para o servidor, e o botão <em>Mandar para Incluir</em> deu lugar a
+    classificar e incluir sem sair da aba. O resto do cartão continua valendo. Ver o cartão da v1.17.
   </div>
   <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
     <strong>Nota sobre a verificação.</strong> Em 2026-10-09 tudo acima foi conferido neste harness.
@@ -426,6 +425,107 @@
     corrigidos antes da entrega: o contador do rodapé continuava contando quem já tinha entrado no
     painel, e a recusa por teto aparecia <em>sem</em> o filtro, justamente no caso em que a string
     exata é a única coisa útil na tela.
+  </div>
+</div>
+
+<div class="card">
+  <strong>v1.17 — Consultar por GSE, ler, classificar e incluir na mesma aba.</strong><br>
+  O recorte da consulta passou a ser a <strong>GSE</strong>, e ele vai no filtro do servidor como
+  <code>AssignedToGroup&nbsp;=&nbsp;'&lt;Id&gt;'</code>, por <em>Id</em> e entre aspas, várias
+  unidas por <code>or</code> dentro de parênteses próprios. O termo livre saiu: ele só coava as
+  linhas que já tinham vindo, e <code>wordstartswith</code> nunca foi visto funcionando em
+  <code>Request</code> — só em <code>Person</code>, <code>Location</code> e <code>PersonGroup</code>.
+  Filtro recusado pelo SMAX volta <strong>vazio sem erro</strong>, que a tela leria como “não existe
+  nenhum”; por isso o recorte foi para o campo que o servidor reconhece.
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>A busca de GSE é em <code>PersonGroup</code>, não em <code>Group</code>.</strong>
+    <code>Group</code> responde “operação não permitida” no SMAX de verdade. Digite
+    <em>supor</em> em <em>+ Adicionar GSE</em>: têm de vir 5 (CADASTRO, CUSTAS, EPROC, MIGRACAO,
+    TELEFONIA). Digite <em>eproc</em>: têm de vir <strong>2</strong>, e uma delas é
+    <em>GSE SGS EPROC 1 GRAU</em> — prova que <code>wordstartswith</code> casa com o início de
+    <em>qualquer</em> palavra e não só da primeira. Digite <em>suporte c</em>: as duas palavras são
+    unidas por <code>and</code>, então sobram CADASTRO e CUSTAS. Digite <em>desativ</em>: tem de dar
+    <strong>zero</strong> — a GSE com esse nome está inativa e o filtro recorta por
+    <code>Status&nbsp;=&nbsp;'Active'</code>.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>O recorte é por Id, e some do servidor.</strong> Escolha <em>SUPORTE CUSTAS</em> e
+    consulte: no log do mock tem de aparecer <code>gses=44002</code> e <em>todas</em> as linhas da
+    tela têm de ser desse grupo. Acrescente <em>SUPORTE MIGRACAO</em> e o total tem de
+    <em>crescer</em> (os dois grupos, não a interseção). Escolha <em>SUPORTE TELEFONIA</em>, que não
+    é o grupo de nenhum global: tem de dar “nenhum global nesse filtro” — e isso é diferente de
+    falha. As GSEs escolhidas ficam gravadas em <code>GM_setValue</code>: o SMAX recarrega a página
+    a cada navegação, e escolha só em memória obrigaria a redigitar em toda consulta.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>GSE afrouxa o teto de 10.000.</strong> <em>Sem recorte</em> de data e <em>sem</em> GSE
+    continua sendo recusado com <code>query.num.of.entities.exceeded</code>. Agora escolha uma GSE e
+    mantenha <em>sem recorte</em>: tem de <strong>funcionar</strong>. O teto é pelo tamanho do
+    conjunto varrido, não pelo período — e é isso que torna a consulta por GSE útil sem janela de
+    data.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>A divergência de campo aparece na linha.</strong> O filtro usa a designação atual
+    (<code>AssignedToGroup</code>), que é o que o script de produção do outro autor filtra; mas quem
+    troca de GSE no SMAX Respostas grava <code>ExpertGroup</code>. Se nesta instalação a GSE do
+    global morar no outro campo, a consulta voltaria vazia <em>sem explicação</em>. Por isso o
+    <code>ExpertGroup</code> entra no layout só como diagnóstico e a linha mostra
+    <em>grupo especialista: …</em> <strong>apenas quando difere</strong>. No mock o
+    <code>82133910</code> e um a cada 37 sintéticos têm essa divergência plantada: o aviso tem de
+    sair nessas linhas e em nenhuma outra.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Ler antes de decidir.</strong> Cada linha tem <em>Ver</em>, e ele abre o chamado mesmo
+    para quem <strong>não</strong> está no painel — é o ponto da mudança: a escolha de assunto, base
+    e competência se faz <em>lendo</em> o chamado. Em <em>Classificação no painel</em> um candidato
+    novo tem de dizer “sem marcação”, e não dar erro. Para quem já está no painel a linha troca o
+    chip de marcar por <em>Editar</em>.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Classificar e incluir sem trocar de aba.</strong> O bloco de classificação só aparece
+    quando há alguém marcado, e o rodapé passa a ser <em>Incluir os N marcados</em>. A regra de
+    admissão é a <em>mesma função</em> da aba Incluir (<code>conferirUm</code>) e a gravação é o
+    mesmo <code>Dados.incluir</code> — duas versões da regra divergiriam. Teste as recusas: marque
+    um e inclua duas vezes (a segunda tem de dizer <em>repetido</em>); a conferência é refeita no
+    SMAX antes de gravar, porque a lista na tela tem a idade da última consulta. Depois de incluir,
+    as marcações e a nota são <strong>zeradas</strong> — herdar classificação em silêncio é o jeito
+    de carimbar o chamado errado. O desfecho fica em <em>Última inclusão</em>, com motivo por linha:
+    “marquei 5, entraram 3” sem explicação não é relatório.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>O texto digitado sobrevive ao redesenho.</strong> Digite na <em>Nota</em>, marque um chip
+    de assunto e confira que a nota continua lá — o re-render recria o <code>&lt;input&gt;</code>. Na
+    busca de GSE é o contrário: ela redesenha <em>só a própria caixa</em>, preservando foco e cursor,
+    porque um <code>render()</code> inteiro mataria o campo a cada tecla.
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Ids de grupo no mock.</strong> Até a v1.16 todas as fixtures compartilhavam o Id
+    <code>44444</code>, e com isso <em>qualquer</em> filtro de GSE pareceria funcionar — um único Id
+    casava com todo mundo. Agora cada grupo tem Id próprio (<code>44001</code>…<code>44008</code>).
+  </div>
+  <div style="margin-top:10px; font-size:12.5px; color:#5a6b7e;">
+    <strong>Nota sobre a verificação.</strong> Em 2026-10-09 tudo acima foi conferido neste harness.
+    A string que chegou ao servidor foi
+    <code>IsGlobal_c&nbsp;=&nbsp;'true' and CreateTime&nbsp;&gt;=&nbsp;… and (AssignedToGroup&nbsp;=&nbsp;'44005' or AssignedToGroup&nbsp;=&nbsp;'44002') and (Status&nbsp;=&nbsp;… or …)</code>
+    — a cadeia <code>or</code> das GSEs <em>dentro dos próprios parênteses</em>, separada da dos
+    status, que é o ponto: a precedência de <code>and</code>/<code>or</code> nos filtros do SMAX não
+    é documentada e um <code>or</code> solto passaria despercebido. Para poder ver isso, o mock passou
+    a registrar o <em>filtro cru</em> no log, além dos valores que conseguiu interpretar.
+    Números medidos (<em>SUPORTE EPROC</em>): <em>90 dias / abertos</em> → 17, 1 descartado,
+    16 na lista; <em>12 meses / abertos</em> → 65, 5 descartados, 60; <em>sem recorte</em> →
+    <strong>70</strong>, isto é, funcionou em vez de bater no teto. Sem GSE e sem data a recusa
+    voltou com a mensagem do teto <em>e</em> o filtro exato. <em>SUPORTE TELEFONIA</em> deu
+    “nenhum global nesse filtro”, e não erro. Na busca de GSE: <em>eproc</em> → 2 (incluindo
+    <em>GSE SGS EPROC 1 GRAU</em>, prova do início de qualquer palavra), <em>supor</em> → 5,
+    <em>suporte c</em> → 2, <em>desativ</em> → 0. O aviso de grupo especialista saiu em
+    <strong>1</strong> das 60 linhas (o <code>82133910</code>) e em nenhuma outra, com o
+    <em>nome</em> e não <code>[object Object]</code>. O caminho completo foi exercitado ponta a
+    ponta: <em>Ver</em> abriu o <code>82133910</code>, que <strong>não</strong> está no painel,
+    mostrando “sem marcação” em vez de erro; marcar → classificar nos três eixos → nota → incluir
+    gravou o global com <em>Indisponibilidade / SAJ5 / Cível</em> e a nota, zerou marcações e nota,
+    e a linha virou <em>já no painel</em> com <em>Editar</em> no lugar do chip. A nota sobreviveu a
+    marcar um chip, e as GSEs escolhidas sobreviveram à troca de aba. Um defeito saiu daqui e foi
+    corrigido antes da entrega: o rodapé dizia “Incluir os <strong>1</strong> marcados”.
   </div>
 </div>
 

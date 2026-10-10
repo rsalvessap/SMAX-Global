@@ -13,6 +13,30 @@ let nextId = 4567890;
 
 // Pessoas fake. Os quatro "GLOBAL EPROC" existem para exercitar o seed do picker;
 // os outros dois so provam que a busca por prefixo filtra mesmo.
+/* GSEs fake (entidade `PersonGroup`). O filtro de GSE da aba Consultar e por
+ * **Id**, nao por nome — por isso cada grupo aqui tem Id proprio. Antes da v1.17
+ * todas as fixtures compartilhavam o Id '44444', e com isso qualquer filtro de
+ * GSE pareceria funcionar: um unico Id casava com todo mundo.
+ *
+ * Tres coisas estao plantadas de proposito:
+ *  - `SUPORTE TELEFONIA` nao e o grupo de nenhum global: escolhe-la tem de dar
+ *    "nenhum global nesse filtro", e nao lista cheia.
+ *  - `SUPORTE DESATIVADO` esta inativo, para provar que o recorte de Status na
+ *    busca de GSE funciona (ela nao pode aparecer nos achados).
+ *  - duas comecam com "SUPORTE C": prova que a busca e por INICIO de palavra e
+ *    volta mais de uma. */
+const GROUPS = [
+  { Id: '44001', Name: 'SUPORTE EPROC',      Status: 'Active' },
+  { Id: '44002', Name: 'SUPORTE CUSTAS',     Status: 'Active' },
+  { Id: '44003', Name: 'SUPORTE MIGRACAO',   Status: 'Active' },
+  { Id: '44004', Name: 'ATENDIMENTO',        Status: 'Active' },
+  { Id: '44005', Name: 'SUPORTE CADASTRO',   Status: 'Active' },
+  { Id: '44006', Name: 'SUPORTE TELEFONIA',  Status: 'Active' },
+  { Id: '44007', Name: 'GSE SGS EPROC 1 GRAU', Status: 'Active' },
+  { Id: '44008', Name: 'SUPORTE DESATIVADO', Status: 'Inactive' },
+];
+const idDoGrupo = (nome) => (GROUPS.find(g => g.Name === nome) || {}).Id || '';
+
 const PEOPLE = [
   { Id: '51000001', Name: 'GLOBAL EPROC 1 GRAU E COLEGIO RECURSAL', Upn: 'global.eproc1@tjsp.jus.br' },
   { Id: '51000002', Name: 'GLOBAL EPROC 2 GRAU',                    Upn: 'global.eproc2@tjsp.jus.br' },
@@ -33,7 +57,10 @@ const REQUESTS = [
   // As datas de CreateTime dos globais sao de meses DIFERENTES e de proposito
   // deixam junho e setembro de 2026 vazios: e assim que se ve se o grafico de
   // abertura por mes desenha o mes sem nenhum global em vez de pular.
-  { Id: '82133910', IsGlobal_c: 'true', DisplayLabel: 'GLOBAL — eproc 1o grau fora do ar', Status: 'InProgress', StatusSCCDSMAX_c: 'EmAtendimento_c', grupo: 'SUPORTE EPROC', CreateTime: 1778770800000, LastUpdateTime: 1758900000000 },
+  // `espec` diferente de `grupo`: e o caso que o aviso de divergencia da aba
+  // Consultar existe para mostrar. Se a GSE do global desta instalacao morar em
+  // ExpertGroup e nao em AssignedToGroup, e esta linha que denuncia.
+  { Id: '82133910', IsGlobal_c: 'true', DisplayLabel: 'GLOBAL — eproc 1o grau fora do ar', Status: 'InProgress', StatusSCCDSMAX_c: 'EmAtendimento_c', grupo: 'SUPORTE EPROC', espec: 'GSE SGS EPROC 1 GRAU', CreateTime: 1778770800000, LastUpdateTime: 1758900000000 },
   // GlobalId_c apontando para si mesmo, e so em related_properties: o SMAX faz
   // isso em global de verdade, e nem a conferencia nem a contagem podem ler como filho.
   { Id: '82140011', IsGlobal_c: true, DisplayLabel: 'GLOBAL — custas indevidas', Status: 'Ready', StatusSCCDSMAX_c: 'Aguardando3Nivel_c', grupo: 'SUPORTE CUSTAS', CreateTime: 1783004400000, LastUpdateTime: 1758910000000, pai: '82140011', relOnly: true },
@@ -102,6 +129,9 @@ for (let i = 0; i < 320; i++) {
     Status: STATUS_CICLO[i % STATUS_CICLO.length],
     StatusSCCDSMAX_c: i % 2 ? 'EmAtendimento_c' : 'Aguardando3Nivel_c',
     grupo: ['SUPORTE EPROC', 'SUPORTE CUSTAS', 'SUPORTE MIGRACAO'][i % 3],
+    // Alguns com grupo especialista divergente, espalhados: o aviso tem de
+    // aparecer so nessas linhas, e nao em todas nem em nenhuma.
+    espec: i % 37 === 4 ? 'GSE SGS EPROC 1 GRAU' : undefined,
     CreateTime: AGORA - Math.round(i * 1.25 * DIA),
     LastUpdateTime: AGORA - Math.round(i * 1.25 * DIA) + 3600000,
     pai: filho ? ID_PAI_SINT : undefined,
@@ -113,11 +143,15 @@ const entidadeDe = (r) => {
   const props = {
     Id: r.Id, DisplayLabel: r.DisplayLabel, IsGlobal_c: r.IsGlobal_c,
     Status: r.Status || '', StatusSCCDSMAX_c: r.StatusSCCDSMAX_c || '',
-    PhaseId: r.PhaseId || '', AssignedToGroup: r.grupo ? '44444' : '',
+    PhaseId: r.PhaseId || '', AssignedToGroup: idDoGrupo(r.grupo),
+    ExpertGroup: idDoGrupo(r.espec),
     CreateTime: r.CreateTime || 0, LastUpdateTime: r.LastUpdateTime || 0
   };
   const rel = {};
-  if (r.grupo) rel.AssignedToGroup = { Id: '44444', Name: r.grupo };
+  if (r.grupo) rel.AssignedToGroup = { Id: idDoGrupo(r.grupo), Name: r.grupo };
+  // `espec` so existe nas fixtures que DIVERGEM da designacao atual — e a linha
+  // da aba Consultar so mostra o grupo especialista nesse caso.
+  if (r.espec) rel.ExpertGroup = { Id: idDoGrupo(r.espec), Name: r.espec };
   if (r.pai) {
     if (r.relOnly) rel.GlobalId_c = { Id: r.pai };
     else props.GlobalId_c = { Id: r.pai };
@@ -343,13 +377,19 @@ http.createServer(async (req, res) => {
      * recusa por teto de 10.000 — e o que o SMAX faz com consulta aberta demais,
      * e e o unico jeito de exercitar esse caminho na tela. */
     if (/IsGlobal_c\s*=\s*'/.test(filter)) {
-      if (!/CreateTime\s*>=/.test(filter)) {
-        console.log('[mock] GET ems/Request (busca) sem recorte de data → recusado por teto de 10.000');
+      const gses = valores('AssignedToGroup');
+      /* O teto de 10.000 e por tamanho do conjunto varrido, nao pelo periodo:
+       * recortar por GSE encolhe a varredura e por isso "sem recorte" de data
+       * passa a ser consulta viavel. Sem essa distincao o mock ensinaria o
+       * contrario do que a tela promete ao escolher uma GSE. */
+      if (!/CreateTime\s*>=/.test(filter) && !gses.length) {
+        console.log('[mock] GET ems/Request (busca) sem recorte de data nem de GSE → recusado por teto de 10.000');
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ meta: { completion_status: 'FAILED' }, error: { messageKey: 'query.num.of.entities.exceeded', message: 'too many' } }));
         return;
       }
-      const desde = Number(/CreateTime\s*>=\s*(\d+)/.exec(filter)[1]);
+      const mDesde = /CreateTime\s*>=\s*(\d+)/.exec(filter);
+      const desde = mDesde ? Number(mDesde[1]) : 0;
       // Os dois lados normalizados: o filtro manda sempre com o prefixo do enum,
       // e as fixtures guardam das duas formas de proposito.
       const semPref = (s) => String(s || '').replace(/^RequestStatus/, '');
@@ -357,14 +397,21 @@ http.createServer(async (req, res) => {
       const ehTrue = (v) => v === true || v === 'true';
       let achados = REQUESTS.filter(r => ehTrue(r.IsGlobal_c)
         && (r.CreateTime || 0) >= desde
-        && (!sts.length || sts.includes(semPref(r.Status))));
+        && (!sts.length || sts.includes(semPref(r.Status)))
+        // Por Id, como o script manda. Comparar por nome aqui esconderia o erro
+        // de mandar nome no lugar de Id.
+        && (!gses.length || gses.includes(idDoGrupo(r.grupo))));
       // `order` e servidor, nao cliente: se o mock nao ordenar, "mais recentes
       // primeiro" na tela seria so a ordem em que as fixtures foram declaradas.
       if (/CreateTime\s+desc/i.test(qs.get('order') || '')) {
         achados = achados.slice().sort((a, b) => (b.CreateTime || 0) - (a.CreateTime || 0));
       }
       const pag = achados.slice(skip, skip + size);
-      console.log(`[mock] GET ems/Request (busca) desde=${new Date(desde).toISOString().slice(0, 10)} status=${sts.length || 'todos'} order=${qs.get('order') || '—'} skip=${skip} size=${size} → ${pag.length}/${achados.length}`);
+      // O filtro cru, e nao so o que o mock conseguiu entender: a precedencia de
+      // and/or nos filtros do SMAX nao e documentada, e um `or` solto fora dos
+      // parenteses passaria por aqui parecendo certo.
+      console.log(`[mock]   filtro cru: ${filter}`);
+      console.log(`[mock] GET ems/Request (busca) desde=${desde ? new Date(desde).toISOString().slice(0, 10) : 'sempre'} gses=${gses.length ? gses.join(',') : 'todas'} status=${sts.length || 'todos'} order=${qs.get('order') || '—'} skip=${skip} size=${size} → ${pag.length}/${achados.length}`);
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         meta: { completion_status: 'OK', total_count: achados.length },
@@ -383,6 +430,38 @@ http.createServer(async (req, res) => {
     res.end(JSON.stringify({
       meta: { completion_status: 'OK', total_count: hits.length },
       entities: pagina.map(entidadeDe)
+    }));
+    return;
+  }
+
+  /* Busca de GSE. Entidade `PersonGroup` de proposito: `Group` responde
+   * "operacao nao permitida" no SMAX de verdade. O operador e `wordstartswith`,
+   * que casa com o inicio de QUALQUER palavra do nome — nao so a primeira — e e
+   * por isso que o mock quebra o nome em palavras antes de comparar. Fingir
+   * "startsWith" no nome inteiro faria o mock aceitar uma busca que em producao
+   * volta vazia. */
+  if (/^\/rest\/\d+\/ems\/PersonGroup$/i.test(url) && req.method === 'GET') {
+    const qs = new URL(req.url, 'http://x').searchParams;
+    const filter = qs.get('filter') || '';
+    const size = Math.max(1, Number(qs.get('size')) || 30);
+    const termos = [...filter.matchAll(/Name\s+wordstartswith\s*\(\s*'([^']*)'\s*\)/gi)]
+      .map(m => m[1].replace(/''/g, "'").toLocaleUpperCase('pt-BR'))
+      .filter(Boolean);
+    // O script manda as palavras com `and`: todas tem de casar, cada uma com
+    // alguma palavra do nome.
+    const soAtivos = /Status\s*=\s*'Active'/i.test(filter);
+    let hits = GROUPS.filter((g) => {
+      if (soAtivos && g.Status !== 'Active') return false;
+      if (!termos.length) return false;
+      const palavras = g.Name.toLocaleUpperCase('pt-BR').split(/\s+/);
+      return termos.every(t => palavras.some(p => p.startsWith(t)));
+    });
+    hits = hits.slice().sort((a, b) => a.Name.localeCompare(b.Name, 'pt-BR')).slice(0, size);
+    console.log(`[mock] GET ems/PersonGroup termos=${JSON.stringify(termos)} ativos=${soAtivos} → ${hits.length}`);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({
+      meta: { completion_status: 'OK', total_count: hits.length },
+      entities: hits.map(g => ({ entity_type: 'PersonGroup', properties: { Id: g.Id, Name: g.Name, Status: g.Status } }))
     }));
     return;
   }

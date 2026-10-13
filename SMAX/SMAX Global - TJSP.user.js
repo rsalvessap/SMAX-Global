@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SMAX Painel de Globais - TJSP
 // @namespace    https://github.com/rsalvessap/SMAX-Global
-// @version      1.18
+// @version      1.19
 // @description  Painel de gestao de chamados globais do SMAX TJSP — lista curada, classificacao por assunto/base/competencia, sincronizacao por arquivo no GitHub e abertura automatizada de global por molde
 // @author       rsalvessap
 // @match        https://suporte.tjsp.jus.br/saw/*
@@ -27,7 +27,7 @@
   if (window.top && window.top !== window.self) return;
   if (window.location.hostname !== 'suporte.tjsp.jus.br') return;
 
-  const SMAX_GLOBAL_VERSION = '1.18';
+  const SMAX_GLOBAL_VERSION = '1.19';
 
   // O userscript roda em sandbox; quem dispara as requisicoes e a pagina.
   const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
@@ -1842,9 +1842,11 @@
     const MINHA_ABA = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 
     const TIPOS = {
-      filhos: { rot: 'Filhos', peso: 3 },
-      status: { rot: 'Status', peso: 2 },
-      grupo: { rot: 'Grupo', peso: 1 },
+      filhos: { rot: 'Filhos', peso: 5 },
+      status: { rot: 'Status', peso: 4 },
+      fase: { rot: 'Fase', peso: 3 },
+      grupo: { rot: 'Grupo', peso: 2 },
+      titulo: { rot: 'Título', peso: 1 },
       atualizado: { rot: 'Atualizado', peso: 0 }
     };
 
@@ -1867,6 +1869,8 @@
       const itens = [];
       if (!antes) return itens; // primeira leitura deste global: nao e novidade
       const add = (tipo, texto) => itens.push({ id, titulo: depois.titulo || antes.titulo || '', tipo, texto, quando });
+      // Marca se o item de status saiu — a fase depende disso (ver abaixo).
+      let teveStatus = false;
 
       const a = antes.filhosSonda;
       const d = depois.filhosSonda;
@@ -1893,10 +1897,32 @@
         const fim = (st) => Metrica.encerrada({ lido: true, status: st });
         const virouEncerrado = !fim(antes.status) && fim(depois.status);
         add('status', `${de} → ${para}${virouEncerrado ? ' (encerrado — dá para arquivar)' : ''}`);
+        teveStatus = true;
+      }
+
+      /* A fase (`PhaseId`) ja vinha na leitura desde a fase 5 (:1454) e nunca era
+       * comparada — mudanca de fase caia no item generico. Sai SO quando o item
+       * de status nao saiu: no SMAX a fase acompanha o status na maioria das
+       * gravacoes, e as duas linhas descreveriam a mesma mudanca. E o mesmo
+       * cuidado contra ruido que faz o item generico existir.
+       *
+       * O valor vai CRU, como o SMAX manda. Nao ha mapa de rotulo de PhaseId
+       * neste script, e inventar um nome amigavel aqui seria adivinhar — o painel
+       * prefere um valor tecnico verdadeiro a um rotulo bonito e suposto. */
+      if (!teveStatus && antes.fase !== undefined && depois.fase !== undefined
+          && antes.fase !== depois.fase) {
+        add('fase', `${antes.fase || '—'} → ${depois.fase || '—'}`);
       }
 
       if (antes.grupo !== undefined && depois.grupo !== undefined && antes.grupo !== depois.grupo) {
         add('grupo', `${antes.grupo || '—'} → ${depois.grupo || '—'}`);
+      }
+
+      // Titulo nao tem a condicao da fase: editar o texto do titulo nao mexe em
+      // status, grupo nem filhos, entao nunca e a mesma noticia que outro item.
+      if (antes.titulo !== undefined && depois.titulo !== undefined
+          && antes.titulo !== depois.titulo) {
+        add('titulo', `“${antes.titulo || '—'}” → “${depois.titulo || '—'}”`);
       }
 
       if (!itens.length
@@ -1992,6 +2018,11 @@
         if (son.porPai[id] !== undefined && son.porPai[id] !== antes.filhosSonda) return true;
         if (dep.status !== antes.status || dep.statusOp !== antes.statusOp) return true;
         if (dep.grupo !== antes.grupo) return true;
+        // Fase e titulo entram aqui pelo mesmo motivo que status e grupo ja
+        // estavam: o `atualizadoEm` logo abaixo cobriria os dois, mas a lista da
+        // sondagem tem de espelhar a do `diffGlobal`. Tipo que o diff sabe
+        // nomear e a sondagem nao sabe ver nunca chegaria a aparecer.
+        if (dep.fase !== antes.fase || dep.titulo !== antes.titulo) return true;
         return (Number(dep.atualizadoEm) || 0) > (Number(antes.atualizadoEm) || 0);
       });
 
@@ -2770,7 +2801,9 @@
 }
 .smax-gl-nov-tipo[data-tipo="filhos"] { color:var(--sp-danger-text); }
 .smax-gl-nov-tipo[data-tipo="status"] { color:var(--sp-accent); }
+.smax-gl-nov-tipo[data-tipo="fase"] { color:var(--sp-success-text); }
 .smax-gl-nov-tipo[data-tipo="grupo"] { color:var(--sp-pending); }
+.smax-gl-nov-tipo[data-tipo="titulo"] { color:var(--sp-text); }
 .smax-gl-nov-tipo[data-tipo="atualizado"] { color:var(--sp-text-muted); }
 .smax-gl-nov-tit { font-size:12.5px; color:var(--sp-text); }
 .smax-gl-nov-tit b { font-family:Consolas, monospace; }
@@ -4490,8 +4523,8 @@
         return `
           <div class="smax-gl-note">
             Nada registrado ainda. O monitor compara cada leitura com a anterior e anota aqui o que
-            mudou nos globais não arquivados: filhos novos, troca de status, troca de grupo e
-            alteração genérica.
+            mudou nos globais não arquivados: filhos novos, troca de status, troca de fase, troca de
+            grupo, edição de título e alteração genérica.
             ${PgStore.prefs.monitor.ligado
               ? proximaTexto()
               : '<br><strong>O monitoramento está desligado</strong> — ligue em Configuração, ou use “↻ Atualizar do SMAX”, que também compara.'}

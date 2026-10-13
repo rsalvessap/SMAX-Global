@@ -139,11 +139,19 @@ for (let i = 0; i < 320; i++) {
   });
 }
 
+/* No SMAX a fase acompanha o status, e e justo esse acoplamento que faz o diff
+   suprimir o item de fase quando o de status saiu. Devolver PhaseId sempre vazio
+   deixaria a regra sem como ser exercitada aqui. */
+const faseDeStatus = (s) => {
+  const k = String(s || '').replace(/^RequestStatus/, '');
+  return k ? `Log_${k}` : '';
+};
+
 const entidadeDe = (r) => {
   const props = {
     Id: r.Id, DisplayLabel: r.DisplayLabel, IsGlobal_c: r.IsGlobal_c,
     Status: r.Status || '', StatusSCCDSMAX_c: r.StatusSCCDSMAX_c || '',
-    PhaseId: r.PhaseId || '', AssignedToGroup: idDoGrupo(r.grupo),
+    PhaseId: r.PhaseId || faseDeStatus(r.Status), AssignedToGroup: idDoGrupo(r.grupo),
     ExpertGroup: idDoGrupo(r.espec),
     CreateTime: r.CreateTime || 0, LastUpdateTime: r.LastUpdateTime || 0
   };

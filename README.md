@@ -1,6 +1,8 @@
 # SMAX Global — TJSP
 
-Userscript Tampermonkey que automatiza a **abertura de chamado global** no SMAX do TJSP.
+Userscript Tampermonkey para os **chamados globais** do SMAX do TJSP: um painel que mantém a
+lista curada da equipe, **abre** global novo por molde e **acompanha** o que muda nos que já
+estão abertos.
 
 Chamado global, aqui, é o chamado que a equipe abre para concentrar várias demandas idênticas.
 O script não vincula os filhos — ele só abre o global e devolve o ID.
@@ -8,6 +10,7 @@ O script não vincula os filhos — ele só abre o global e devolve o ID.
 ```
 SMAX/SMAX Global - TJSP.user.js   # o script
 test/harness.html                 # harness local de desenvolvimento
+test/server.js                    # servidor local que finge ser a API do SMAX
 ```
 
 ## Como funciona
@@ -105,6 +108,66 @@ a cada recarga de página.
 
 O corpo inteiro da requisição é clonado — não só `properties` — para que qualquer campo irmão
 que o SMAX espere viaje junto no replay.
+
+## Monitoramento dos globais
+
+O painel acompanha os globais não arquivados da lista e anota na aba **Novidades** o que mudou
+desde a leitura anterior. Duas perguntas, e só duas: mudou algo num global que eu acompanho, e
+apareceram filhos novos. Vigiar os chamados novos do SMAX seria outro produto.
+
+Dois gatilhos, mesmo pipeline: a rodada automática (padrão 30 min, em *Configuração →
+Monitoramento*) e o botão **↻ Atualizar do SMAX** no rodapé do Painel.
+
+### A rodada é em duas etapas
+
+Primeiro uma **sondagem barata** — `size=1&meta=totalCount`, uma requisição por global, payload
+quase zero. Só nos globais que mexeram vem a **leitura completa**. O motivo é medido: um global
+com 2.614 filhos custa 11 requisições de 250 registros para enumerar os filhos. Num ciclo
+automático isso é carga demais, e a pergunta da sondagem ("o número mudou?") não precisa deles.
+
+A contagem da sondagem mora num campo próprio (`filhosSonda`) e é comparada sempre contra ela
+mesma — marca d'água, não informação. Ela conta o próprio global quando ele tem `GlobalId_c`
+apontando para si mesmo, e a enumeração desconta essa autorreferência; as duas podem diferir em 1.
+Quem a tela mostra é a enumeração. Comparar métricas diferentes faria o primeiro ciclo anunciar
+"+1 filho" em todo global autorreferente.
+
+### O que o aviso diz
+
+| Tipo | Texto |
+|---|---|
+| **Filhos** | `3 filho(s) novo(s) — de 12 para 15` — queda também é notícia |
+| **Status** | `Em andamento / Aguardando → Concluído / —`, com `(encerrado — dá para arquivar)` |
+| **Fase** | `Log_InProgress → Log_Complete` |
+| **Grupo** | GSE anterior → GSE atual |
+| **Título** | título anterior → título atual |
+| **Atualizado** | `alguma alteração no chamado — a leitura enxuta não diz qual` |
+
+A **fase** vai com o valor cru do SMAX: não há mapa de rótulo de `PhaseId` aqui, e um nome
+amigável inventado seria pior que um valor técnico verdadeiro. Ela só sai **quando o item de
+Status não saiu** — no SMAX a fase acompanha o status na maioria das gravações, e as duas linhas
+descreveriam a mesma mudança. **Título** não tem essa condição: editar o texto não mexe em mais
+nada, então nunca é a mesma notícia que outro item.
+
+O item genérico **Atualizado** sai só quando nenhum dos específicos saiu, e de propósito não diz
+o quê: `LastUpdateTime` cresce em toda gravação, e a leitura em lote não traz comentário nem
+descrição. Comentário novo, troca de pessoa designada e edição de descrição ainda caem aqui.
+
+Para fechar essa lacuna existe o endpoint de auditoria
+`audit/ems-history-service/Request?changeType=ALL&entityId={id}`, que devolve
+`results[].changeProperties[campo].oldValue/.newValue` — o nome do campo e o de/para. Ele está em
+uso em produção por outros scripts da família, mas **ainda não é usado aqui**: falta confirmar
+quais campos aparecem no `changeProperties` (os consumidores conhecidos leem só `AssignedToGroup`
+e `ExpertGroup`) e se cada entrada tem carimbo de hora — sem ele o aviso repetiria a história
+inteira do chamado em vez do que mudou desde a última leitura.
+
+### Duas regras que não se negociam
+
+**Comparação só acontece quando existe valor anterior.** Campo nunca lido vale `undefined` e
+significa "não sei", nunca zero. Sem esse sentinela a primeira rodada anunciaria "+2.614 filhos"
+em cada global da lista.
+
+**Nunca inventar zero.** Bloco de consulta recusado pelo SMAX tira a chave em vez de gravar 0 —
+a tela mostra *não lido*. Um global com o teto de 10.000 estourado tem muitos filhos, não nenhum.
 
 ## Segurança
 

@@ -648,7 +648,9 @@
     // Um papel por global, para cada tipo de novidade sair em separado: misturar
     // dois gatilhos no mesmo global esconderia um dos dois (o generico so sai
     // quando nenhum especifico saiu).
-    const papeis = ['status', 'grupo', 'filhos'];
+    // `fase` depende de o papel NAO ser `status`: o diff suprime a fase quando o
+    // status tambem mudou, e plantar os dois no mesmo global esconderia a fase.
+    const papeis = ['status', 'grupo', 'filhos', 'fase', 'titulo'];
     let i = 0;
     const plantados = [];
     ids.forEach((id) => {
@@ -665,6 +667,8 @@
       if (papel === 'status') { e.status = 'RequestStatusNew'; e.statusOp = 'Triagem_c'; }
       if (papel === 'grupo') e.grupo = 'GRUPO ANTIGO (plantado pelo harness)';
       if (papel === 'filhos' && typeof e.filhosSonda === 'number') e.filhosSonda = Math.max(0, e.filhosSonda - 2);
+      if (papel === 'fase') e.fase = 'FASE_ANTIGA_PLANTADA';
+      if (papel === 'titulo') e.titulo = 'TITULO ANTIGO (plantado pelo harness)';
       plantados.push(`${id}: ${papel}`);
     });
     plantados.forEach(p => log('plantado — ' + p, 'warn'));

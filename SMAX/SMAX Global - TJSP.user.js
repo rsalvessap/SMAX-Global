@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SMAX Painel de Globais - TJSP
 // @namespace    https://github.com/rsalvessap/SMAX-Global
-// @version      1.19
+// @version      1.20
 // @description  Painel de gestao de chamados globais do SMAX TJSP — lista curada, classificacao por assunto/base/competencia, sincronizacao por arquivo no GitHub e abertura automatizada de global por molde
 // @author       rsalvessap
 // @match        https://suporte.tjsp.jus.br/saw/*
@@ -27,7 +27,7 @@
   if (window.top && window.top !== window.self) return;
   if (window.location.hostname !== 'suporte.tjsp.jus.br') return;
 
-  const SMAX_GLOBAL_VERSION = '1.19';
+  const SMAX_GLOBAL_VERSION = '1.20';
 
   // O userscript roda em sandbox; quem dispara as requisicoes e a pagina.
   const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
@@ -661,6 +661,13 @@
         || bruto.replace(/_c$/i, '').replace(/([a-z0-9à-ü])([A-Z])/g, '$1 $2');
     };
 
+    /* O mesmo mapa servindo de lista para escolher, ordenado pelo rotulo que
+     * aparece na tela — nao pelo codigo, que e ordem de ninguem. O mapa segue
+     * privado: quem escolhe precisa de pares {codigo, rotulo}, nao do objeto. */
+    const opcoesStatusOp = () => Object.keys(STATUS_OP_ROTULO)
+      .map(codigo => ({ codigo, rotulo: STATUS_OP_ROTULO[codigo] }))
+      .sort((a, b) => a.rotulo.localeCompare(b.rotulo, 'pt-BR'));
+
     const linhaDe = (g) => {
       const e = PgStore.estado().porId[g.id] || null;
       return {
@@ -850,7 +857,7 @@
       };
     };
 
-    return { todas, listar, resumo, statusConhecidos, graficos, rotuloStatus, rotuloStatusOp, encerrada, CHAVES, ASC_PRIMEIRO };
+    return { todas, listar, resumo, statusConhecidos, graficos, rotuloStatus, rotuloStatusOp, opcoesStatusOp, encerrada, CHAVES, ASC_PRIMEIRO };
   })();
 
   /* =========================================================
@@ -2647,6 +2654,97 @@
     const labelFor = (list, key) => (list.find(([k]) => k === key) || [])[1] || key;
 
     return { TO_OPTIONS, PURPOSE_OPTIONS, buildPayload, post, labelFor };
+  })();
+
+  /* =========================================================
+   * Vinculo — amarra chamado filho a um global.
+   *
+   * O vinculo NAO e o campo `GlobalId_c`: esse e leitura, alimentado pelo
+   * servidor a partir da relacao. Quem amarra e a relacao
+   * `RequestCausesRequest` — a mesma que a tela nativa do SMAX cria (o Toolkit
+   * a intercepta por `/ems\/RequestCausesRequest/`, SMAX Toolkit:2804). E por
+   * isso que a contagem de filhos do painel, que le `GlobalId_c`, ja funciona
+   * hoje sobre vinculos feitos por outras pessoas fora do script.
+   *
+   * Payload portado de dois scripts em producao: Respostas ADM
+   * (`postCreateRequestCausesRequest`, :2851-2875) e Triagem ADM (:6052-6084).
+   * =======================================================*/
+  const Vinculo = (() => {
+    // Uma relacao por chamada. `operation` vale para o lote inteiro e nao por
+    // entidade (analise 01-toolkit.md §17.10), e nao existe precedente em
+    // producao de varias relacoes num array so — o array fica com um item.
+    const amarrar = (paiId, filhoId) => ApiClient.request('ems/bulk', {
+      method: 'POST',
+      useXsrf: true,
+      body: {
+        relationships: [{
+          name: 'RequestCausesRequest',
+          firstEndpoint: { Request: String(paiId) },
+          secondEndpoint: { Request: String(filhoId) }
+        }],
+        operation: 'CREATE'
+      }
+    });
+
+    const atualizar = (filhoId, props) => ApiClient.request('ems/bulk', {
+      method: 'POST',
+      useXsrf: true,
+      body: {
+        entities: [{ entity_type: 'Request', properties: { Id: String(filhoId), ...props } }],
+        operation: 'UPDATE'
+      }
+    });
+
+    /* Ao criar o vinculo o servidor roda uma rotina que sincroniza o status
+     * operacional do filho com o do pai. Gravar o nosso valor antes dela e
+     * perde-lo em silencio — o delay existe para gravar DEPOIS. O motivo esta
+     * escrito na Triagem ADM:6071-6072, e vale para qualquer valor escolhido,
+     * nao so para o `Aguardando3Nivel_c` que os precedentes cravam. */
+    const ESPERA_ROTINA_MS = 2000;
+    const espera = (ms) => new Promise(r => setTimeout(r, ms));
+
+    const etapaOk = () => ({ ok: true, msg: '' });
+    const etapaErro = (msg) => ({ ok: false, msg });
+
+    /* Uma etapa de escrita, com o desfecho SEMPRE visivel. Os dois precedentes
+     * embrulham os updates de status em `try {} catch {}` vazio (Respostas
+     * ADM:9717 e :9724, Triagem ADM:6078) e por isso conseguem reportar
+     * "vinculado" com os campos intactos. Aqui a falha volta como dado. */
+    const tentar = async (fn) => {
+      try {
+        const res = await fn();
+        const st = Molde.completionStatus(res);
+        return st === 'OK' ? etapaOk() : etapaErro(st ? `SMAX respondeu ${st}.` : 'SMAX não confirmou a gravação.');
+      } catch (err) {
+        return etapaErro(err && err.message ? err.message : String(err));
+      }
+    };
+
+    /* Vincula UM filho. Devolve as tres etapas separadas, nunca um booleano:
+     * "vinculou mas nao suspendeu" e desfecho real e precisa chegar na tela
+     * diferente de "vinculou tudo".
+     *
+     * `statusOp` vazio significa "nao mexer no status operacional" — a etapa
+     * sai como `null`, que a tela le como nao tentada, nao como falha. */
+    const vincularUm = async (paiId, filhoId, statusOp) => {
+      const r = { id: String(filhoId), vinculo: null, status: null, statusOp: null };
+
+      r.vinculo = await tentar(() => amarrar(paiId, filhoId));
+      // Gate do precedente (Triagem ADM:6063): status de filho que nao ficou
+      // vinculado nao se mexe. Sem isso, um vinculo recusado deixaria o chamado
+      // suspenso sem pai — pior que nao ter feito nada.
+      if (!r.vinculo.ok) return r;
+
+      r.status = await tentar(() => atualizar(filhoId, { Status: 'RequestStatusSuspended' }));
+
+      if (statusOp) {
+        await espera(ESPERA_ROTINA_MS);
+        r.statusOp = await tentar(() => atualizar(filhoId, { StatusSCCDSMAX_c: statusOp }));
+      }
+      return r;
+    };
+
+    return { ESPERA_ROTINA_MS, amarrar, atualizar, vincularUm };
   })();
 
   /* =========================================================
@@ -4806,7 +4904,11 @@
       document.body.appendChild(wrap);
     });
 
-    const infoModal = (title, contentHtml) => {
+    /* `acao` e opcional: `{ rotulo, onClick }` vira um botao no rodape. Existe
+     * para o aviso de "chamado global criado" poder oferecer o passo seguinte
+     * (vincular filhos) sem o usuario ter de decorar o numero e ir procurar o
+     * global na lista depois. Sem `acao` o modal segue como era: so fecha. */
+    const infoModal = (title, contentHtml, acao = null) => {
       const wrap = document.createElement('div');
       wrap.className = 'smax-gl-overlay smax-gl-modal smax-gl-root';
       wrap.dataset.theme = ThemeManager.current();
@@ -4817,8 +4919,19 @@
             <div class="smax-gl-header-actions"><button data-act="fechar">✕</button></div>
           </div>
           <div class="smax-gl-body">${contentHtml}</div>
+          ${acao ? `
+            <div class="smax-gl-footer">
+              <div class="smax-gl-status"></div>
+              <button class="smax-gl-btn smax-gl-btn-primary" data-act="acao">${Utils.escapeHtml(acao.rotulo)}</button>
+              <button class="smax-gl-btn" data-act="fechar">Fechar</button>
+            </div>` : ''}
         </div>`;
       wrap.addEventListener('click', (ev) => {
+        if (acao && ev.target.closest('[data-act="acao"]')) {
+          wrap.remove();
+          acao.onClick();
+          return;
+        }
         if (ev.target === wrap || ev.target.closest('[data-act="fechar"]')) wrap.remove();
       });
       document.body.appendChild(wrap);
@@ -4915,12 +5028,21 @@
           </div>
           <div class="smax-gl-footer">
             <div class="smax-gl-status"></div>
+            <button class="smax-gl-btn" data-act="vincular-filhos">🔗 Vincular filhos</button>
             <a class="smax-gl-btn" href="/saw/Request/${Utils.escapeHtml(id)}/general" target="_blank"
                style="text-decoration:none;">Abrir no SMAX</a>
             <button class="smax-gl-btn" data-act="fechar">Fechar</button>
           </div>
         </div>`;
       wrap.addEventListener('click', (ev) => {
+        // A acao de escrita fica no rodape, separada dos dados: este modal e
+        // deliberadamente de leitura (ver o comentario acima), e misturar um
+        // botao que grava no meio do conteudo apagaria essa distincao.
+        if (ev.target.closest('[data-act="vincular-filhos"]')) {
+          wrap.remove();
+          vincularModal(id, () => relerPai(id));
+          return;
+        }
         if (ev.target === wrap || ev.target.closest('[data-act="fechar"]')) wrap.remove();
       });
       document.body.appendChild(wrap);
@@ -4984,6 +5106,296 @@
       });
     };
 
+    /* ---------- Vincular filhos ----------
+     *
+     * Um modal, dois pontos de entrada: o aviso de global recem-criado (passo
+     * seguinte da abertura) e o `verModal` de um global que ja esta na lista.
+     * Nos dois o pai vem do contexto, entao nao existe seletor de pai aqui —
+     * escolher o pai de novo, tendo acabado de criar ou de abrir um global, e
+     * chance de errar sem ganho nenhum.
+     *
+     * `onConcluir` releu o pai no SMAX: a contagem de filhos do painel vem da
+     * leitura, e somar +1 no numero guardado seria inventar dado (a regra do
+     * "nunca inventar zero", que vale para qualquer numero). Entao quem fecha
+     * dispara a releitura de verdade. */
+    const vincularModal = (paiId, onConcluir = null) => {
+      const pai = String(paiId);
+      const estado = {
+        texto: '',
+        statusOp: 'Aguardando3Nivel_c',
+        conferindo: false,
+        gravando: false,
+        conferidos: [],
+        resultados: []
+      };
+
+      const wrap = document.createElement('div');
+      wrap.className = 'smax-gl-overlay smax-gl-modal smax-gl-root';
+      wrap.dataset.theme = ThemeManager.current();
+      const corpo = () => wrap.querySelector('.smax-gl-body');
+      const rodape = () => wrap.querySelector('.smax-gl-footer-actions');
+      const aviso = () => wrap.querySelector('.smax-gl-status');
+
+      const dizer = (msg, tipo = '') => {
+        const el = aviso();
+        if (!el) return;
+        el.textContent = msg || '';
+        el.dataset.tipo = tipo;
+      };
+
+      // O texto digitado mora no <textarea>, e redesenhar o corpo o apagaria.
+      const lerTexto = () => {
+        const el = wrap.querySelector('#smax-gl-vinc-ids');
+        if (el) estado.texto = el.value;
+        return estado.texto;
+      };
+      const lerStatusOp = () => {
+        const el = wrap.querySelector('#smax-gl-vinc-statusop');
+        if (el) estado.statusOp = el.value;
+        return estado.statusOp;
+      };
+      // Mesma regra da aba Incluir global: qualquer sequencia de 3+ digitos,
+      // entao espaco, virgula, ponto-e-virgula, linha e "#" todos servem.
+      const idsDigitados = () => [...new Set((lerTexto().match(/\d{3,}/g) || []))];
+
+      const podemEntrar = () => estado.conferidos.filter(x => x.estado === 'ok');
+
+      /* A conferencia do FILHO e o espelho da `conferirUm` da aba Incluir: la o
+       * chamado tem de ser global e sem pai; aqui tem de NAO ser global e estar
+       * livre. O mesmo `PgApi.conferir` responde as duas, numa leitura. */
+      const conferirFilho = async (id) => {
+        if (id === pai) return { id, estado: 'proprio' };
+        try {
+          const r = await PgApi.conferir(id);
+          if (r.estado === 'inexistente') return { id, estado: 'inexistente' };
+          if (r.ehGlobal) return { id, estado: 'e-global', titulo: r.titulo };
+          if (r.paiId === pai) return { id, estado: 'ja-vinculado', titulo: r.titulo };
+          if (r.paiId) return { id, estado: 'outro-pai', titulo: r.titulo, paiId: r.paiId };
+          return { id, estado: 'ok', titulo: r.titulo };
+        } catch (err) {
+          return { id, estado: 'erro', motivo: PgApi.motivoDeErro(err) };
+        }
+      };
+
+      const ROTULO_CONFERIDO = {
+        ok: ['smax-gl-badge', 'pode vincular'],
+        'ja-vinculado': ['smax-gl-badge smax-gl-badge-warn', 'já é filho deste global'],
+        'outro-pai': ['smax-gl-badge smax-gl-badge-warn', 'é filho de outro global'],
+        'e-global': ['smax-gl-badge smax-gl-badge-warn', 'é um global'],
+        inexistente: ['smax-gl-badge smax-gl-badge-warn', 'não existe no SMAX'],
+        proprio: ['smax-gl-badge smax-gl-badge-warn', 'é o próprio global'],
+        erro: ['smax-gl-badge smax-gl-badge-warn', 'não foi possível conferir']
+      };
+
+      const linhaConferida = (x) => {
+        const [cls, rot] = ROTULO_CONFERIDO[x.estado] || ROTULO_CONFERIDO.erro;
+        const extra = x.estado === 'outro-pai'
+          ? ` <a href="/saw/Request/${Utils.escapeHtml(x.paiId)}/general" target="_blank"
+                 style="color:var(--sp-accent);">#${Utils.escapeHtml(x.paiId)} ↗</a>`
+          : x.estado === 'erro' ? ` ${Utils.escapeHtml(x.motivo || '')}` : '';
+        return `<tr>
+          <td class="smax-gl-num">#${Utils.escapeHtml(x.id)}</td>
+          <td>${Utils.escapeHtml(x.titulo || '')}</td>
+          <td><span class="${cls}">${rot}</span>${extra}</td>
+        </tr>`;
+      };
+
+      const etapaSelo = (etapa, feito, naoTentado) => {
+        if (etapa === null) return `<span class="smax-gl-naolido">${naoTentado}</span>`;
+        return etapa.ok
+          ? `<span class="smax-gl-badge">${feito}</span>`
+          : `<span class="smax-gl-badge smax-gl-badge-warn" title="${Utils.escapeHtml(etapa.msg)}">falhou</span>`;
+      };
+
+      const linhaResultado = (r) => `<tr>
+        <td class="smax-gl-num">#${Utils.escapeHtml(r.id)}</td>
+        <td>${etapaSelo(r.vinculo, 'vinculado', '—')}</td>
+        <td>${etapaSelo(r.status, 'suspenso', 'não tentado')}</td>
+        <td>${etapaSelo(r.statusOp, 'status op.', 'não mexido')}</td>
+      </tr>`;
+
+      const render = () => {
+        const opcoes = Metrica.opcoesStatusOp()
+          .map(o => `<option value="${Utils.escapeHtml(o.codigo)}" ${o.codigo === estado.statusOp ? 'selected' : ''}>${Utils.escapeHtml(o.rotulo)}</option>`)
+          .join('');
+
+        const blocoConferido = estado.conferidos.length ? `
+          <div class="smax-gl-label" style="margin-top:14px;">
+            Conferência — ${podemEntrar().length} de ${estado.conferidos.length} pode(m) vincular
+          </div>
+          <table class="smax-gl-kv"><tbody>${estado.conferidos.map(linhaConferida).join('')}</tbody></table>` : '';
+
+        const blocoResultado = estado.resultados.length ? `
+          <div class="smax-gl-label" style="margin-top:14px;">Resultado</div>
+          <table class="smax-gl-kv">
+            <thead><tr><th>Chamado</th><th>Vínculo</th><th>Status</th><th>Status op.</th></tr></thead>
+            <tbody>${estado.resultados.map(linhaResultado).join('')}</tbody>
+          </table>
+          <div class="smax-gl-note">
+            As três etapas são gravações separadas no SMAX. “vinculado” com “falhou” ao lado
+            significa que o filho está amarrado ao global mas o campo não mudou — passe o mouse
+            no selo para ver o que o SMAX respondeu, e ajuste pela tela nativa.
+          </div>` : '';
+
+        corpo().innerHTML = `
+          <div class="smax-gl-note">
+            Os chamados abaixo passam a ser <strong>filhos do #${Utils.escapeHtml(pai)}</strong>.
+            Cada um recebe o vínculo, vai para <strong>Suspenso</strong> e recebe o status
+            operacional escolhido. A designação do especialista <strong>não é tocada</strong>.
+          </div>
+
+          <label class="smax-gl-label" for="smax-gl-vinc-ids">Números dos chamados filhos</label>
+          <textarea class="smax-gl-input" id="smax-gl-vinc-ids" rows="4" style="width:100%;"
+            placeholder="82133910 82140011 — separados por espaço, vírgula ou linha"
+            ${estado.conferindo || estado.gravando ? 'disabled' : ''}>${Utils.escapeHtml(estado.texto)}</textarea>
+
+          <label class="smax-gl-label" for="smax-gl-vinc-statusop" style="margin-top:12px;">Status operacional do filho</label>
+          <select class="smax-gl-select" id="smax-gl-vinc-statusop" style="width:100%;"
+            ${estado.gravando ? 'disabled' : ''}>${opcoes}</select>
+          <div class="smax-gl-note" style="margin-top:6px;">
+            Gravado <strong>${Math.round(Vinculo.ESPERA_ROTINA_MS / 1000)}s depois</strong> do vínculo, de
+            propósito: ao vincular, o SMAX roda uma rotina que iguala o status operacional do filho
+            ao do pai, e gravar antes dela perderia o valor sem avisar.
+          </div>
+
+          <div style="display:flex; gap:8px; margin-top:12px; flex-wrap:wrap;">
+            <button class="smax-gl-btn" data-act="conferir" ${estado.conferindo || estado.gravando ? 'disabled' : ''}>
+              ${estado.conferindo ? 'Conferindo…' : 'Conferir no SMAX'}
+            </button>
+            <button class="smax-gl-btn" data-act="limpar" ${estado.conferindo || estado.gravando ? 'disabled' : ''}>Limpar</button>
+          </div>
+          ${blocoConferido}
+          ${blocoResultado}`;
+
+        const n = podemEntrar().length;
+        rodape().innerHTML = `
+          <button class="smax-gl-btn smax-gl-btn-primary" data-act="vincular"
+            ${n && !estado.gravando && !estado.conferindo ? '' : 'disabled'}>
+            ${estado.gravando ? 'Vinculando…' : n === 1 ? '🔗 Vincular 1 filho' : `🔗 Vincular ${n} filhos`}
+          </button>`;
+      };
+
+      const conferir = async () => {
+        if (estado.conferindo || estado.gravando) return;
+        const ids = idsDigitados();
+        if (!ids.length) { dizer('Nenhum número de chamado reconhecido no texto.', 'err'); return; }
+        estado.conferindo = true;
+        estado.conferidos = [];
+        estado.resultados = [];
+        render();
+        dizer(`Conferindo ${ids.length} chamado(s) no SMAX…`);
+        try {
+          estado.conferidos = await PgApi.emLote(ids, conferirFilho);
+          const n = podemEntrar().length;
+          dizer(`${n} de ${ids.length} pode(m) vincular.`, n ? 'ok' : 'err');
+        } catch (err) {
+          dizer(`Falha na conferência: ${PgApi.motivoDeErro(err)}`, 'err');
+        } finally {
+          estado.conferindo = false;
+          render();
+        }
+      };
+
+      const vincular = async () => {
+        if (estado.gravando || estado.conferindo) return;
+        const alvos = podemEntrar().map(x => x.id);
+        if (!alvos.length) { dizer('Nenhum chamado conferido pode vincular.', 'err'); return; }
+
+        const statusOp = lerStatusOp();
+        if (!prefs.enableRealWrites) {
+          dizer('Escritas reais desabilitadas — nada foi enviado.', 'err');
+          return;
+        }
+
+        const rotuloOp = Metrica.rotuloStatusOp(statusOp) || statusOp;
+        const ok = await askModal('Vincular filhos ao global', `
+          <div class="smax-gl-note smax-gl-note-warn">
+            Isto escreve em <strong>produção</strong>, em ${alvos.length} chamado(s).
+          </div>
+          <table class="smax-gl-kv"><tbody>
+            <tr><td>Global pai</td><td><strong>#${Utils.escapeHtml(pai)}</strong></td></tr>
+            <tr><td>Filhos</td><td>${Utils.escapeHtml(alvos.join(', '))}</td></tr>
+            <tr><td>Status</td><td>Suspenso</td></tr>
+            <tr><td>Status operacional</td><td>${Utils.escapeHtml(rotuloOp)}</td></tr>
+            <tr><td>Especialista designado</td><td>não é alterado</td></tr>
+          </tbody></table>`, `Vincular ${alvos.length}`);
+        if (!ok) { dizer('Cancelado.'); return; }
+
+        estado.gravando = true;
+        estado.resultados = [];
+        render();
+
+        // Em serie, nao em lote: cada filho leva uma espera de 2s pela rotina do
+        // servidor, e disparar tudo junto embaralharia essas esperas.
+        for (let i = 0; i < alvos.length; i++) {
+          dizer(`Vinculando ${i + 1} de ${alvos.length} — #${alvos[i]}…`);
+          const r = await Vinculo.vincularUm(pai, alvos[i], statusOp);
+          estado.resultados = [...estado.resultados, r];
+          // Conferido que ja virou resultado sai da fila: reclicar nao repete.
+          estado.conferidos = estado.conferidos.map(x => (x.id === r.id && r.vinculo.ok)
+            ? { ...x, estado: 'ja-vinculado' } : x);
+          render();
+        }
+
+        estado.gravando = false;
+        const vinculados = estado.resultados.filter(r => r.vinculo.ok).length;
+        const parciais = estado.resultados.filter(r => r.vinculo.ok
+          && ((r.status && !r.status.ok) || (r.statusOp && !r.statusOp.ok))).length;
+        dizer(
+          parciais
+            ? `${vinculados} vinculado(s), ${parciais} com campo não confirmado — veja o resultado.`
+            : vinculados === estado.resultados.length
+              ? `${vinculados} chamado(s) vinculado(s) ao #${pai}.`
+              : `${vinculados} de ${estado.resultados.length} vinculado(s) — veja o resultado.`,
+          vinculados && !parciais ? 'ok' : 'err'
+        );
+        render();
+        if (vinculados && onConcluir) onConcluir();
+      };
+
+      wrap.innerHTML = `
+        <div class="smax-gl-panel" style="width:min(820px,96vw);max-height:92vh;">
+          <div class="smax-gl-header">
+            <h2>🔗 Vincular filhos ao #${Utils.escapeHtml(pai)}</h2>
+            <div class="smax-gl-header-actions"><button data-act="fechar">✕</button></div>
+          </div>
+          <div class="smax-gl-body" style="overflow:auto;"></div>
+          <div class="smax-gl-footer">
+            <div class="smax-gl-status"></div>
+            <div class="smax-gl-footer-actions" style="display:flex;gap:8px;"></div>
+            <button class="smax-gl-btn" data-act="fechar">Fechar</button>
+          </div>
+        </div>`;
+
+      wrap.addEventListener('click', (ev) => {
+        // Fechar no meio de uma gravacao perderia o resultado das etapas ja
+        // feitas, que e a unica forma de saber o que ficou pela metade.
+        const fechar = ev.target === wrap || ev.target.closest('[data-act="fechar"]');
+        if (fechar) {
+          if (estado.gravando) { dizer('Aguarde o fim da gravação.', 'err'); return; }
+          lerTexto();
+          wrap.remove();
+          return;
+        }
+        if (ev.target.closest('[data-act="conferir"]')) { conferir(); return; }
+        if (ev.target.closest('[data-act="vincular"]')) { vincular(); return; }
+        if (ev.target.closest('[data-act="limpar"]')) {
+          if (estado.conferindo || estado.gravando) return;
+          estado.texto = '';
+          estado.conferidos = [];
+          estado.resultados = [];
+          render();
+          dizer('');
+        }
+      });
+      wrap.addEventListener('change', (ev) => {
+        if (ev.target.id === 'smax-gl-vinc-statusop') estado.statusOp = ev.target.value;
+      });
+
+      document.body.appendChild(wrap);
+      render();
+    };
+
     /* Reclassificar um global que ja esta no painel. Antes disto a unica saida
      * para uma marcacao errada era remover e incluir de novo — e remover apaga a
      * nota e a data de inclusao, ou seja, consertar o erro custava dado bom.
@@ -5041,6 +5453,27 @@
         }
       });
       document.body.appendChild(wrap);
+    };
+
+    /* Releitura de UM global, usada depois de vincular filhos. A contagem de
+     * filhos do painel vem da leitura do SMAX; somar +1 no numero guardado seria
+     * inventar dado. Falhar aqui nao desfaz nada — o vinculo ja esta feito —, mas
+     * tambem nao pode ser silencioso: sem aviso o usuario leria a contagem velha
+     * como se fosse a de agora. */
+    const relerPai = async (id) => {
+      try {
+        setStatus(`Relendo o #${id} para atualizar a contagem de filhos…`);
+        await PgMonitor.lerTudo([id]);
+        render();
+        setStatus(`#${id} relido — contagem de filhos atualizada.`, 'ok');
+      } catch (err) {
+        render();
+        setStatus(
+          `Vínculo feito, mas não foi possível reler o #${id}: ${PgApi.motivoDeErro(err)} `
+          + 'A contagem na tela ainda é a anterior — use ↻ Atualizar do SMAX.',
+          'err'
+        );
+      }
     };
 
     /* ---------- Atualizar o estado a partir do SMAX ---------- */
@@ -5566,7 +5999,11 @@
             </p>
             <details><summary style="cursor:pointer;font-size:12px;color:var(--sp-text-muted);">Resposta da API</summary>
               <pre class="smax-gl-pre" style="margin-top:8px;">${Utils.escapeHtml(JSON.stringify(res, null, 2))}</pre>
-            </details>`);
+            </details>`,
+            // Passo seguinte da abertura: o global acabou de nascer e quem o
+            // abriu costuma ter os filhos em maos. Oferecer aqui evita decorar o
+            // numero para ir procurar o global na lista depois.
+            { rotulo: '🔗 Vincular filhos', onClick: () => vincularModal(newId, () => relerPai(newId)) });
         } else {
           busy = false;
           render();

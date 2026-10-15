@@ -52,6 +52,12 @@ const PEOPLE = [
 //   que e como o SMAX devolve em parte dos casos.
 const ID_ERRO_LEITURA = '82170044';   // responde 500 sempre
 const ID_TETO = '82190066';           // faz a consulta em lote ser recusada pelo teto
+// Os dois passam na conferencia (sao comuns e sem pai) mas falham na ESCRITA, em
+// etapas diferentes. Existem porque o desfecho parcial — vinculado com campo que
+// nao gravou — e o que a tela precisa distinguir de "vinculou tudo", e e o que os
+// scripts de producao escondem ao embrulhar o update em catch vazio.
+const ID_VINCULO_RECUSADO = '82150023';  // a relacao e recusada
+const ID_STATUS_RECUSADO = '82150024';   // vincula, mas o UPDATE de status falha
 
 const REQUESTS = [
   // As datas de CreateTime dos globais sao de meses DIFERENTES e de proposito
@@ -69,6 +75,9 @@ const REQUESTS = [
   // devolve — os outros estao sem prefixo de proposito, para exercitar os dois.
   { Id: '82133911', IsGlobal_c: 'true', DisplayLabel: 'GLOBAL — mandados em lote (encerrado)', Status: 'RequestStatusComplete', StatusSCCDSMAX_c: 'Fechado_c', grupo: 'SUPORTE EPROC', CreateTime: 1764774000000, LastUpdateTime: 1758915000000 },
   { Id: '82150022', IsGlobal_c: 'false', DisplayLabel: 'Chamado comum de usuario', Status: 'Ready', grupo: 'ATENDIMENTO', CreateTime: 1757200000000, LastUpdateTime: 1758920000000 },
+  // Candidatos a filho que a conferencia aprova e a escrita derruba.
+  { Id: ID_VINCULO_RECUSADO, IsGlobal_c: 'false', DisplayLabel: 'Comum — a relacao sera recusada', Status: 'Ready', grupo: 'ATENDIMENTO', CreateTime: 1757210000000, LastUpdateTime: 1758921000000 },
+  { Id: ID_STATUS_RECUSADO, IsGlobal_c: 'false', DisplayLabel: 'Comum — vincula mas o status falha', Status: 'Ready', grupo: 'ATENDIMENTO', CreateTime: 1757220000000, LastUpdateTime: 1758922000000 },
   { Id: '82160033', IsGlobal_c: 'false', DisplayLabel: 'Filho do global', Status: 'Ready', grupo: 'ATENDIMENTO', CreateTime: 1757300000000, LastUpdateTime: 1758930000000, pai: '82133910', relOnly: true },
   // Mais filhos, para a contagem dar numero diferente por pai (3 e 1).
   { Id: '82160034', IsGlobal_c: 'false', DisplayLabel: 'Filho 2', Status: 'Ready', grupo: 'ATENDIMENTO', pai: '82133910' },
@@ -489,8 +498,41 @@ http.createServer(async (req, res) => {
   if (/^\/rest\/\d+\//.test(url)) {
     const body = await readBody(req);
     const op = String(body?.operation || '').toUpperCase();
+
+    /* Vinculo filho→global chega em `relationships`, nao em `entities`. Este ramo
+     * vem ANTES do de entidade de proposito: la o corpo seria lido como
+     * `entities[0].properties`, daria `{}`, e o log sairia como "Id=(novo)" —
+     * escondendo exatamente a forma do payload que o harness existe para
+     * conferir. O log imprime pai e filho para dar para ler no terminal que
+     * firstEndpoint e o pai e secondEndpoint e o filho, que e a ordem que a
+     * engenharia reversa fixou e que inverter quebraria em silencio. */
+    const rel = Array.isArray(body?.relationships) ? body.relationships[0] : null;
+    if (rel) {
+      const pai = rel?.firstEndpoint?.Request;
+      const filho = rel?.secondEndpoint?.Request;
+      console.log(`[mock] ${req.method} ${url} op=${op} ${rel.name} pai=${pai} filho=${filho}`);
+      if (String(filho) === ID_VINCULO_RECUSADO) {
+        console.log('[mock] relacao recusada de proposito');
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ meta: { completion_status: 'FAILED' }, error: { message: 'relationship refused' } }));
+        return;
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ meta: { completion_status: 'OK' } }));
+      return;
+    }
+
     const props = body?.entities?.[0]?.properties || {};
     console.log(`[mock] ${req.method} ${url} op=${op} Id=${props.Id ?? '(novo)'}`);
+
+    // Vinculou e o campo nao gravou: o desfecho parcial, que a tela tem de
+    // mostrar diferente de sucesso.
+    if (op === 'UPDATE' && String(props.Id || '') === ID_STATUS_RECUSADO) {
+      console.log('[mock] UPDATE recusado de proposito');
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ meta: { completion_status: 'FAILED' }, error: { message: 'update refused' } }));
+      return;
+    }
 
     const id = op === 'CREATE' ? String(nextId++) : String(props.Id || '');
     res.writeHead(200, { 'Content-Type': 'application/json' });

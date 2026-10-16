@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         SMAX Painel de Globais - TJSP
 // @namespace    https://github.com/rsalvessap/SMAX-Global
-// @version      1.20
+// @version      1.21
 // @description  Painel de gestao de chamados globais do SMAX TJSP — lista curada, classificacao por assunto/base/competencia, sincronizacao por arquivo no GitHub e abertura automatizada de global por molde
 // @author       rsalvessap
 // @match        https://suporte.tjsp.jus.br/saw/*
@@ -27,7 +27,7 @@
   if (window.top && window.top !== window.self) return;
   if (window.location.hostname !== 'suporte.tjsp.jus.br') return;
 
-  const SMAX_GLOBAL_VERSION = '1.20';
+  const SMAX_GLOBAL_VERSION = '1.21';
 
   // O userscript roda em sandbox; quem dispara as requisicoes e a pagina.
   const pageWindow = typeof unsafeWindow !== 'undefined' ? unsafeWindow : window;
@@ -131,8 +131,60 @@
       _version: 0,
       _updatedAt: '',
       eixos: { assunto: [], base: [], competencia: [] },
-      globais: []
+      globais: [],
+      consultas: []
     });
+
+    /* Id de GSE vira clausula de filtro, concatenada na query. Este saneamento
+     * nao e formalidade: id com aspas ou texto arbitrario iria direto para dentro
+     * do `filter=`. Vale para a prefs local E para a consulta salva, que vem do
+     * arquivo do GitHub e portanto e entrada externa como qualquer outra. */
+    const saneaGses = (arr) => (Array.isArray(arr) ? arr : [])
+      .filter(g => g && /^\d+$/.test(String(g.id)) && String(g.nome || '').trim())
+      .map(g => ({ id: String(g.id), nome: String(g.nome).trim() }))
+      .slice(0, 30);
+
+    const SITUACOES_OK = ['abertos', 'encerrados', 'todos'];
+    const saneaSituacao = (s) => (SITUACOES_OK.includes(s) ? s : 'abertos');
+
+    /* `dias` entra no filtro como epoch JA CALCULADO (`Date.now() - dias*DIA_MS`),
+     * nunca como texto — entao basta garantir inteiro nao negativo. De proposito
+     * NAO e preso a lista dos chips: arquivo com 45 dias e consulta valida, so nao
+     * acende chip. O teto de 36500 (100 anos) existe porque `dias` grande demais
+     * estoura o epoch para negativo e o SMAX recusaria o filtro. 0 = sem recorte. */
+    const saneaDias = (d) => {
+      const n = Math.round(Number(d));
+      return Number.isFinite(n) && n > 0 ? Math.min(n, 36500) : 0;
+    };
+
+    /* Consultas salvas. Viajam no arquivo publicado, e isso NAO pediu bump de
+     * `_schema`: `sanear` reconstroi o objeto do zero, entao script antigo ignora
+     * esta chave; e `publicar` monta o corpo com `{...remoto, ...local}`, entao o
+     * script antigo tambem nao a APAGA ao publicar. Bumpar o schema travaria a
+     * importacao de quem ainda nao atualizou (ver `checaSchema`), sem ganho. */
+    const saneaConsultas = (arr) => {
+      const vistos = new Set();
+      const out = (Array.isArray(arr) ? arr : [])
+        .filter(c => c && c.id && String(c.nome || '').trim())
+        .filter(c => !vistos.has(String(c.id)) && vistos.add(String(c.id)))
+        .map(c => ({
+          id: String(c.id),
+          nome: String(c.nome).replace(/\s+/g, ' ').trim().slice(0, 60),
+          gses: saneaGses(c.gses),
+          dias: saneaDias(c.dias),
+          situacao: saneaSituacao(c.situacao),
+          padrao: c.padrao === true
+        }))
+        .slice(0, 30);
+      // No maximo UMA padrao. Arquivo editado a mao pode trazer duas, e a primeira
+      // vence — assim `consultaPadrao()` nunca tem de desempatar na leitura.
+      let achou = false;
+      out.forEach((c) => {
+        if (c.padrao && !achou) achou = true;
+        else c.padrao = false;
+      });
+      return out;
+    };
 
     const prefsDefaults = {
       arquivoUrl: 'https://raw.githubusercontent.com/rsalvessap/SMAX-TOOLS/master/painel-globais.json',
@@ -153,13 +205,45 @@
        * proposito — o selo no botao flutuante e o aviso na tela funcionam sempre,
        * mas a notificacao do SO pode ser engolida pelo Assistente de Foco do
        * Windows, e aviso que pode nao chegar nao serve como unico canal. */
-      monitor: { ligado: true, minutos: 30, notificarSO: false },
+      /* `tipos` e o filtro de QUAIS novidades avisam. Mapa aberto
+       * { [tipo]: boolean }, e ABSENTE significa NOTIFICA — assim um tipo novo
+       * criado numa versao futura ja nasce avisando, em vez de nascer mudo numa
+       * prefs gravada antes de ele existir. A lista de tipos vive em
+       * PgMonitor.TIPOS, que e definido depois daqui; tratar o mapa como aberto e
+       * o que permite nao duplicar as chaves nos dois lugares.
+       *
+       * O filtro corta SO nos avisos (selo, aviso na tela, notificacao do SO). A
+       * aba Novidades continua mostrando tudo: "nao quero ser interrompido por
+       * isso" nao e "quero perder o historico disso". */
+      monitor: { ligado: true, minutos: 30, notificarSO: false, tipos: {} },
       /* GSEs escolhidas na aba Consultar, [{id,nome}]. Persistem porque o SMAX
        * RECARREGA a pagina a cada navegacao: escolha so em memoria obrigaria a
        * redigitar as GSEs em toda consulta, que e o custo de usar a aba. Ficam
        * aqui, e nao em smax_pg_dados, pelo mesmo motivo dos filtros — e escolha
-       * desta maquina e nao entra no arquivo publicado. */
-      consultaGses: []
+       * desta maquina e nao entra no arquivo publicado.
+       *
+       * Desde a v1.21 este trio (`consultaGses`, `consultaDias`,
+       * `consultaSituacao`) e a consulta EM EDICAO — o rascunho que esta na tela.
+       * As consultas SALVAS moram em smax_pg_dados e viajam no arquivo; o rascunho
+       * fica aqui porque e estado de tela desta maquina, e porque trocar de aba no
+       * SMAX nao pode significar perder o que se estava montando. */
+      consultaGses: [],
+      /* `null` = nunca iniciada nesta maquina. E o unico valor que dispara a carga
+       * da consulta padrao: depois disso o rascunho manda, senao abrir o painel
+       * sobrescreveria o recorte que o usuario acabou de ajustar. 0 e "sem
+       * recorte", que e escolha legitima e nao se confunde com null. */
+      consultaDias: null,
+      consultaSituacao: 'abertos',
+      // Id da consulta salva que o rascunho veio. '' = consulta avulsa, nao salva.
+      // Serve para a tela dizer "alterada" e oferecer "Salvar alteracoes".
+      consultaId: '',
+      /* Incluir comentario interno no texto que o botao "📋 Copiar" do modal Ver
+       * monta. Nasce DESLIGADO, e isso nao e cautela de rotina: aquele texto
+       * existe para ser colado num aviso aos usuarios, e comentario interno e
+       * exatamente o que o solicitante nao pode ver. Mas fica guardado na prefs
+       * porque quem usa o painel para relatorio interno teria de religar a cada
+       * chamado — a escolha e por pessoa, nao por copia. */
+      copiaInternos: false
     };
 
     const saneaValores = (arr) => Array.isArray(arr)
@@ -194,7 +278,8 @@
             competencia: saneaMarcas(g.competencia),
             nota: typeof g.nota === 'string' ? g.nota : '',
             arquivado: g.arquivado === true
-          }))
+          })),
+        consultas: saneaConsultas(raw.consultas)
       };
     };
 
@@ -245,15 +330,38 @@
       m.ligado = m.ligado !== false;
       m.notificarSO = m.notificarSO === true;
       m.minutos = permitidos.includes(Number(m.minutos)) ? Number(m.minutos) : 30;
+      /* Mapa aberto: so o que esta explicitamente `false` silencia. Guardar apenas
+       * os silenciados (e nao os seis tipos) e o que faz a regra "absente =
+       * notifica" valer tambem para tipo que ainda nao existe. */
+      const t = {};
+      Object.entries(m.tipos && typeof m.tipos === 'object' ? m.tipos : {})
+        .forEach(([k, v]) => { if (v === false) t[String(k)] = false; });
+      m.tipos = t;
       pgPrefs.monitor = m;
     })();
-    /* As GSEs gravadas viram cláusula de filtro, concatenada na query — o
-     * saneamento aqui nao e formalidade: id com aspas ou texto arbitrario iria
-     * direto para dentro do `filter=`. So passa par {id numerico, nome}. */
-    pgPrefs.consultaGses = (Array.isArray(pgPrefs.consultaGses) ? pgPrefs.consultaGses : [])
-      .filter(g => g && /^\d+$/.test(String(g.id)) && String(g.nome || '').trim())
-      .map(g => ({ id: String(g.id), nome: String(g.nome).trim() }))
-      .slice(0, 30);
+    // Mesmo saneamento das GSEs da consulta salva: o id gravado aqui tambem vai
+    // concatenado no `filter=`, e storage do Tampermonkey da para editar a mao.
+    pgPrefs.consultaGses = saneaGses(pgPrefs.consultaGses);
+    // `null` tem de sobreviver ao saneamento — e o sentinela de "nunca iniciada".
+    pgPrefs.consultaDias = pgPrefs.consultaDias === null || pgPrefs.consultaDias === undefined
+      ? null
+      : saneaDias(pgPrefs.consultaDias);
+    pgPrefs.consultaSituacao = saneaSituacao(pgPrefs.consultaSituacao);
+    pgPrefs.consultaId = String(pgPrefs.consultaId || '');
+    // Vale a comparacao estrita, e nao o truthy: o que decide incluir comentario
+    // interno num texto que vai para fora e `true` gravado por clique, nao uma
+    // string qualquer sobrando no storage.
+    pgPrefs.copiaInternos = pgPrefs.copiaInternos === true;
+
+    /* O `dias` EFETIVO do rascunho, num ponto so. O sentinela `null` ("nunca
+     * iniciada") vale 90, que e o chip que a tela acende. Ter dois lugares
+     * resolvendo esse fallback produziria a pior especie de divergencia: a tela
+     * mostrando "90 dias" selecionado e o salvamento gravando 0, que significa
+     * "sem recorte" — outro recorte, nao um detalhe de apresentacao. */
+    const consultaDias = () => {
+      const d = pgPrefs.consultaDias;
+      return d === null || d === undefined ? 90 : saneaDias(d);
+    };
 
     const salvarDados = () => {
       try { GM_setValue(K_DADOS, JSON.stringify(dados)); }
@@ -365,9 +473,15 @@
       salvarNovid();
     };
 
+    // Absente = notifica (ver o comentario de `monitor.tipos` em prefsDefaults).
+    const notifica = (tipo) => pgPrefs.monitor.tipos[String(tipo)] !== false;
+
+    /* Conta so o que NOTIFICA: o selo e um canal de aviso, e tipo silenciado que
+     * acendesse o selo manteria exatamente a interrupcao que o usuario desligou.
+     * A lista da aba Novidades nao usa isto — la aparece tudo. */
     const naoVistas = () => {
       recarregarNovid();
-      return novid.itens.filter(x => Number(x.quando) > novid.vistoEm).length;
+      return novid.itens.filter(x => Number(x.quando) > novid.vistoEm && notifica(x.tipo)).length;
     };
 
     /* ----- Agenda do monitor, compartilhada entre abas -----
@@ -404,8 +518,9 @@
       estado: () => estado,
       novidades: () => novid,
       sanear, salvarDados, salvarPrefs, substituirDados, mesclarEstado,
-      registrarNovidades, marcarNovidadesVistas, limparNovidades, naoVistas,
-      lerAgenda, salvarAgenda, MAX_NOVID
+      registrarNovidades, marcarNovidadesVistas, limparNovidades, naoVistas, notifica,
+      lerAgenda, salvarAgenda, MAX_NOVID,
+      saneaDias, saneaSituacao, consultaDias
     };
   })();
 
@@ -550,9 +665,193 @@
       return { ok: true, msg: `#${id} removido do painel.` };
     };
 
+    /* ----- Consultas salvas -----
+       Moram em smax_pg_dados e viajam no arquivo publicado. O rascunho que esta na
+       tela fica na prefs (ver `consultaGses` e companhia): o que se salva aqui e
+       uma FOTO do rascunho, nao uma referencia viva a ele. */
+
+    const consultas = () => PgStore.dados().consultas;
+
+    const acharConsulta = (id) => consultas().find(c => c.id === String(id)) || null;
+
+    const consultaPadrao = () => consultas().find(c => c.padrao) || null;
+
+    const novoIdConsulta = () => {
+      const usados = new Set(consultas().map(c => c.id));
+      let id;
+      do { id = Math.random().toString(16).slice(2, 8); } while (!id || usados.has(id));
+      return id;
+    };
+
+    // O rascunho de agora, saneado como se viesse de fora. Serve de corpo tanto
+    // para criar quanto para sobrescrever.
+    const rascunho = () => ({
+      gses: PgStore.prefs.consultaGses.map(g => ({ id: g.id, nome: g.nome })),
+      dias: PgStore.consultaDias(),
+      situacao: PgStore.saneaSituacao(PgStore.prefs.consultaSituacao)
+    });
+
+    const MAX_CONSULTAS = 30;
+
+    const salvarConsulta = (nome) => {
+      const limpo = limpaNome(nome).slice(0, 60);
+      if (!limpo) return { ok: false, msg: 'Dê um nome à consulta.' };
+      const d = PgStore.dados();
+      // Mesma regra de colisao dos valores de eixo: caixa e acento fora da
+      // comparacao, senao "Mandados UPJ" e "mandados upj" viram duas entradas que
+      // o usuario le como a mesma.
+      const k = chaveComparacao(limpo);
+      if (d.consultas.some(c => chaveComparacao(c.nome) === k)) {
+        return { ok: false, msg: `Já existe uma consulta chamada “${limpo}”. Renomeie, ou use “Salvar alterações” nela.` };
+      }
+      if (d.consultas.length >= MAX_CONSULTAS) {
+        return { ok: false, msg: `Teto de ${MAX_CONSULTAS} consultas salvas. Apague uma antes.` };
+      }
+      const nova = {
+        id: novoIdConsulta(),
+        nome: limpo,
+        ...rascunho(),
+        // A primeira a ser salva vira padrao sozinha: o usuario que salvou uma so
+        // nao deveria ter de marcar nada para ela ser carregada.
+        padrao: !d.consultas.length
+      };
+      d.consultas.push(nova);
+      PgStore.salvarDados();
+      PgStore.prefs.consultaId = nova.id;
+      PgStore.salvarPrefs();
+      return { ok: true, consulta: nova, msg: `“${limpo}” salva${nova.padrao ? ' e marcada como padrão' : ''}.` };
+    };
+
+    const sobrescreverConsulta = (id) => {
+      const alvo = acharConsulta(id);
+      if (!alvo) return { ok: false, msg: 'Consulta não encontrada.' };
+      Object.assign(alvo, rascunho());
+      PgStore.salvarDados();
+      return { ok: true, msg: `“${alvo.nome}” atualizada com o recorte da tela.` };
+    };
+
+    const renomearConsulta = (id, nome) => {
+      const limpo = limpaNome(nome).slice(0, 60);
+      if (!limpo) return { ok: false, msg: 'Digite um nome.' };
+      const alvo = acharConsulta(id);
+      if (!alvo) return { ok: false, msg: 'Consulta não encontrada.' };
+      const k = chaveComparacao(limpo);
+      const colide = consultas().find(c => chaveComparacao(c.nome) === k && c.id !== alvo.id);
+      if (colide) return { ok: false, msg: `Já existe como “${colide.nome}”.` };
+      alvo.nome = limpo;
+      PgStore.salvarDados();
+      return { ok: true, msg: `Renomeada para “${limpo}”.` };
+    };
+
+    const removerConsulta = (id) => {
+      const d = PgStore.dados();
+      const alvo = acharConsulta(id);
+      if (!alvo) return { ok: false, msg: 'Consulta não encontrada.' };
+      const eraPadrao = alvo.padrao;
+      d.consultas = d.consultas.filter(c => c.id !== alvo.id);
+      // Apagar a padrao nao pode deixar o conjunto sem padrao: a proxima assume.
+      // Sem isso, abrir o painel numa maquina nova nao carregaria nada e o usuario
+      // leria como "as consultas nao vieram".
+      if (eraPadrao && d.consultas.length) d.consultas[0].padrao = true;
+      PgStore.salvarDados();
+      if (PgStore.prefs.consultaId === alvo.id) {
+        PgStore.prefs.consultaId = '';
+        PgStore.salvarPrefs();
+      }
+      return { ok: true, msg: `“${alvo.nome}” apagada.` };
+    };
+
+    const marcarPadrao = (id) => {
+      const alvo = acharConsulta(id);
+      if (!alvo) return { ok: false, msg: 'Consulta não encontrada.' };
+      consultas().forEach((c) => { c.padrao = c.id === alvo.id; });
+      PgStore.salvarDados();
+      return { ok: true, msg: `“${alvo.nome}” é a consulta padrão.` };
+    };
+
+    /* Joga a consulta salva para dentro do rascunho. E aqui que o `consultaId`
+       passa a valer — e a partir dele que a tela sabe dizer "alterada". */
+    const carregarConsulta = (id) => {
+      const alvo = acharConsulta(id);
+      if (!alvo) return { ok: false, msg: 'Consulta não encontrada.' };
+      const p = PgStore.prefs;
+      p.consultaGses = alvo.gses.map(g => ({ id: g.id, nome: g.nome }));
+      p.consultaDias = alvo.dias;
+      p.consultaSituacao = alvo.situacao;
+      p.consultaId = alvo.id;
+      PgStore.salvarPrefs();
+      return { ok: true, consulta: alvo, msg: `“${alvo.nome}” carregada.` };
+    };
+
+    // O rascunho difere da consulta de onde veio? Compara os mesmos tres campos
+    // que se salvam, com as GSEs ordenadas: a ORDEM em que se clicou nos grupos
+    // nao e uma diferenca de recorte, e acusa-la faria a tela dizer "alterada"
+    // sem nada ter mudado.
+    const rascunhoAlterado = () => {
+      const alvo = acharConsulta(PgStore.prefs.consultaId);
+      if (!alvo) return false;
+      const r = rascunho();
+      const ids = (gs) => gs.map(g => g.id).slice().sort().join(',');
+      return ids(r.gses) !== ids(alvo.gses) || r.dias !== alvo.dias || r.situacao !== alvo.situacao;
+    };
+
+    /* Carrega a padrao SO na primeira vez que esta maquina usa a aba
+       (`consultaDias === null`). Nas aberturas seguintes o rascunho manda: abrir o
+       painel nao pode desfazer o recorte que o usuario acabou de ajustar. */
+    const iniciarConsulta = () => {
+      if (PgStore.prefs.consultaDias !== null) return false;
+      const padrao = consultaPadrao();
+      if (padrao) { carregarConsulta(padrao.id); return true; }
+      // Sem padrao salva: fixa o default da tela para o sentinela nao ficar `null`
+      // para sempre e a padrao nao entrar por cima de um rascunho futuro.
+      PgStore.prefs.consultaDias = 90;
+      PgStore.salvarPrefs();
+      return false;
+    };
+
+    /* Chamado DEPOIS de aplicar uma importacao.
+     *
+     * Existe porque `iniciarConsulta` nao cobre o caso principal: numa maquina
+     * nova o script roda uma vez com a lista vazia (o arquivo ainda nao foi
+     * importado), fixa `consultaDias: 90` e perde o gatilho para sempre. Sem este
+     * acerto, importar traria as consultas e a tela continuaria sem nenhuma
+     * carregada — exatamente o sintoma de "as configuracoes nao vieram". */
+    const sincronizarAposImportar = () => {
+      const p = PgStore.prefs;
+      const seguida = acharConsulta(p.consultaId);
+      if (seguida) {
+        // A consulta que o rascunho seguia veio no arquivo: recarrega, porque
+        // refletir o que foi publicado e justamente o motivo de importar.
+        carregarConsulta(seguida.id);
+        return { acao: 'recarregada', consulta: seguida };
+      }
+      const padrao = consultaPadrao();
+      if (!padrao) {
+        if (p.consultaId) { p.consultaId = ''; PgStore.salvarPrefs(); }
+        return { acao: 'nada' };
+      }
+      /* Carrega a padrao em dois casos, e so nesses: rascunho VIRGEM (o usuario
+       * nunca escolheu recorte nesta maquina) ou rascunho ORFAO (seguia uma
+       * consulta que saiu no arquivo importado). Rascunho montado a mao e que nao
+       * seguia ninguem fica como esta — importar substitui a lista curada, nao o
+       * recorte que a pessoa acabou de ajustar na tela. */
+      const virgem = !p.consultaGses.length
+        && (p.consultaDias === null || p.consultaDias === 90)
+        && p.consultaSituacao === 'abertos';
+      const orfao = !!p.consultaId;
+      if (virgem || orfao) {
+        carregarConsulta(padrao.id);
+        return { acao: orfao ? 'orfao' : 'padrao', consulta: padrao };
+      }
+      return { acao: 'nada' };
+    };
+
     return {
       EIXOS, chaveComparacao, lista, nomeDe, criarValor, renomearValor, removerValor, contarUsos,
-      acharGlobal, incluir, atualizarMarcas, arquivar, removerGlobal
+      acharGlobal, incluir, atualizarMarcas, arquivar, removerGlobal,
+      consultas, acharConsulta, consultaPadrao, salvarConsulta, sobrescreverConsulta,
+      renomearConsulta, removerConsulta, marcarPadrao, carregarConsulta,
+      rascunhoAlterado, iniciarConsulta, sincronizarAposImportar, MAX_CONSULTAS
     };
   })();
 
@@ -951,13 +1250,26 @@
           renomeados: [...rv.keys()].filter(id => lv.has(id) && lv.get(id) !== rv.get(id)).length
         };
       });
+      // Assinatura do recorte de uma consulta salva, pela mesma razao da
+      // `assinatura` dos globais: contar quantas MUDARAM, nao so quantas entram.
+      const assinCons = (c) =>
+        `${c.gses.map(g => g.id).slice().sort().join(',')}|${c.dias}|${c.situacao}|${c.padrao === true}`;
+      const lc = new Map(local.consultas.map(c => [c.id, c]));
+      const rc = new Map(remotoSan.consultas.map(c => [c.id, c]));
+      const consultas = {
+        entram: [...rc.values()].filter(c => !lc.has(c.id)).map(c => c.nome),
+        saem: [...lc.values()].filter(c => !rc.has(c.id)).map(c => c.nome),
+        mudam: [...rc.keys()].filter(id => lc.has(id) && assinCons(lc.get(id)) !== assinCons(rc.get(id))).length
+      };
+
       return {
         versaoLocal: local._version,
         versaoRemota: remotoSan._version,
         entram: [...rg.keys()].filter(id => !lg.has(id)),
         saem: [...lg.keys()].filter(id => !rg.has(id)),
         mudam: [...rg.keys()].filter(id => lg.has(id) && assinatura(lg.get(id)) !== assinatura(rg.get(id))),
-        eixos
+        eixos,
+        consultas
       };
     };
 
@@ -2748,6 +3060,209 @@
   })();
 
   /* =========================================================
+   * Copia — o chamado como texto pronto para colar num aviso.
+   *
+   * Por que existe: a aba Novidades diz O QUE mudou e o modal "Ver" mostra o
+   * chamado, mas avisar as pessoas significava redigitar a mao o que as duas
+   * telas ja tinham em maos.
+   *
+   * O formato e o do relatorio do "SMAX Consulta de Chamados"
+   * (SGS221-Triagem/SMAX/SMAX Consulta de Chamados.user.js:464-515, `ticketLines`)
+   * DE PROPOSITO, e nao por preguica: a equipe ja le aviso naquele desenho, e um
+   * segundo formato para a mesma mensagem faria o leitor ter de aprender duas
+   * vezes a mesma coisa.
+   *
+   * Grava texto E html no clipboard. Um so nao resolve: markdown colado no Teams
+   * aparece com os colchetes crus, e html colado em campo de texto simples nao
+   * aparece. Com os dois, quem cola nao precisa saber qual o destino aceita.
+   * =======================================================*/
+  const Copia = (() => {
+    // Teto de discussoes no texto. E o que o usuario pediu e o mesmo do relatorio
+    // de referencia (:500) — aviso e resumo, nao transcricao do chamado.
+    const MAX_DISC = 3;
+
+    /* Texto plano de um corpo rico JA SANEADO. `Utils.htmlToText` nao serve aqui:
+     * ele le `textContent`, que junta os paragrafos numa linha so. Isso esta
+     * certo para o uso dele no modal (decidir "tem conteudo?"), e errado para
+     * colar — um comentario de tres paragrafos viraria uma parede de texto.
+     *
+     * Recebe saneado, e nao cru, para o saneamento acontecer UMA vez por
+     * comentario: o html saneado tambem e usado no flavor rico e no teste de
+     * "tem conteudo", e sanear tres vezes o mesmo corpo seria desperdicio num
+     * caminho que roda a cada clique.
+     *
+     * `DOMParser` e nao `div.innerHTML`: o documento que ele devolve e INERTE.
+     * Num div solto o Chrome ainda buscaria o `<img src>` de dentro do
+     * comentario (a armadilha descrita em :1369), e copiar texto nao e motivo
+     * para bater num servidor. */
+    const paraTexto = (limpo) => {
+      if (!limpo) return '';
+      const corpo = new DOMParser().parseFromString(limpo, 'text/html').body;
+      corpo.querySelectorAll('br').forEach((el) => { el.replaceWith('\n'); });
+      corpo.querySelectorAll('p, div, li, tr, h1, h2, h3, h4, blockquote, pre')
+        .forEach((el) => { el.append('\n'); });
+      return (corpo.textContent || '')
+        .replace(/\u00a0/g, ' ')
+        .split('\n')
+        .map(l => l.replace(/[ \t]+/g, ' ').trim())
+        .join('\n')
+        .replace(/\n{3,}/g, '\n\n')
+        .trim();
+    };
+
+    /* O que o monitor anotou para este chamado — e so o da ULTIMA rodada que
+     * produziu algo. O historico guarda centenas de itens e varios dias de
+     * movimentacao; colar a vida inteira do global num aviso de hoje seria ruido
+     * e, pior, faria o leitor procurar qual linha e a nova. */
+    const diffDe = (id) => {
+      const meus = PgStore.novidades().itens.filter(x => String(x.id) === String(id));
+      if (!meus.length) return [];
+      const ultima = Math.max(...meus.map(x => Number(x.quando) || 0));
+      return meus
+        .filter(x => (Number(x.quando) || 0) === ultima)
+        /* O tipo generico `atualizado` fica fora: o texto dele e "alguma
+         * alteracao no chamado — a leitura enxuta nao diz qual" (:2252), que num
+         * aviso a usuario nao informa nada e ainda soa a desculpa. Quando ele e o
+         * unico item, as discussoes logo abaixo e que contam o que mudou. */
+        .filter(x => x.tipo !== 'atualizado')
+        .map(x => ({
+          rot: (PgMonitor.TIPOS[x.tipo] || { rot: x.tipo }).rot,
+          texto: String(x.texto || '')
+        }));
+    };
+
+    /* Os comentarios do chamado preparados para a copia, UMA vez: o html saneado
+     * serve ao flavor rico, o texto serve ao flavor plano, e os dois juntos
+     * decidem se o comentario tem conteudo.
+     *
+     * Comentario sem conteudo nenhum nao gasta uma das tres vagas. O modal mostra
+     * "(comentário vazio)" porque ele e fiel ao chamado; aqui a vaga e ORCAMENTO,
+     * e uma linha vazia no lugar de uma discussao de verdade e informacao
+     * perdida. O `<img>` conta como conteudo: comentario que e so um print nao
+     * tem texto e nao pode ser descartado por isso.
+     *
+     * `c.comentarios` ja vem sem os lancamentos automaticos do SMAX e em ordem
+     * crescente de data (`parseComentarios`, :1928). */
+    const prepararComentarios = (c) => (c.comentarios || [])
+      .map((cm) => {
+        const html = Utils.sanitizeRichText(Utils.unescapeIfDoubleEscaped(cm.corpo));
+        return { quando: cm.quando, interno: cm.interno, html, texto: paraTexto(html) };
+      })
+      .filter(cm => cm.texto || /<img\b/i.test(cm.html));
+
+    /* Quantos internos COM CONTEUDO o chamado tem. Existe como funcao propria
+     * porque o rodape do modal precisa do numero ANTES de montar copia alguma —
+     * e contar por outro criterio ali faria o botao prometer "2 internos" e a
+     * copia entregar um. */
+    const contarInternos = (c) => prepararComentarios(c).filter(cm => cm.interno).length;
+
+    /* `c` e o retorno de `PgApi.lerChamado`. Os campos sao exatamente os pedidos:
+     * numero com link, titulo, status operacional, GSE e as ultimas discussoes —
+     * mais as linhas do monitor, quando houver. Nada de "Ultima alteracao" nem de
+     * status principal em texto: o estado de vida do chamado esta no sinal (🟢
+     * encerrado / 🔴 aberto), e campo a mais num aviso e campo que ninguem le. */
+    const montar = (c, { internos = false } = {}) => {
+      const id = String(c.id);
+      // `location.origin` em vez do host escrito a mao: o script so roda em
+      // suporte.tjsp.jus.br (:28), entao da no mesmo — e nao mente se um dia rodar
+      // num ambiente de homologacao.
+      const url = `${location.origin}/saw/Request/${encodeURIComponent(id)}/general`;
+      const titulo = c.titulo || '(sem título)';
+      // `encerrada` recebe a LINHA, nao o status (ver :884). Aqui o chamado foi
+      // lido agora, entao `lido:true` e verdade e nao atalho.
+      const marca = Metrica.encerrada({ lido: true, status: c.status }) ? '🟢' : '🔴';
+      const op = Metrica.rotuloStatusOp(c.statusOp) || '—';
+      const gse = c.grupo || '—';
+      const diff = diffDe(id);
+
+      const comConteudo = prepararComentarios(c);
+
+      /* Filtra o interno ANTES de cortar em tres. Pegar as tres ultimas e depois
+       * esconder a interna devolveria duas linhas e uma lacuna silenciosa — o
+       * texto diria menos do que pode sem avisar que faltou algo.
+       *
+       * O numero de internos NAO entra no texto copiado, so no retorno (o rodape
+       * do modal usa): avisar o usuario de que existe comentario que ele nao pode
+       * ver nao e informacao, e provocacao. */
+      const elegiveis = internos ? comConteudo : comConteudo.filter(cm => !cm.interno);
+      const disc = elegiveis.slice(-MAX_DISC);
+      const qtdInternos = comConteudo.filter(cm => cm.interno).length;
+
+      const linhas = [
+        `${marca} [${id}](${url}) — ${titulo}`,
+        `Status Operacional: ${op} | GSE: ${gse}`
+      ];
+      diff.forEach(d => linhas.push(`  ↳ ${d.rot}: ${d.texto}`));
+      if (!disc.length) {
+        linhas.push('', 'Nenhuma discussão registrada.');
+      } else {
+        disc.forEach((cm) => {
+          linhas.push('', `${Utils.formatBrDateTime(cm.quando)}${cm.interno ? '  [INTERNO]' : ''}`);
+          // Sem texto aqui significa comentario que e so imagem (o filtro acima ja
+          // tirou os vazios de verdade). Dizer isso e melhor do que uma linha em
+          // branco, que pareceria falha da copia.
+          linhas.push(cm.texto || '(imagem — veja o chamado)');
+        });
+      }
+
+      /* O html vai com estilo em LINHA e em `pt`, igual ao do relatorio de
+       * referencia (:588-604): e o unico jeito de o Word e o Outlook respeitarem
+       * a formatacao: folha de estilo nao sobrevive ao clipboard, e `px` o Word
+       * reinterpreta. */
+      const esc = Utils.escapeHtml;
+      const discHtml = disc.length
+        ? disc.map(cm => `
+            <div style="margin:8pt 0 0 8pt; border-left:3pt solid #3b82f6; padding-left:8pt;">
+              <p style="margin:0; font-size:9pt; color:#374151; font-weight:bold;">
+                ${esc(Utils.formatBrDateTime(cm.quando))}${cm.interno ? ' [INTERNO]' : ''}
+              </p>
+              <div style="margin-top:2pt; font-size:10pt; color:#111827; line-height:1.5;">
+                ${cm.html}
+              </div>
+            </div>`).join('')
+        : '<p style="margin:4pt 0; font-size:9pt; color:#9ca3af; font-style:italic;">Nenhuma discussão registrada.</p>';
+
+      const html = `<div style="font-family:Segoe UI,Arial,sans-serif;">
+        <p style="margin:0 0 2pt; font-size:13pt; font-weight:bold; color:#111827;">
+          ${marca} <a href="${esc(url)}" style="color:#1d4ed8; text-decoration:none;">${esc(id)}</a>
+          <span style="font-size:11pt; font-weight:normal; color:#374151;"> — ${esc(titulo)}</span>
+        </p>
+        <p style="margin:0 0 4pt; font-size:9pt; color:#4b5563;">
+          Status Operacional: <b>${esc(op)}</b> | GSE: <b>${esc(gse)}</b>
+        </p>
+        ${diff.map(d => `
+          <div style="font-size:9pt; color:#78350f; margin-left:16pt;">↳ ${esc(d.rot)}: ${esc(d.texto)}</div>`).join('')}
+        ${discHtml}
+      </div>`;
+
+      return { texto: linhas.join('\n'), html, discussoes: disc.length, qtdInternos };
+    };
+
+    /* Os dois formatos num item so. `ClipboardItem` nao existe em toda versao de
+     * navegador e `navigator.clipboard.write` exige o documento em foco — nos
+     * dois casos cai no `writeText`, que leva o texto plano. Chegar sem formatacao
+     * e aceitavel; nao chegar nada, nao. Quem chama recebe qual dos dois saiu,
+     * para a tela poder dizer a verdade em vez de um "copiado" generico. */
+    const paraClipboard = async ({ texto, html }) => {
+      if (typeof ClipboardItem === 'function' && navigator.clipboard && navigator.clipboard.write) {
+        try {
+          await navigator.clipboard.write([new ClipboardItem({
+            'text/plain': new Blob([texto], { type: 'text/plain' }),
+            'text/html': new Blob([html], { type: 'text/html' })
+          })]);
+          return 'rico';
+        } catch (err) {
+          console.warn('[SMAX Painel] clipboard rico recusado, caindo no texto plano:', err);
+        }
+      }
+      await navigator.clipboard.writeText(texto);
+      return 'texto';
+    };
+
+    return { MAX_DISC, contarInternos, montar, paraClipboard };
+  })();
+
+  /* =========================================================
    * ThemeManager
    * =======================================================*/
   const ThemeManager = (() => {
@@ -3369,8 +3884,11 @@
     // "procurei e nao achou nada" sao duas telas diferentes, e confundi-las e
     // justamente a falha de mostrar ausencia de leitura como zero.
     const consultaUI = {
-      dias: 90,            // 0 = sem recorte de data
-      situacao: 'abertos', // abertos | encerrados | todos
+      /* `dias` e `situacao` NAO moram mais aqui: desde a v1.21 estao em
+       * PgStore.prefs, junto com as GSEs. O motivo e o mesmo que já valia para as
+       * GSEs e estava sendo ignorado para estes dois — o SMAX RECARREGA a pagina a
+       * cada navegacao, e estado de recorte em memoria voltava a "90 dias /
+       * Abertos" a cada clique do usuario na interface do SMAX. Ver `consDias()`. */
       buscando: false,
       buscou: false,
       total: 0,            // quantos o SMAX diz que existem
@@ -3380,9 +3898,12 @@
       proximoSkip: 0,
       filtro: '',          // o filtro exato que foi enviado — aparece no erro
       erro: '',
-      // Ids das GSEs da consulta EM CURSO, congelados na primeira pagina. As
-      // escolhidas moram em PgStore.prefs e podem mudar no meio da paginacao.
+      // O recorte da consulta EM CURSO, congelado na primeira pagina. O recorte
+      // escolhido mora em PgStore.prefs e pode mudar no meio da paginacao; estes
+      // tres e que sao enviados em toda pagina. Ver `consultar`.
       grupos: [],
+      situacaoEmCurso: 'abertos',
+      desdeEmCurso: 0,
       marcados: new Set(),
       // Classificacao e nota da leva que esta sendo marcada. Ficam aqui, na
       // propria aba, porque a decisao de assunto/base/competencia e tomada
@@ -3399,6 +3920,13 @@
     // isto aqui e so a busca, que e pontual.
     const gseUI = { open: false, term: '', loading: false, error: '', results: [], searchSeq: 0 };
     let gseDebounce = null;
+
+    // O recorte da consulta, lido da prefs. O fallback do sentinela `null` mora
+    // em PgStore.consultaDias, para a tela e o salvamento nunca discordarem.
+    const consDias = () => PgStore.consultaDias();
+    const consSituacao = () => PgStore.prefs.consultaSituacao;
+
+    const salvarRecorte = () => PgStore.salvarPrefs();
 
     const setStatus = (msg, kind = '') => {
       const el = overlay && overlay.querySelector('.smax-gl-status');
@@ -3478,15 +4006,24 @@
       }
     };
 
-    // Chamado pelo PgMonitor ao fim de uma rodada que achou algo.
+    /* Chamado pelo PgMonitor ao fim de uma rodada que achou algo.
+     *
+     * O filtro de tipo corta AQUI, nos tres canais de aviso, e nao no diff nem no
+     * registro. Dois motivos. O historico: silenciar "filhos" e dizer "nao me
+     * interrompa com isso", nao "apague isso" — a aba Novidades continua completa.
+     * E o ruido: o item generico `atualizado` so e emitido quando nenhum
+     * especifico saiu (ver `diffGlobal`), entao filtrar antes do diff trocaria
+     * "3 filho(s) novo(s)" por "alguma alteracao no chamado", que e menos
+     * informacao pelo mesmo incomodo. */
     const aoNovidades = (itens) => {
       syncLauncher();
-      mostrarAviso(itens);
-      if (PgStore.prefs.monitor.notificarSO) {
-        const porId = new Set(itens.map(x => x.id));
+      const avisar = itens.filter(x => PgStore.notifica(x.tipo));
+      mostrarAviso(avisar);
+      if (avisar.length && PgStore.prefs.monitor.notificarSO) {
+        const porId = new Set(avisar.map(x => x.id));
         notificarSO(
-          `SMAX: ${itens.length} novidade(s) em ${porId.size} global(is)`,
-          itens.slice(0, 3).map(x => `#${x.id} — ${x.texto}`).join('\n')
+          `SMAX: ${avisar.length} novidade(s) em ${porId.size} global(is)`,
+          avisar.slice(0, 3).map(x => `#${x.id} — ${x.texto}`).join('\n')
         );
       }
       // Painel aberto na aba de novidades: redesenha para a lista nao ficar velha
@@ -4344,9 +4881,20 @@
         </div>`;
     };
 
+    /* A barra das consultas salvas tem de ser redesenhada junto com a caixa de
+     * GSE: mexer nas GSEs muda o rascunho, e e o rascunho que decide o selo
+     * "alterada" e a oferta de "Salvar alteracoes". Sem isto o selo so apareceria
+     * no proximo render() inteiro — ou seja, a tela diria que nada mudou depois de
+     * o usuario tirar uma GSE. */
+    const refreshConsultasSalvas = () => {
+      const box = overlay && overlay.querySelector('#smax-gl-cons-salvas');
+      if (box) box.innerHTML = renderConsultasSalvas();
+    };
+
     // Redesenha SO a caixa: um render() inteiro destruiria o foco e o caret do
     // campo de busca a cada tecla. Mesmo padrao do `refreshPersonBox`.
     const refreshGseBox = () => {
+      refreshConsultasSalvas();
       const box = overlay && overlay.querySelector('#smax-gl-gse-box');
       if (!box) return;
       const input = box.querySelector('#smax-gl-gse-q');
@@ -4389,6 +4937,62 @@
         });
     };
 
+    /* A barra das consultas salvas.
+     *
+     * Fica no TOPO da aba, antes do recorte, porque a ordem da tela tem de
+     * espelhar a ordem do trabalho: escolher a consulta e o primeiro passo, e
+     * ajustar GSE/periodo/situacao e o refinamento dela. */
+    const renderConsultasSalvas = () => {
+      const salvas = Dados.consultas();
+      const atual = Dados.acharConsulta(PgStore.prefs.consultaId);
+      const alterada = Dados.rascunhoAlterado();
+
+      const opcoes = [
+        `<option value="" ${atual ? '' : 'selected'}>— consulta avulsa —</option>`,
+        ...salvas.map(s => `
+          <option value="${Utils.escapeHtml(s.id)}" ${atual && atual.id === s.id ? 'selected' : ''}>
+            ${Utils.escapeHtml(s.nome)}${s.padrao ? ' (padrão)' : ''}
+          </option>`)
+      ].join('');
+
+      const acoes = [
+        `<button class="smax-gl-btn" data-act="cons-salvar-como">+ Salvar a atual como…</button>`,
+        atual && alterada
+          ? `<button class="smax-gl-btn smax-gl-btn-primary" data-act="cons-sobrescrever"
+                     title="Grava o recorte que está na tela sobre “${Utils.escapeHtml(atual.nome)}”.">Salvar alterações</button>`
+          : '',
+        atual && alterada
+          ? `<button class="smax-gl-btn" data-act="cons-descartar"
+                     title="Volta o recorte da tela para o que está salvo.">Descartar alterações</button>`
+          : '',
+        atual && !atual.padrao
+          ? `<button class="smax-gl-chip" data-act="cons-padrao" data-id="${Utils.escapeHtml(atual.id)}"
+                     title="A consulta padrão é a que carrega sozinha num computador novo.">☆ Tornar padrão</button>`
+          : '',
+        atual ? `<button class="smax-gl-btn" data-act="cons-renomear" data-id="${Utils.escapeHtml(atual.id)}">Renomear</button>` : '',
+        atual ? `<button class="smax-gl-btn smax-gl-btn-danger" data-act="cons-apagar" data-id="${Utils.escapeHtml(atual.id)}">Apagar</button>` : ''
+      ].filter(Boolean).join('');
+
+      return `
+        <div class="smax-gl-label">Consulta salva</div>
+        <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+          <select class="smax-gl-select" data-act="cons-escolher" style="width:auto; min-width:200px;">
+            ${opcoes}
+          </select>
+          ${atual && alterada ? '<span class="smax-gl-badge smax-gl-badge-warn">alterada</span>' : ''}
+          ${atual && atual.padrao ? '<span class="smax-gl-badge smax-gl-badge-best">★ padrão</span>' : ''}
+        </div>
+        <div style="display:flex; gap:8px; margin-top:8px; flex-wrap:wrap;">${acoes}</div>
+        <div class="smax-gl-note" style="margin-top:8px;">
+          ${salvas.length
+            ? `As consultas salvas <strong>vão no arquivo publicado</strong> — publique para levá-las
+               ao outro computador. A <strong>padrão</strong> é a que carrega sozinha na primeira vez
+               que a aba é usada numa máquina. (${salvas.length} de ${Dados.MAX_CONSULTAS})`
+            : `Monte o recorte abaixo e use <strong>Salvar a atual como…</strong> para guardá-lo.
+               Consultas salvas vão no arquivo publicado e chegam no outro computador pela importação.`}
+        </div>`;
+    };
+
     const renderConsultar = () => {
       const c = consultaUI;
       const visiveis = c.itens;
@@ -4396,10 +5000,10 @@
 
       const chipsPeriodo = PERIODOS.map(p => `
         <button class="smax-gl-chip" data-act="cons-dias" data-dias="${p.dias}"
-                data-active="${c.dias === p.dias}">${p.rot}</button>`).join('');
+                data-active="${consDias() === p.dias}">${p.rot}</button>`).join('');
       const chipsSituacao = SITUACOES.map(s => `
         <button class="smax-gl-chip" data-act="cons-situacao" data-sit="${s.id}"
-                data-active="${c.situacao === s.id}">${s.rot}</button>`).join('');
+                data-active="${consSituacao() === s.id}">${s.rot}</button>`).join('');
 
       // O filtro enviado aparece junto com o erro de proposito: se a forma do
       // literal estiver errada, o que se precisa ver e a string exata.
@@ -4519,6 +5123,8 @@
           interessam, classifique e inclua sem sair daqui.
         </div>
 
+        <div id="smax-gl-cons-salvas">${renderConsultasSalvas()}</div>
+
         <div class="smax-gl-label" style="margin-top:14px;">GSE (designação atual do chamado)</div>
         <div id="smax-gl-gse-box">${renderGseBox()}</div>
 
@@ -4631,9 +5237,11 @@
 
       const itens = n.itens.map((x) => {
         const t = PgMonitor.TIPOS[x.tipo] || { rot: x.tipo };
+        const mudo = !PgStore.notifica(x.tipo);
         return `
-          <div class="smax-gl-nov-item" data-novo="${Number(x.quando) > vistoEm}">
-            <span class="smax-gl-nov-tipo" data-tipo="${Utils.escapeHtml(x.tipo)}">${Utils.escapeHtml(t.rot)}</span>
+          <div class="smax-gl-nov-item" data-novo="${Number(x.quando) > vistoEm && !mudo}">
+            <span class="smax-gl-nov-tipo" data-tipo="${Utils.escapeHtml(x.tipo)}"
+                  title="${mudo ? 'Tipo silenciado: fica registrado aqui, mas não acende o selo nem avisa.' : ''}">${Utils.escapeHtml(t.rot)}${mudo ? ' 🔕' : ''}</span>
             <div>
               <div class="smax-gl-nov-tit"><b>#${Utils.escapeHtml(x.id)}</b> ${Utils.escapeHtml(x.titulo || '(sem título)')}</div>
               <div class="smax-gl-nov-txt">${Utils.escapeHtml(x.texto)}</div>
@@ -4645,15 +5253,24 @@
           </div>`;
       }).join('');
 
-      const naoVistas = n.itens.filter(x => Number(x.quando) > vistoEm).length;
+      // Duas contagens, porque sao duas coisas: o que o selo mostrou e o que ha de
+      // novo na lista. Mostrar so a primeira esconderia o silenciado; so a segunda
+      // faria a aba contradizer o selo que o usuario acabou de clicar.
+      const novas = n.itens.filter(x => Number(x.quando) > vistoEm);
+      const naoVistas = novas.filter(x => PgStore.notifica(x.tipo)).length;
+      const mudas = novas.length - naoVistas;
       return `
         <div class="smax-gl-note">
           O que mudou nos globais da lista desde a leitura anterior.
-          ${naoVistas ? `<strong>${naoVistas}</strong> ainda não vista(s).` : 'Todas vistas.'}
+          ${naoVistas ? `<strong>${naoVistas}</strong> ainda não vista(s).` : 'Nenhuma pendente no selo.'}
+          ${mudas ? `Mais <strong>${mudas}</strong> de tipo silenciado (🔕), que não acendem o selo.` : ''}
           Guarda as ${PgStore.MAX_NOVID} mais recentes.${proximaTexto()}
         </div>
         <div style="display:flex; gap:8px; margin-bottom:10px; flex-wrap:wrap;">
-          <button class="smax-gl-btn" data-act="novid-vistas" ${naoVistas ? '' : 'disabled'}>Marcar todas como vistas</button>
+          <!-- Habilitado pelo total de novas, nao pelo que conta no selo: marcar
+               como vistas carimba a lista inteira, inclusive o silenciado. Preso
+               ao selo, o botao ficaria morto tendo item novo mudo na tela. -->
+          <button class="smax-gl-btn" data-act="novid-vistas" ${novas.length ? '' : 'disabled'}>Marcar todas como vistas</button>
           <button class="smax-gl-btn smax-gl-btn-danger" data-act="novid-limpar">Limpar histórico</button>
         </div>
         <div class="smax-gl-nov">${itens}</div>`;
@@ -4704,7 +5321,8 @@
         <div class="smax-gl-note">
           Versão local: <strong>${d._version}</strong>${d._updatedAt ? ` · publicada em ${Utils.escapeHtml(d._updatedAt)}` : ' · nunca publicada daqui'}<br>
           ${d.globais.length} global(is) na lista ·
-          ${Dados.EIXOS.map(e => `${Dados.lista(e.chave).length} ${e.rotulo.toLowerCase()}`).join(' · ')}
+          ${Dados.EIXOS.map(e => `${Dados.lista(e.chave).length} ${e.rotulo.toLowerCase()}`).join(' · ')} ·
+          ${d.consultas.length} consulta(s) salva(s)
         </div>
         <input class="smax-gl-input" id="smax-gl-arquivo-url" type="text" style="width:100%;"
                placeholder="https://raw.githubusercontent.com/dono/repo/branch/painel-globais.json"
@@ -4749,11 +5367,39 @@
           </button>
         </div>
         <div class="smax-gl-note" style="margin-top:6px;">
-          O selo no botão flutuante e o aviso na tela aparecem sempre. A notificação do sistema é
-          opcional porque <strong>pode não chegar</strong>: o Assistente de Foco do Windows a
-          engole sem avisar, e aviso que às vezes não chega não serve como canal único.
+          A notificação do sistema é opcional porque <strong>pode não chegar</strong>: o Assistente
+          de Foco do Windows a engole sem avisar, e aviso que às vezes não chega não serve como
+          canal único.
           ${temNotificacao() ? '' : '<br><strong>Indisponível neste navegador/Tampermonkey</strong> — a permissão <code>GM_notification</code> não está concedida.'}
-        </div>`;
+        </div>
+
+        <div class="smax-gl-label" style="margin-top:18px;">O que avisa</div>
+        <div class="smax-gl-note">
+          Clique para silenciar um tipo. Tipo silenciado <strong>continua sendo registrado</strong>
+          na aba Novidades — o que ele deixa de fazer é acender o selo, abrir o aviso na tela e
+          disparar a notificação do sistema. Útil para o que é frequente e raramente urgente, como
+          filho novo.
+        </div>
+        <div class="smax-gl-chips">
+          ${Object.entries(PgMonitor.TIPOS).map(([k, t]) => `
+            <button class="smax-gl-chip" data-act="mon-tipo" data-tipo="${Utils.escapeHtml(k)}"
+                    data-active="${PgStore.notifica(k)}"
+                    title="${PgStore.notifica(k) ? 'Avisando — clique para silenciar' : 'Silenciado — clique para voltar a avisar'}">
+              ${PgStore.notifica(k) ? '🔔' : '🔕'} ${Utils.escapeHtml(t.rot)}
+            </button>`).join('')}
+        </div>
+        ${(() => {
+          const mudos = Object.keys(PgMonitor.TIPOS).filter(k => !PgStore.notifica(k));
+          // Silenciar TODOS deixa o monitor rodando e sem nenhum canal de aviso —
+          // estado valido, mas que se parece com defeito. Melhor dizer.
+          if (!mudos.length) return '';
+          const todos = mudos.length === Object.keys(PgMonitor.TIPOS).length;
+          return `<div class="smax-gl-note smax-gl-note-warn" style="margin-top:8px;">
+            ${todos
+              ? 'Todos os tipos estão silenciados: o monitor continua lendo e registrando, mas <strong>nenhum aviso aparece</strong>. Olhe a aba Novidades de vez em quando.'
+              : `Silenciados: <strong>${mudos.map(k => Utils.escapeHtml(PgMonitor.TIPOS[k].rot)).join(', ')}</strong>.`}
+          </div>`;
+        })()}`;
     };
 
     /* ---------- Render ---------- */
@@ -5028,12 +5674,74 @@
           </div>
           <div class="smax-gl-footer">
             <div class="smax-gl-status"></div>
+            <!-- O grupo de copiar nasce vazio e e preenchido quando a leitura
+                 chega: sem o chamado em maos nao existe o que copiar, e botao
+                 desabilitado no rodape se parece com defeito. -->
+            <div class="smax-gl-ver-copia" style="display:flex; align-items:center; gap:8px;"></div>
             <button class="smax-gl-btn" data-act="vincular-filhos">🔗 Vincular filhos</button>
             <a class="smax-gl-btn" href="/saw/Request/${Utils.escapeHtml(id)}/general" target="_blank"
                style="text-decoration:none;">Abrir no SMAX</a>
             <button class="smax-gl-btn" data-act="fechar">Fechar</button>
           </div>
         </div>`;
+
+      const dizer = (msg, tipo = '') => {
+        const el = wrap.querySelector('.smax-gl-status');
+        if (!el) return;
+        el.textContent = msg || '';
+        el.style.color = tipo === 'err' ? 'var(--sp-danger-text)'
+          : tipo === 'ok' ? 'var(--sp-success-text)'
+          : 'var(--sp-text-muted)';
+      };
+
+      // O chamado lido. As duas funcoes abaixo existem antes de ele chegar porque
+      // o ouvinte de clique e registrado antes da leitura terminar; enquanto for
+      // `null`, elas nao fazem nada e nao ha botao na tela para chama-las.
+      let lido = null;
+
+      /* O chip de internos aparece SO quando o chamado tem comentario interno.
+       * Oferecer a escolha num chamado que nao tem nenhum e pergunta sem
+       * consequencia, e o rodape ja tem botao bastante. */
+      const pintarCopia = () => {
+        const box = wrap.querySelector('.smax-gl-ver-copia');
+        if (!box || !lido) return;
+        // Conta pelo mesmo criterio da copia: interno vazio nao apareceria no
+        // texto nem se fosse incluido, e nao pode inflar o numero do botao.
+        const n = Copia.contarInternos(lido);
+        const ligado = PgStore.prefs.copiaInternos;
+        box.innerHTML = `
+          <button class="smax-gl-btn" data-act="copiar-chamado"
+                  title="Copia número, título, status operacional, GSE e as últimas ${Copia.MAX_DISC} discussões.">📋 Copiar</button>
+          ${n ? `
+            <button class="smax-gl-chip" data-act="copia-internos" data-active="${ligado}"
+                    title="${ligado
+                      ? 'Os comentários internos ENTRAM no texto copiado — clique para deixá-los de fora.'
+                      : 'Os comentários internos ficam FORA do texto copiado — clique para incluí-los.'}">
+              ${ligado ? '👁️' : '🙈'} ${n} interno(s)
+            </button>` : ''}`;
+      };
+
+      const copiar = () => {
+        if (!lido) return;
+        const pacote = Copia.montar(lido, { internos: PgStore.prefs.copiaInternos });
+        Copia.paraClipboard(pacote).then((modo) => {
+          // Diz quantas discussoes foram e se a formatacao sobreviveu. "Copiado"
+          // sozinho nao serve: quem cola num aviso precisa saber se levou as tres
+          // discussoes ou nenhuma, antes de descobrir isso no destino.
+          dizer([
+            'Copiado:',
+            pacote.discussoes
+              ? `${pacote.discussoes} discussão(ões)`
+              : 'sem discussão',
+            PgStore.prefs.copiaInternos && pacote.qtdInternos ? '(internos incluídos)' : '',
+            modo === 'texto' ? '— sem formatação, o navegador recusou o formato rico.' : ''
+          ].filter(Boolean).join(' '), 'ok');
+        }).catch((err) => {
+          console.warn('[SMAX Painel] falha ao copiar o chamado:', err);
+          dizer('Não foi possível escrever na área de transferência.', 'err');
+        });
+      };
+
       wrap.addEventListener('click', (ev) => {
         // A acao de escrita fica no rodape, separada dos dados: este modal e
         // deliberadamente de leitura (ver o comentario acima), e misturar um
@@ -5041,6 +5749,19 @@
         if (ev.target.closest('[data-act="vincular-filhos"]')) {
           wrap.remove();
           vincularModal(id, () => relerPai(id));
+          return;
+        }
+        if (ev.target.closest('[data-act="copiar-chamado"]')) { copiar(); return; }
+        if (ev.target.closest('[data-act="copia-internos"]')) {
+          PgStore.prefs.copiaInternos = !PgStore.prefs.copiaInternos;
+          PgStore.salvarPrefs();
+          pintarCopia();
+          // Nao recopia sozinho: trocar a escolha e preparar a copia, nao fazer a
+          // copia. Gravar no clipboard sem o usuario pedir trocaria por baixo o
+          // que ele talvez tenha copiado de outro lugar.
+          dizer(PgStore.prefs.copiaInternos
+            ? 'Os comentários internos passam a entrar no texto. Clique em 📋 Copiar.'
+            : 'Os comentários internos ficam fora do texto. Clique em 📋 Copiar.');
           return;
         }
         if (ev.target === wrap || ev.target.closest('[data-act="fechar"]')) wrap.remove();
@@ -5058,6 +5779,8 @@
         // O modal pode ter sido fechado durante a leitura. Escrever no DOM de um
         // no removido nao da erro, mas reabriria nada — so sai fora.
         if (!wrap.isConnected) return;
+        lido = c;
+        pintarCopia();
         const campo = (rot, val) => `<div><span class="smax-gl-label">${rot}</span>
           <div>${val}</div></div>`;
         const discussao = c.comentarios.length
@@ -5551,11 +6274,22 @@
       if (consultaUI.buscando) return;
       lerNotaConsulta();
       const c = consultaUI;
-      const desde = c.dias ? Date.now() - c.dias * DIA_MS : 0;
-      // Lido UMA vez e usado na contagem e em todas as paginas: se o usuario
-      // mexesse nas GSEs no meio da paginacao, o `skip` cairia em outro
-      // resultado e a lista misturaria duas consultas.
+      /* Os tres congelados na primeira pagina e reusados em todas as seguintes. As
+       * GSEs ja eram, pelo motivo do comentario abaixo; periodo e situacao passaram
+       * a precisar do mesmo cuidado na v1.21, porque agora persistem e podem ser
+       * trocados no meio da paginacao — antes eram lidos de um objeto em memoria
+       * que o usuario mal conseguia mexer entre duas paginas.
+       *
+       * `desde` tambem entra congelado, e nao recalculado por pagina: ele vem de
+       * `Date.now()`, e recalcular move a janela alguns segundos a cada pagina. Com
+       * a janela movendo, o `skip` cai em outro resultado e a lista pula ou repete
+       * chamado na fronteira das paginas. */
       const grupos = continuando ? c.grupos : gsesEscolhidas();
+      const situacao = continuando ? c.situacaoEmCurso : consSituacao();
+      const dias = consDias();
+      const desde = continuando
+        ? c.desdeEmCurso
+        : (dias ? Date.now() - dias * DIA_MS : 0);
 
       if (!continuando) {
         c.itens = [];
@@ -5568,6 +6302,8 @@
         c.buscou = false;
         c.resultados = [];
         c.grupos = grupos;
+        c.situacaoEmCurso = situacao;
+        c.desdeEmCurso = desde;
       }
       c.buscando = true;
       render();
@@ -5578,7 +6314,7 @@
         // "20 globais" quando existem 800.
         if (!continuando) {
           setStatus('Contando quantos globais batem com o filtro…');
-          const cont = await PgApi.contarBusca({ desde, situacao: c.situacao, grupos });
+          const cont = await PgApi.contarBusca({ desde, situacao, grupos });
           c.total = cont.total;
           c.filtro = cont.filtro;
           if (!c.total) {
@@ -5589,7 +6325,7 @@
         }
 
         setStatus(`Trazendo ${Math.min(PgApi.PAGINA_BUSCA, c.total - c.lidos)} de ${c.total}…`);
-        const pag = await PgApi.buscarPagina({ desde, situacao: c.situacao, grupos, skip: c.proximoSkip });
+        const pag = await PgApi.buscarPagina({ desde, situacao, grupos, skip: c.proximoSkip });
         c.filtro = pag.filtro;
         // O total da pagina vale mais que o da contagem: foi medido agora.
         c.total = pag.total;
@@ -5815,8 +6551,10 @@
       try {
         setStatus('Baixando o arquivo…');
         const { remotoSan, previa } = await GitSync.prepararImportacao();
+        const pc = previa.consultas;
         const nada = !previa.entram.length && !previa.saem.length && !previa.mudam.length
-          && previa.eixos.every(e => !e.entram && !e.saem && !e.renomeados);
+          && previa.eixos.every(e => !e.entram && !e.saem && !e.renomeados)
+          && !pc.entram.length && !pc.saem.length && !pc.mudam;
 
         const linha = (rotulo, n, extra = '') =>
           `<tr><td>${rotulo}</td><td><strong>${n}</strong>${extra}</td></tr>`;
@@ -5837,7 +6575,15 @@
               `${e.rotulo} — valores`,
               `${e.entram} entram, ${e.saem} saem, ${e.renomeados} renomeados`
             )).join('')}
+            ${linha('Consultas salvas',
+              `${pc.entram.length} entram, ${pc.saem.length} saem, ${pc.mudam} com recorte diferente`,
+              pc.entram.length ? ` — ${Utils.escapeHtml(pc.entram.slice(0, 4).join(', '))}${pc.entram.length > 4 ? '…' : ''}` : '')}
           </table>
+          ${pc.saem.length ? `
+            <div class="smax-gl-note smax-gl-note-warn">
+              Saem as consultas <strong>${Utils.escapeHtml(pc.saem.join(', '))}</strong> — existem só aqui.
+              Se você as criou nesta máquina e ainda não publicou, importar as perde.
+            </div>` : ''}
           ${previa.saem.length ? `
             <div class="smax-gl-note smax-gl-note-warn">
               Os ${previa.saem.length} global(is) que saem existem só aqui. Se foram incluídos nesta
@@ -5850,8 +6596,15 @@
           return;
         }
         GitSync.aplicarImportacao(remotoSan);
+        // Depois de aplicar, nao antes: o acerto decide o que fazer olhando a
+        // lista JA importada.
+        const sinc = Dados.sincronizarAposImportar();
         render();
-        setStatus(`Importado — versão ${PgStore.dados()._version}.`, 'ok');
+        const extra = sinc.acao === 'padrao' ? ` Consulta padrão “${sinc.consulta.nome}” carregada.`
+          : sinc.acao === 'orfao' ? ` A consulta que estava na tela saiu do arquivo; carreguei a padrão “${sinc.consulta.nome}”.`
+          : sinc.acao === 'recarregada' ? ` Consulta “${sinc.consulta.nome}” recarregada do arquivo.`
+          : '';
+        setStatus(`Importado — versão ${PgStore.dados()._version}.${extra}`, 'ok');
       } catch (err) {
         setStatus(`Falha ao importar: ${err.message}`, 'err');
       } finally {
@@ -6322,6 +7075,23 @@
             ? `Monitoramento ligado — primeira sondagem em ${m.minutos} min.`
             : 'Monitoramento desligado. O “↻ Atualizar do SMAX” continua comparando.');
         }
+        else if (act === 'mon-tipo') {
+          const k = ev.target.closest('[data-tipo]').dataset.tipo;
+          const m = PgStore.prefs.monitor;
+          // Grava so o silencio; voltar a avisar APAGA a chave, para o mapa seguir
+          // com a regra "absente = notifica" (ver prefsDefaults).
+          if (PgStore.notifica(k)) m.tipos[k] = false;
+          else delete m.tipos[k];
+          PgStore.salvarPrefs();
+          // O selo conta so o que notifica: silenciar tem de descontar na hora, e
+          // nao na proxima rodada do monitor.
+          syncLauncher();
+          render();
+          const rot = (PgMonitor.TIPOS[k] || { rot: k }).rot;
+          setStatus(PgStore.notifica(k)
+            ? `“${rot}” volta a avisar.`
+            : `“${rot}” silenciado — continua na aba Novidades, sem acender o selo.`);
+        }
         else if (act === 'mon-so') {
           const m = PgStore.prefs.monitor;
           if (!m.notificarSO && !temNotificacao()) {
@@ -6357,13 +7127,64 @@
         /* ---- Consultar ---- */
         else if (act === 'cons-dias') {
           lerNotaConsulta();
-          consultaUI.dias = Number(ev.target.closest('[data-dias]').dataset.dias);
+          PgStore.prefs.consultaDias = Number(ev.target.closest('[data-dias]').dataset.dias);
+          salvarRecorte();
           render();
         }
         else if (act === 'cons-situacao') {
           lerNotaConsulta();
-          consultaUI.situacao = ev.target.closest('[data-sit]').dataset.sit;
+          PgStore.prefs.consultaSituacao = ev.target.closest('[data-sit]').dataset.sit;
+          salvarRecorte();
           render();
+        }
+        /* ---- Consultar: consultas salvas ---- */
+        else if (act === 'cons-salvar-como') {
+          lerNotaConsulta();
+          const nome = prompt('Nome da consulta (ex.: Mandados UPJ):', '');
+          if (nome === null) return;
+          const r = Dados.salvarConsulta(nome);
+          render();
+          setStatus(r.msg, r.ok ? 'ok' : 'err');
+        }
+        else if (act === 'cons-sobrescrever') {
+          lerNotaConsulta();
+          const r = Dados.sobrescreverConsulta(PgStore.prefs.consultaId);
+          render();
+          setStatus(r.msg, r.ok ? 'ok' : 'err');
+        }
+        else if (act === 'cons-descartar') {
+          lerNotaConsulta();
+          const r = Dados.carregarConsulta(PgStore.prefs.consultaId);
+          render();
+          setStatus(r.ok ? 'Alterações descartadas.' : r.msg, r.ok ? 'ok' : 'err');
+        }
+        else if (act === 'cons-padrao') {
+          lerNotaConsulta();
+          const r = Dados.marcarPadrao(ev.target.closest('[data-id]').dataset.id);
+          render();
+          setStatus(r.msg, r.ok ? 'ok' : 'err');
+        }
+        else if (act === 'cons-renomear') {
+          lerNotaConsulta();
+          const alvo = Dados.acharConsulta(ev.target.closest('[data-id]').dataset.id);
+          if (!alvo) { setStatus('Consulta não encontrada.', 'err'); return; }
+          const nome = prompt('Novo nome da consulta:', alvo.nome);
+          if (nome === null) return;
+          const r = Dados.renomearConsulta(alvo.id, nome);
+          render();
+          setStatus(r.msg, r.ok ? 'ok' : 'err');
+        }
+        else if (act === 'cons-apagar') {
+          lerNotaConsulta();
+          const alvo = Dados.acharConsulta(ev.target.closest('[data-id]').dataset.id);
+          if (!alvo) { setStatus('Consulta não encontrada.', 'err'); return; }
+          // O recorte na tela NAO e apagado junto, e isso e de proposito: apagar a
+          // consulta salva e desfazer o atalho, nao desfazer o filtro que esta em
+          // uso. Quem apagou por engano reconstroi com "Salvar a atual como…".
+          if (!confirm(`Apagar a consulta “${alvo.nome}”? O recorte continua na tela; só o atalho salvo sai.`)) return;
+          const r = Dados.removerConsulta(alvo.id);
+          render();
+          setStatus(r.msg, r.ok ? 'ok' : 'err');
         }
         else if (act === 'cons-buscar') { consultar(false); }
         else if (act === 'cons-mais') { consultar(true); }
@@ -6552,6 +7373,23 @@
           PgStore.salvarPrefs();
           render();
         }
+        if (ev.target.dataset && ev.target.dataset.act === 'cons-escolher') {
+          lerNotaConsulta();
+          const id = ev.target.value;
+          if (!id) {
+            // "consulta avulsa": solta o vinculo e MANTEM o recorte da tela. Trocar
+            // para avulsa nao e pedir uma consulta nova — e desgrudar a atual para
+            // mexer nela sem mexer na salva.
+            PgStore.prefs.consultaId = '';
+            PgStore.salvarPrefs();
+            render();
+            setStatus('Consulta avulsa — o recorte na tela não está mais ligado a uma consulta salva.');
+          } else {
+            const r = Dados.carregarConsulta(id);
+            render();
+            setStatus(r.msg, r.ok ? 'ok' : 'err');
+          }
+        }
         if (ev.target.dataset && ev.target.dataset.act === 'mon-minutos') {
           PgStore.prefs.monitor.minutos = Number(ev.target.value);
           PgStore.salvarPrefs();
@@ -6711,6 +7549,13 @@
       selo.dataset.n = '0';
       selo.addEventListener('click', () => abrirEm('novidades'));
       document.body.appendChild(selo);
+
+      /* Carrega a consulta padrao, se esta maquina ainda nao tem rascunho. Fica no
+       * init, e nao na abertura da aba Consultar, por ser idempotente de uma vez
+       * so: chamar aqui garante UMA execucao na vida desta instalacao, sem
+       * espalhar a chamada por `open`, `abrirEm` e o clique de aba — e sem efeito
+       * colateral dentro de uma funcao de render. */
+      Dados.iniciarConsulta();
 
       syncLauncher();
       Capture.onChange(syncLauncher);
